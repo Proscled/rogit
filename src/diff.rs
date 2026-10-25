@@ -54,6 +54,12 @@ impl Change {
     pub fn new(name: impl Into<String>, old: impl Into<String>, new: impl Into<String>) -> Self {
         Change { name: name.into(), old: old.into(), new: new.into(), conflict: None }
     }
+
+    /// A property change from two shown values. Data that doesn't read as text (terrain voxels, mesh data) shows the
+    /// same both ways, so it just says it changed.
+    pub fn values(name: impl Into<String>, old: String, new: String) -> Self {
+        if old == new { Change::new(name, "", "changed") } else { Change::new(name, old, new) }
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -128,7 +134,7 @@ pub(crate) fn is_script(inst: &Instance) -> bool {
     matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript")
 }
 
-fn tag(inst: &Instance) -> Option<String> {
+pub(crate) fn tag(inst: &Instance) -> Option<String> {
     inst.properties.get(&*ATTRIBUTES).and_then(|v| match v {
         // Place files store attribute text as raw bytes, so the ID usually arrives as a BinaryString.
         Variant::Attributes(attributes) => match attributes.get(TAG) {
@@ -332,6 +338,8 @@ pub(crate) fn label(property: &str, rotated: bool) -> String {
         "CFrame" if rotated => "Rotation",
         "CFrame" => "Position",
         "WorldPivotData" => "Pivot",
+        "SmoothGrid" => "Voxels",
+        "MaterialColors" => "Material colors",
         other => other,
     }
     .to_owned()
@@ -367,7 +375,7 @@ fn changes(start: (&WeakDom, &Index, Ref), current: (&WeakDom, &Index, Ref)) -> 
     changed.sort_unstable_by_key(|(name, _, _)| *name);
     for (name, before, after) in changed {
         let rotated = rotation_differs(before, after);
-        out.push(Change::new(label(name, rotated), show(before, class, name, start.1, rotated), show(after, class, name, current.1, rotated)));
+        out.push(Change::values(label(name, rotated), show(before, class, name, start.1, rotated), show(after, class, name, current.1, rotated)));
     }
     out
 }
@@ -809,6 +817,19 @@ mod tests {
         attributes.insert(UPDATE.to_owned(), Variant::String("u1".into()));
         current.get_by_ref_mut(gate).unwrap().properties.insert("Attributes".into(), Variant::Attributes(attributes));
         assert_eq!(compare(&start, &current, &RojoPaths::default()).summary, Summary::default());
+    }
+
+    #[test]
+    fn terrain_edits_read_as_changed_voxels() {
+        let terrain = |data: &[u8]| {
+            let mut dom = place(0.5, "Tower", true, false);
+            let workspace = dom.root().children()[0];
+            dom.insert(workspace, tagged("Terrain", "Terrain", "terrain").with_property("SmoothGrid", Variant::BinaryString(data.to_vec().into())));
+            dom
+        };
+        let review = compare(&terrain(b"before"), &terrain(b"after"), &RojoPaths::default());
+        let row = review.rows.iter().find(|r| r.name == "Terrain").unwrap();
+        assert_eq!(row.changes, vec![Change::new("Voxels", "", "changed")]);
     }
 
     #[test]

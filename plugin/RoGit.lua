@@ -104,6 +104,9 @@ end
 
 -- This Studio window, so rogit serve can tell work from before it opened.
 local SESSION = newId(12)
+-- Every RoGit ID in this place and its object, once the project is set up. A copy made with Ctrl+D or pasted carries
+-- its original's ID; with this, it gets its own right away.
+local idOwners: { [string]: Instance }? = nil
 -- Whether this window just opened its place (nothing to undo yet), rather than the plugin reloading in a window
 -- that's been worked in. Only a window that just opened can be missing unsaved work.
 local FRESH_WINDOW = not ChangeHistoryService:GetCanUndo()
@@ -175,8 +178,12 @@ local function tagObjects(rojo: any): { tagged: number, added: number, skipped: 
 	if #missing > 0 then
 		local recording = ChangeHistoryService:TryBeginRecording("RoGitTags", "RoGit IDs")
 		for _, object in missing do
-			if pcall(object.SetAttribute, object, TAG, newId(10)) then
+			local id = newId(10)
+			if pcall(object.SetAttribute, object, TAG, id) then
 				added += 1
+				if idOwners then
+					idOwners[id] = object
+				end
 			end
 		end
 		if recording then
@@ -2003,10 +2010,8 @@ restoreButton.Activated:Connect(function()
 	end
 	dropView()
 	local from = state.unsaved
-	run("Copying the branch…", function()
-		local capture, manifest = copy()
-		step("Comparing…")
-		local reply = call("POST", "/api/branches/restore", { name = branch.name, capture = capture, manifest = manifest })
+	run("Comparing…", function()
+		local reply = callWithBranch("/api/branches/restore", { name = branch.name })
 		showView({
 			kind = "restore", data = reply.plan, branch = branch.name, record = reply.record, title = "Restore unsaved work",
 			subtitle = if from then "From " .. formatTime(from) else nil,
@@ -2125,6 +2130,20 @@ local function applyOperation(op: any, templates: { [number]: Instance }, ids: {
 				copyTags(template, target)
 			elseif (target:IsA("MeshPart") and MESH_DATA[property]) or (target:IsA("PartOperation") and UNION_DATA[property]) then
 				geometry = true
+			elseif target:IsA("Terrain") and property == "SmoothGrid" then
+				-- Voxels can't be set directly: paste the incoming terrain over the whole thing.
+				local terrain = target :: Terrain
+				local source = template :: Terrain
+				local region = source:CopyRegion(source.MaxExtents)
+				terrain:Clear()
+				local low = source.MaxExtents.Min
+				terrain:PasteRegion(region, Vector3int16.new(low.X, low.Y, low.Z), true)
+			elseif target:IsA("Terrain") and property == "MaterialColors" then
+				for _, material in Enum.Material:GetEnumItems() do
+					pcall(function()
+						(target :: Terrain):SetMaterialColor(material, (template :: Terrain):GetMaterialColor(material))
+					end)
+				end
 			else
 				-- Some saved names differ from what scripts use.
 				local name = SCRIPT_NAMES[property] or property
@@ -2407,6 +2426,23 @@ local function touched(object: Instance)
 	end
 	noteEdit()
 end
+-- A newly added object keeps its RoGit ID unless another object has it (a Ctrl+D copy, a paste); then it gets its
+-- own. This runs while Studio is still making the copy, so it's part of the same undo step.
+local function claimId(object: Instance)
+	local id = object:GetAttribute(TAG)
+	if not idOwners or type(id) ~= "string" then
+		return
+	end
+	local owner = idOwners[id]
+	if owner and owner ~= object and owner:IsDescendantOf(game) then
+		local fresh = newId(10)
+		object:SetAttribute(TAG, fresh)
+		idOwners[fresh] = object
+	else
+		idOwners[id] = object
+	end
+end
+
 local function added(object: Instance)
 	if object:IsA("LuaSourceContainer") then
 		if object.Parent then
@@ -2414,7 +2450,41 @@ local function added(object: Instance)
 		end
 		return
 	end
+	if relevant(object) then
+		claimId(object)
+	end
 	touched(object)
+end
+
+-- Makes the list of IDs, and gives copies that share one (Ctrl+D copies from before) their own, in one undo step.
+local function claimAllIds()
+	local owners: { [string]: Instance } = {}
+	local copies = {}
+	for _, service in tracked do
+		for _, object in service:GetDescendants() do
+			local id = object:GetAttribute(TAG)
+			if type(id) == "string" then
+				if owners[id] then
+					table.insert(copies, object)
+				else
+					owners[id] = object
+				end
+			end
+		end
+	end
+	if #copies > 0 then
+		local recording = ChangeHistoryService:TryBeginRecording("RoGitTags", "RoGit IDs")
+		for _, object in copies do
+			local id = newId(10)
+			if pcall(object.SetAttribute, object, TAG, id) then
+				owners[id] = object
+			end
+		end
+		if recording then
+			ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+		end
+	end
+	idOwners = owners
 end
 local function removing(object: Instance)
 	if object:IsA("LuaSourceContainer") then
@@ -2429,6 +2499,11 @@ local function removing(object: Instance)
 	pending.removed[object] = object:GetDebugId(0)
 	pending.objects[object] = nil
 	relevance[object] = nil
+	-- Cut and paste keeps an object's ID: once it's out of the place, its ID is free again.
+	local id = object:GetAttribute(TAG)
+	if idOwners and type(id) == "string" and idOwners[id] == object then
+		idOwners[id] = nil
+	end
 	noteEdit()
 end
 game.DescendantAdded:Connect(added)
@@ -2562,7 +2637,7 @@ local function sendChanges(): boolean
 		table.clear(pending.services)
 		local capture = newId(16)
 		local manifest = copyPlace(capture, true)
-		local reply = call("POST", "/api/branches/changes", { name = branch.name, capture = capture, manifest = manifest })
+		local reply = call("POST", "/api/branches/changes", { name = branch.name, capture = capture, manifest = manifest, session = SESSION })
 		watch.lastFull = os.clock()
 		-- If the IDs don't line up with the copy, every refresh stays a full copy.
 		pending.full = not reply.live
@@ -2692,6 +2767,9 @@ task.spawn(function()
 		if ticks % 4 == 0 then
 			checkSelection()
 			checkTerrain()
+		end
+		if idOwners == nil and not state.busy then
+			claimAllIds()
 		end
 		-- Every 10 minutes, when nobody's editing, a full copy makes sure nothing was missed.
 		if os.clock() - watch.lastFull > 600 and os.clock() - watch.last > 30 then

@@ -40,6 +40,9 @@ struct State {
     committed: HashMap<String, Committed>,
     /// Each open branch as it is in Studio, kept current by the plugin's patches.
     live: HashMap<String, Live>,
+    /// Branches with unsaved work waiting to be restored: their autosave isn't overwritten until it's restored,
+    /// dismissed, or the branch is saved.
+    recovering: HashSet<String>,
 }
 
 /// A branch's last commit (or where it last met main), indexed once.
@@ -78,7 +81,7 @@ pub fn serve(project: Project, port: u16) -> Result<(), String> {
     let mut state = State {
         project, branches, history, roblox: Roblox::new(), seen_places: HashSet::new(), planned: HashMap::new(),
         updates: HashMap::new(), restores: HashMap::new(), sessions: HashMap::new(), unsaved: HashMap::new(),
-        committed: HashMap::new(), live: HashMap::new(),
+        committed: HashMap::new(), live: HashMap::new(), recovering: HashSet::new(),
     };
     println!("RoGit {} is serving {} on http://{address}", env!("CARGO_PKG_VERSION"), state.project.folder_name());
     match state.project.config() {
@@ -665,7 +668,18 @@ fn changes_reply(state: &State, name: &str, review: diff::Review, saved: Option<
 fn changes(state: &mut State, body: &str) -> Reply {
     let (name, capture, manifest) = capture_request(body)?;
     existing(state, &name)?;
-    let dom = state.branches.keep_latest(&name, &capture, &manifest).map_err(|e| (500, e))?;
+    // A window that just opened after Studio closed unexpectedly: its copy mustn't replace the unsaved work.
+    let session = json_body(body)?["session"].as_str().unwrap_or_default().to_owned();
+    if let Some(opened) = state.sessions.get(&session).copied() {
+        if unsaved_work(state, &name, opened).is_some() {
+            state.recovering.insert(name.clone());
+        }
+    }
+    let dom = if state.recovering.contains(&name) {
+        take_upload(state, &capture, &manifest)?
+    } else {
+        state.branches.keep_latest(&name, &capture, &manifest).map_err(|e| (500, e))?
+    };
     load_committed(state, &name, merge::last_update(&dom))?;
     let live = Live::new(dom, &manifest);
     let identified = live.identified;
@@ -701,9 +715,13 @@ fn patch(state: &mut State, body: &str) -> Reply {
         state.live.remove(&name);
         return Ok(json!({ "full": true }));
     }
-    // The copy in memory is also the autosave; it's written out now and then.
+    // The copy in memory is also the autosave; it's written out every few seconds, unless unsaved work from before is
+    // waiting to be restored (saving the branch also ends that wait).
+    if state.recovering.contains(&name) && state.branches.unsaved_copy(&name).is_none() {
+        state.recovering.remove(&name);
+    }
     let mut saved = None;
-    if live.changed && live.saved.elapsed() > Duration::from_secs(30) {
+    if live.changed && live.saved.elapsed() > Duration::from_secs(10) && !state.recovering.contains(&name) {
         live.saved = Instant::now();
         live.changed = false;
         match state.branches.save_latest(&name, &live.dom) {
@@ -877,9 +895,10 @@ fn plan_discard(state: &mut State, body: &str) -> Reply {
 /// Plans bringing back unsaved work (the newest copy RoGit made) into the branch as it is in Studio (`capture`).
 /// Measured against the window as it is, so work that's still there isn't added twice.
 fn plan_restore(state: &mut State, body: &str) -> Reply {
-    let (name, capture, manifest) = capture_request(body)?;
+    let request = json_body(body)?;
+    let name = request["name"].as_str().unwrap_or_default().to_owned();
     existing(state, &name)?;
-    let current = take_upload(state, &capture, &manifest)?;
+    let Some(current) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
     let copy = state.branches.latest_place(&name).map_err(|e| (500, e))?;
     plan_restore_of(state, &name, "restore", &copy, &current)
 }
@@ -892,6 +911,7 @@ fn restored(state: &mut State, body: &str) -> Reply {
     print_report(&format!("{} {name}", if kind == "revert" { "Reverted" } else { "Restored unsaved work in" }), &report);
     if kind == "restore" {
         let _ = state.branches.dismiss_unsaved(&name);
+        state.recovering.remove(&name);
     }
     log_event(state, &kind, &name, &report, Some(rows));
     Ok(json!({ "branch": state.branches.get(&name) }))
@@ -902,5 +922,6 @@ fn dismiss_unsaved(state: &mut State, body: &str) -> Reply {
     let name = request["name"].as_str().unwrap_or_default();
     existing(state, name)?;
     state.branches.dismiss_unsaved(name).map_err(|e| (500, e))?;
+    state.recovering.remove(name);
     Ok(json!({ "ok": true }))
 }

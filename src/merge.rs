@@ -182,6 +182,13 @@ fn encode(value: &Variant) -> Option<Value> {
     })
 }
 
+fn without_attribute(dom: &mut WeakDom, referent: Ref, key: &str) {
+    let inst = dom.get_by_ref_mut(referent).unwrap();
+    if let Some(Variant::Attributes(attributes)) = inst.properties.get_mut(&"Attributes".into()) {
+        attributes.remove(key);
+    }
+}
+
 fn with_attribute(dom: &mut WeakDom, referent: Ref, key: &str, value: &str) {
     let inst = dom.get_by_ref_mut(referent).unwrap();
     let mut attributes = match inst.properties.get(&"Attributes".into()) {
@@ -274,6 +281,14 @@ impl Builder<'_> {
             if let Some(marker) = marker {
                 with_attribute(&mut self.bundle, to, REF_TAG, &marker);
             }
+            // A copy made with Ctrl+D keeps its original's ID. It arrives without one, so the target never has two
+            // objects with the same ID, and gets its own the next time RoGit gives out IDs.
+            if let Some(id) = diff::tag(source) {
+                let own = self.source.index.by_ref.get(&from).and_then(|k| self.source.index.get(k)).map(|e| e.own_key.as_str());
+                if own.is_some_and(|own| own != id) || self.target.index.get(&id).is_some() {
+                    without_attribute(&mut self.bundle, to, diff::TAG);
+                }
+            }
             let to_children = self.bundle.get_by_ref(to).unwrap().children().to_vec();
             pairs.extend(source.children().iter().copied().zip(to_children));
         }
@@ -344,7 +359,7 @@ impl Builder<'_> {
                 }
                 let rotated = diff::rotation_differs(ours, theirs);
                 let label = diff::label(&name, rotated);
-                let change = Change::new(
+                let change = Change::values(
                     label.clone(),
                     diff::show(ours, &class, &name, &self.target.index, rotated),
                     diff::show(theirs, &class, &name, &self.source.index, rotated),
@@ -734,6 +749,22 @@ mod tests {
         let shed = plan.rows.iter().find(|r| r.name == "Shed").unwrap();
         assert!(shed.changes.iter().any(|c| c.name == "Moved with it"));
         assert!(!plan.rows.iter().any(|r| r.name == "Roof"));
+    }
+
+    #[test]
+    fn a_ctrl_d_copy_arrives_without_its_originals_id() {
+        let start = place();
+        let mut branch = place();
+        // Duplicate the gate: the copy carries the gate's ID.
+        let map = branch.descendants().find(|i| i.name == "Map").unwrap().referent();
+        branch.insert(map, tagged("Part", "Gate", "gate"));
+        let main = place();
+        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
+        assert_eq!(plan.summary.added, 1);
+        let bundle = base64::engine::general_purpose::STANDARD.decode(&plan.bundle).unwrap();
+        let bundle = rbx_binary::from_reader(&bundle[..]).unwrap();
+        let copy = bundle.descendants().find(|i| i.name == "Gate").unwrap();
+        assert_eq!(diff::tag(copy), None);
     }
 
     #[test]
