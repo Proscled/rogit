@@ -104,10 +104,15 @@ fn attribute(encoded: &Value) -> Option<Variant> {
 pub fn build(dir: &Path, manifest: &Value, out: &Path) -> Result<BuildReport, String> {
     let (dom, settings_skipped) = assemble(dir, manifest)?;
     let objects = dom.descendants().count() - 1;
+    write(&dom, out)?;
+    Ok(BuildReport { objects, settings_skipped })
+}
+
+/// Writes a place in memory to a place file.
+pub fn write(dom: &WeakDom, out: &Path) -> Result<(), String> {
     let services = dom.root().children().to_vec();
     let file = fs::File::create(out).map_err(|e| format!("Couldn't create {}: {e}", out.display()))?;
-    rbx_binary::to_writer(BufWriter::new(file), &dom, &services).map_err(|e| format!("Couldn't write the place file: {e}"))?;
-    Ok(BuildReport { objects, settings_skipped })
+    rbx_binary::to_writer(BufWriter::new(file), dom, &services).map_err(|e| format!("Couldn't write the place file: {e}"))
 }
 
 /// Reads a place file, for example a branch saved in Studio.

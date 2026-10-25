@@ -7,6 +7,7 @@ local HttpService = game:GetService("HttpService")
 local ReflectionService = game:GetService("ReflectionService")
 local RunService = game:GetService("RunService")
 local Selection = game:GetService("Selection")
+local CollectionService = game:GetService("CollectionService")
 local SerializationService = game:GetService("SerializationService")
 local StudioService = game:GetService("StudioService")
 
@@ -41,6 +42,7 @@ type State = {
 	notice: string?,
 	problem: string?,
 	review: any?,
+	merge: any?,
 }
 
 local state: State = { connected = false, branches = {} }
@@ -466,11 +468,12 @@ stack(branchRows, 4)
 
 local shownBranches = ""
 local openBranch: (string) -> ()
+local startMerge: (string) -> ()
 
 local function renderBranches()
 	local key = ""
 	for _, branch in state.branches do
-		key ..= branch.name .. ","
+		key ..= branch.name .. ":" .. tostring(branch.merged) .. ","
 	end
 	if key == shownBranches then
 		return
@@ -486,24 +489,33 @@ local function renderBranches()
 		local row = new("Frame", { LayoutOrder = index, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 36), Parent = branchRows })
 		local name = text(row, 1, 14, MEDIUM, Color.MainText, false)
 		name.AutomaticSize = Enum.AutomaticSize.None
-		name.Size = UDim2.new(1, -70, 0, 18)
+		name.Size = UDim2.new(1, -140, 0, 18)
 		name.TextTruncate = Enum.TextTruncate.AtEnd
 		name.Text = escape(branch.name)
 		local made = text(row, 2, 12, REGULAR, Color.DimmedText, false)
 		made.AutomaticSize = Enum.AutomaticSize.None
 		made.Position = UDim2.fromOffset(0, 18)
-		made.Size = UDim2.new(1, -70, 0, 16)
-		made.Text = "Made " .. formatTime(branch.created)
+		made.Size = UDim2.new(1, -140, 0, 16)
+		made.TextTruncate = Enum.TextTruncate.AtEnd
+		made.Text = if branch.merged then "Merged " .. formatTime(branch.merged) else "Made " .. formatTime(branch.created)
 		local open = button(row, 3, "Open", false)
 		open.AnchorPoint = Vector2.new(1, 0.5)
-		open.Position = UDim2.fromScale(1, 0.5)
+		open.Position = UDim2.new(1, -72, 0.5, 0)
 		open.Activated:Connect(function()
 			openBranch(branch.name)
+		end)
+		local merge = button(row, 4, "Merge", true)
+		merge.AnchorPoint = Vector2.new(1, 0.5)
+		merge.Position = UDim2.fromScale(1, 0.5)
+		merge.AutomaticSize = Enum.AutomaticSize.None
+		merge.Size = UDim2.fromOffset(66, 28)
+		merge.Activated:Connect(function()
+			startMerge(branch.name)
 		end)
 	end
 end
 
--- Review window ------------------------------------------------------------------------------------
+-- Review window (a branch's changes, or a merge into main) --------------------------------------------
 
 local MAX_REVIEW_ROWS = 400
 local STATUS = {
@@ -514,7 +526,7 @@ local STATUS = {
 
 local reviewWidget = plugin:CreateDockWidgetPluginGui(
 	"RoGitReview",
-	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 560, 620, 380, 300)
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 600, 620, 420, 300)
 )
 reviewWidget.Title = "RoGit · Review"
 
@@ -531,6 +543,7 @@ stack(chips, 6, true)
 local addedChip = pill(chips, 1, "", GREEN)
 local removedChip = pill(chips, 2, "", RED)
 local changedChip = pill(chips, 3, "", AMBER)
+local conflictChip = pill(chips, 4, "", RED)
 local headerLine = new("Frame", { Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0, Parent = reviewRoot }, { BackgroundColor3 = Color.Border })
 
 local reviewList = new("ScrollingFrame", {
@@ -541,17 +554,22 @@ new("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), 
 stack(reviewList, 0)
 
 local footer = new("Frame", {
-	AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 44), BorderSizePixel = 0, Parent = reviewRoot,
+	AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 48), BorderSizePixel = 0, Parent = reviewRoot,
 }, { BackgroundColor3 = Color.Titlebar })
 new("Frame", { Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0, Parent = footer }, { BackgroundColor3 = Color.Border })
-local footerHint = text(footer, 1, 12, REGULAR, Color.DimmedText, false)
+local footerHint = text(footer, 1, 12, REGULAR, Color.DimmedText, true)
 footerHint.AutomaticSize = Enum.AutomaticSize.None
 footerHint.Position = UDim2.fromOffset(14, 0)
-footerHint.Size = UDim2.new(1, -140, 1, 0)
-footerHint.Text = "Click a row to select it in Explorer."
+footerHint.Size = UDim2.new(1, -280, 1, 0)
 local refreshButton = button(footer, 2, "Refresh", false)
 refreshButton.AnchorPoint = Vector2.new(1, 0.5)
 refreshButton.Position = UDim2.new(1, -14, 0.5, 0)
+local mergeButton = button(footer, 3, "Merge into main", true)
+mergeButton.AnchorPoint = Vector2.new(1, 0.5)
+mergeButton.Position = UDim2.new(1, -14, 0.5, 0)
+local cancelButton = button(footer, 4, "Cancel", false)
+cancelButton.AnchorPoint = Vector2.new(1, 0.5)
+cancelButton.Position = UDim2.new(1, -160, 0.5, 0)
 
 -- The list fills the space between the header and the footer.
 local function layoutReview()
@@ -566,8 +584,12 @@ reviewWidget:GetPropertyChangedSignal("Enabled"):Connect(function()
 	task.defer(layoutReview)
 end)
 
--- Finds the live object a review row is about: by RoGit ID, by service, or by path for untagged objects.
-local function findObject(key: string): Instance?
+-- Finds a live object by review key: RoGit ID, service, or path for untagged objects. `ids` is an optional
+-- RoGitId -> object map, so repeated lookups don't scan the place each time.
+local function findObject(key: string, ids: { [string]: Instance }?): Instance?
+	if key == "" then
+		return nil
+	end
 	local service = string.match(key, "^service:(.+)$")
 	if service then
 		local ok, found = pcall(game.GetService, game, service)
@@ -580,6 +602,9 @@ local function findObject(key: string): Instance?
 			current = current and current:FindFirstChild(name)
 		end
 		return current
+	end
+	if ids then
+		return ids[key]
 	end
 	for _, name in SERVICES do
 		local ok, service = pcall(game.GetService, game, name)
@@ -594,10 +619,53 @@ local function findObject(key: string): Instance?
 	return nil
 end
 
+local function setStyle(b: TextButton, primary: boolean)
+	local colors = if primary
+		then { BackgroundColor3 = Color.DialogMainButton, TextColor3 = Color.DialogMainButtonText }
+		else { BackgroundColor3 = Color.Button, TextColor3 = Color.ButtonText }
+	themed[b] = colors
+	for property, spec in colors do
+		(b :: any)[property] = themeColor(spec)
+	end
+end
+
+local updateFooter: () -> ()
+
+-- "Keep main" / "Use branch" for one conflict.
+local function choice(parent: Instance, id: number)
+	local holder = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(0, 22),
+		AutomaticSize = Enum.AutomaticSize.X, BackgroundTransparency = 1, Parent = parent,
+	})
+	stack(holder, 4, true)
+	local keep = button(holder, 1, "Keep main", false)
+	local use = button(holder, 2, "Use branch", false)
+	for _, b in { keep, use } do
+		b.Size = UDim2.new(0, 0, 0, 22)
+		b.TextSize = 12
+	end
+	local function show()
+		local picked = state.merge and state.merge.choices[id]
+		setStyle(keep, picked == "main")
+		setStyle(use, picked == "branch")
+	end
+	keep.Activated:Connect(function()
+		state.merge.choices[id] = "main"
+		show()
+		updateFooter()
+	end)
+	use.Activated:Connect(function()
+		state.merge.choices[id] = "branch"
+		show()
+		updateFooter()
+	end)
+	show()
+end
+
 local selectedRow: TextButton? = nil
 
 local function detailLine(order: number, indent: number, change: any): Frame
-	local line = new("Frame", { LayoutOrder = order, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20), Parent = reviewList })
+	local line = new("Frame", { LayoutOrder = order, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 24), Parent = reviewList })
 	local name = text(line, 1, 12, MEDIUM, Color.DimmedText, false)
 	name.AutomaticSize = Enum.AutomaticSize.None
 	name.Position = UDim2.fromOffset(indent, 0)
@@ -607,11 +675,14 @@ local function detailLine(order: number, indent: number, change: any): Frame
 	local value = text(line, 2, 12, REGULAR, Color.MainText, false)
 	value.AutomaticSize = Enum.AutomaticSize.None
 	value.Position = UDim2.fromOffset(indent + 126, 0)
-	value.Size = UDim2.new(1, -(indent + 136), 1, 0)
+	value.Size = UDim2.new(1, -(indent + 136 + (if change.conflict then 170 else 0)), 1, 0)
 	value.TextTruncate = Enum.TextTruncate.AtEnd
 	value.Text = if change.old == ""
 		then escape(change.new)
 		else string.format('<font color="#ef5350"><s>%s</s></font>  →  <font color="#3fb950">%s</font>', escape(change.old), escape(change.new))
+	if change.conflict then
+		choice(line, change.conflict)
+	end
 	return line
 end
 
@@ -623,7 +694,11 @@ local function reviewRow(order: number, row: any)
 		Size = UDim2.new(1, 0, 0, 26), Parent = reviewList,
 	}, { BackgroundColor3 = { Color.Item, Modifier.Hover } })
 	local details: { Frame } = {}
-	local expanded = row.status == "changed" and #row.changes <= 4
+	local hasConflict = row.conflict ~= nil
+	for _, change in row.changes do
+		hasConflict = hasConflict or change.conflict ~= nil
+	end
+	local expanded = hasConflict or (row.status == "changed" and #row.changes <= 4)
 	local chevron = text(frame, 1, 12, BOLD, Color.DimmedText, false)
 	chevron.AutomaticSize = Enum.AutomaticSize.None
 	chevron.Position = UDim2.fromOffset(indent, 0)
@@ -637,23 +712,32 @@ local function reviewRow(order: number, row: any)
 	local name = text(frame, 2, 14, if status then MEDIUM else REGULAR, if status then Color.MainText else Color.SubText, false)
 	name.AutomaticSize = Enum.AutomaticSize.None
 	name.Position = UDim2.fromOffset(indent + 36, 0)
-	name.Size = UDim2.new(1, -(indent + 36 + 90), 1, 0)
+	name.Size = UDim2.new(1, -(indent + 36 + 100), 1, 0)
 	name.TextTruncate = Enum.TextTruncate.AtEnd
 	name.Text = if row.status == "removed" then "<s>" .. escape(row.name) .. "</s>" else escape(row.name)
 	if status then
-		local badge = pill(frame, 3, status.label, status.color)
+		local badge = pill(frame, 3, if hasConflict then "Conflict" else status.label, if hasConflict then RED else status.color)
 		badge.AnchorPoint = Vector2.new(1, 0.5)
 		badge.Position = UDim2.new(1, -12, 0.5, 0)
 	end
-	for i, change in row.changes do
+	local line = 0
+	for _, change in row.changes do
 		-- A whole added or removed model shows its size next to its name instead of as a detail line.
 		if change.name == "Contains" then
 			name.Text ..= '  <font color="#8c8c8c" size="12">' .. escape(change.new) .. " inside</font>"
 			continue
 		end
-		local line = detailLine(order + i, indent + 36, change)
-		line.Visible = expanded
-		table.insert(details, line)
+		line += 1
+		local detail = detailLine(order + math.min(line, 98), indent + 36, change)
+		detail.Visible = expanded
+		table.insert(details, detail)
+	end
+	if row.conflict then
+		local detail = detailLine(order + 99, indent + 36, {
+			name = "Choose", old = "", new = if row.status == "removed" then "Remove it from main?" else "Bring it back from the branch?",
+			conflict = row.conflict,
+		})
+		table.insert(details, detail)
 	end
 	local function showChevron()
 		chevron.Text = if #details == 0 then "" else "›"
@@ -671,8 +755,8 @@ local function reviewRow(order: number, row: any)
 	frame.Activated:Connect(function()
 		if #details > 0 then
 			expanded = not expanded
-			for _, line in details do
-				line.Visible = expanded
+			for _, detail in details do
+				detail.Visible = expanded
 			end
 			showChevron()
 		end
@@ -681,48 +765,86 @@ local function reviewRow(order: number, row: any)
 		end
 		selectedRow = frame
 		frame.BackgroundTransparency = 0
-		if row.status ~= "removed" then
-			local object = findObject(row.key)
-			if object then
-				Selection:Set({ object })
-			end
+		local object = if row.status == "removed" and not state.merge then nil else findObject(row.key)
+		if object then
+			Selection:Set({ object })
 		end
 	end)
+end
+
+updateFooter = function()
+	local merge = state.merge
+	refreshButton.Visible = merge == nil
+	mergeButton.Visible = merge ~= nil
+	cancelButton.Visible = merge ~= nil
+	if not merge then
+		footerHint.Text = "Click a row to select it in Explorer."
+		return
+	end
+	local open = 0
+	for _, conflict in merge.plan.conflicts do
+		if not merge.choices[conflict.id] then
+			open += 1
+		end
+	end
+	merge.ready = open == 0 and #merge.plan.operations > 0
+	mergeButton.BackgroundTransparency = if merge.ready then 0 else 0.6
+	mergeButton.AutoButtonColor = merge.ready
+	footerHint.Text = if #merge.plan.operations == 0
+		then "Nothing to merge: main already has everything from this branch."
+		elseif open > 0 then string.format("Choose a side for %d conflict%s first.", open, if open == 1 then "" else "s")
+		else "Applies as one step. Ctrl+Z undoes the whole merge."
 end
 
 local shownReview: any = nil
 
 local function renderReview()
-	if state.review == shownReview then
+	local data = if state.merge then state.merge.plan else state.review
+	if data == shownReview then
 		return
 	end
-	shownReview = state.review
+	shownReview = data
 	selectedRow = nil
 	for _, child in reviewList:GetChildren() do
 		if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
 			child:Destroy()
 		end
 	end
-	local review = state.review
-	if not review then
+	updateFooter()
+	if not data then
 		return
 	end
-	local s = review.summary
-	reviewTitle.Text = "Changes in " .. escape(if state.branch then (state.branch :: Branch).name else "branch")
-	reviewSubtitle.Text = "Compared with how the branch started · " .. DateTime.now():FormatLocalTime("LT", "en-us")
+	local s = data.summary
+	if state.merge then
+		local merge = state.merge
+		reviewWidget.Title = "RoGit · Merge"
+		reviewTitle.Text = "Merge " .. escape(merge.branch) .. " into main"
+		reviewSubtitle.Text = string.format("%s · branch as %s %s · main as it is now",
+			if merge.since == "merge" then "Since the last merge" else "Since the branch started", merge.source, formatTime(merge.sourceTime))
+	else
+		reviewWidget.Title = "RoGit · Review"
+		reviewTitle.Text = "Changes in " .. escape(if state.branch then (state.branch :: Branch).name else "branch")
+		reviewSubtitle.Text = "Compared with how the branch started · " .. DateTime.now():FormatLocalTime("LT", "en-us")
+	end
 	addedChip.Text, removedChip.Text, changedChip.Text = "+ " .. s.added .. " added", "− " .. s.removed .. " removed", "● " .. s.changed .. " changed"
 	addedChip.Visible, removedChip.Visible, changedChip.Visible = s.added > 0, s.removed > 0, s.changed > 0
-	if #review.rows == 0 then
+	local conflicts = s.conflicts or 0
+	conflictChip.Text = conflicts .. (if conflicts == 1 then " conflict" else " conflicts")
+	conflictChip.Visible = conflicts > 0
+	if #data.rows == 0 then
 		local empty = text(reviewList, 1, 14, REGULAR, Color.SubText)
 		new("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingTop = UDim.new(0, 10), Parent = empty })
-		empty.Text = "No changes yet. Build something in this branch, then click Refresh."
+		empty.Text = if state.merge
+			then (if state.merge.since == "merge"
+				then "Nothing new to merge: main has everything from this branch's last merge."
+				else "Nothing to merge: main already has everything from this branch.")
+			else "No changes yet. Build something in this branch, then click Refresh."
 	end
-	for index, row in review.rows do
+	for index, row in data.rows do
 		if index > MAX_REVIEW_ROWS then
 			local more = text(reviewList, index * 100, 13, REGULAR, Color.DimmedText)
 			new("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingTop = UDim.new(0, 8), Parent = more })
-			more.Text = string.format("…and %d more. Run <b>rogit diff %s</b> in the terminal for the full list.",
-				#review.rows - MAX_REVIEW_ROWS + review.truncated, if state.branch then escape((state.branch :: Branch).name) else "")
+			more.Text = string.format("…and %d more rows.", #data.rows - MAX_REVIEW_ROWS + data.truncated)
 			break
 		end
 		-- Rows are 100 apart, so each row's detail lines sort right under it.
@@ -788,7 +910,9 @@ local function render()
 	newCard.Visible = mode == "main" and idle
 	branchesCard.Visible = mode == "main" and #state.branches > 0
 	reviewButton.Visible = mode == "branch" and idle
-	openReviewButton.Visible = mode == "branch" and idle and state.review ~= nil and not reviewWidget.Enabled
+	openReviewButton.Visible = idle and not reviewWidget.Enabled
+		and ((mode == "branch" and state.review ~= nil) or (mode == "main" and state.merge ~= nil))
+	openReviewButton.Text = if state.merge then "Open merge of " .. state.merge.branch else "Open last review"
 	renderBranches()
 	renderReview()
 end
@@ -930,6 +1054,266 @@ local function runReview()
 	refresh()
 end
 
+-- Merging -----------------------------------------------------------------------------------------
+
+-- Bundle attributes (set by rogit): which operation an object belongs to, and which ones need a reference fixed.
+local OP_TAG = "RoGitOp"
+local REF_TAG = "RoGitRef"
+-- Workspace attribute in main: the last merge of each branch, so the next merge only brings what changed after it.
+local MERGES_TAG = "RoGitMerges"
+
+local function recordMerge(branch: string, id: string)
+	local ok, record = pcall(HttpService.JSONDecode, HttpService, workspace:GetAttribute(MERGES_TAG) or "{}")
+	if not ok or typeof(record) ~= "table" then
+		record = {}
+	end
+	record[branch] = id
+	workspace:SetAttribute(MERGES_TAG, HttpService:JSONEncode(record))
+end
+-- Properties a plugin can't set directly. They change through the mesh or union APIs instead.
+local MESH_DATA = {
+	MeshId = true, MeshContent = true, MeshData = true, InitialSize = true, PhysicalConfigData = true, PhysicsData = true,
+	CollisionFidelity = true, RenderFidelity = true, HasJointOffset = true, HasSkinnedMesh = true, JointOffset = true,
+	DoubleSided = true,
+}
+local UNION_DATA = {
+	AssetId = true, ChildData = true, MeshData = true, PhysicsData = true, PhysicalConfigData = true, InitialSize = true,
+	CollisionFidelity = true, RenderFidelity = true, SmoothingAngle = true,
+}
+
+-- Saved property names that scripts know by another name.
+local SCRIPT_NAMES = { WorldPivotData = "WorldPivot" }
+
+local function decodeValue(encoded: any): any
+	local t, v = encoded.t, encoded.v
+	if t == "Color3" then
+		return Color3.new(v[1], v[2], v[3])
+	elseif t == "Vector3" then
+		return Vector3.new(v[1], v[2], v[3])
+	elseif t == "Vector2" then
+		return Vector2.new(v[1], v[2])
+	elseif t == "NumberRange" then
+		return NumberRange.new(v[1], v[2])
+	end
+	return v
+end
+
+local function copyAttributes(from: Instance, to: Instance)
+	for key in to:GetAttributes() do
+		if key ~= TAG and from:GetAttribute(key) == nil then
+			to:SetAttribute(key, nil)
+		end
+	end
+	for key, value in from:GetAttributes() do
+		if key ~= TAG and key ~= OP_TAG and key ~= REF_TAG then
+			to:SetAttribute(key, value)
+		end
+	end
+end
+
+local function copyTags(from: Instance, to: Instance)
+	for _, tagName in CollectionService:GetTags(to) do
+		if not from:HasTag(tagName) then
+			to:RemoveTag(tagName)
+		end
+	end
+	for _, tagName in CollectionService:GetTags(from) do
+		to:AddTag(tagName)
+	end
+end
+
+-- Every tagged object in main, by RoGit ID.
+local function idMap(): { [string]: Instance }
+	local ids = {}
+	for _, name in SERVICES do
+		local ok, service = pcall(game.GetService, game, name)
+		if ok and service then
+			for _, object in service:GetDescendants() do
+				local id = object:GetAttribute(TAG)
+				if type(id) == "string" then
+					ids[id] = object
+				end
+			end
+		end
+	end
+	return ids
+end
+
+local function applyOperation(op: any, templates: { [number]: Instance }, ids: { [string]: Instance }, problems: { string })
+	local function find(key: string): Instance
+		return findObject(key, ids) or error("Couldn't find " .. key .. " in main.", 0)
+	end
+	if op.kind == "set" then
+		local target, template = find(op.target), templates[op.template]
+		local geometry = false
+		for _, property in op.properties do
+			if property == "Attributes" then
+				copyAttributes(template, target)
+			elseif property == "Tags" then
+				copyTags(template, target)
+			elseif (target:IsA("MeshPart") and MESH_DATA[property]) or (target:IsA("PartOperation") and UNION_DATA[property]) then
+				geometry = true
+			else
+				-- Some saved names differ from what scripts use.
+				local name = SCRIPT_NAMES[property] or property
+				local ok = pcall(function()
+					(target :: any)[name] = (template :: any)[name]
+				end)
+				if not ok then
+					table.insert(problems, target:GetFullName() .. "." .. property .. " couldn't be set")
+				end
+			end
+		end
+		for property, key in op.refs do
+			(target :: any)[property] = if key == "" then nil else find(key)
+		end
+		if geometry then
+			local ok, err = pcall(function()
+				if target:IsA("MeshPart") then
+					(target :: any):ApplyMesh(template)
+				else
+					(target :: any):SubstituteGeometry(template)
+				end
+			end)
+			if not ok then
+				table.insert(problems, target:GetFullName() .. " geometry: " .. tostring(err))
+			end
+		end
+	elseif op.kind == "settings" then
+		local service = game:GetService(op.service)
+		for property, encoded in op.values do
+			local ok = pcall(function()
+				(service :: any)[property] = decodeValue(encoded)
+			end)
+			if not ok then
+				table.insert(problems, op.service .. "." .. property .. " couldn't be set")
+			end
+		end
+	elseif op.kind == "rename" then
+		find(op.target).Name = op.name
+	elseif op.kind == "move" then
+		find(op.target).Parent = find(op.parent)
+	elseif op.kind == "add" then
+		local parent, object = find(op.parent), templates[op.template]
+		local marked: { [string]: Instance } = {}
+		for _, descendant in object:GetDescendants() do
+			local marker = descendant:GetAttribute(REF_TAG)
+			if marker then
+				marked[marker] = descendant
+				descendant:SetAttribute(REF_TAG, nil)
+			end
+		end
+		local ownMarker = object:GetAttribute(REF_TAG)
+		if ownMarker then
+			marked[ownMarker] = object
+			object:SetAttribute(REF_TAG, nil)
+		end
+		for _, fixup in op.fixups do
+			local holder = marked[fixup.marker]
+			if holder then
+				(holder :: any)[fixup.property] = if fixup.target == "" then nil else ids[fixup.target] or findObject(fixup.target, ids)
+			end
+		end
+		object.Parent = parent
+	elseif op.kind == "remove" then
+		find(op.target).Parent = nil
+	end
+end
+
+local function applyMerge()
+	local merge = state.merge
+	if not merge or not merge.ready then
+		return
+	end
+	reviewWidget.Enabled = false
+	run("Merging " .. merge.branch .. " into main…", function()
+		local plan = merge.plan
+		local templates: { [number]: Instance } = {}
+		if plan.bundle ~= "" then
+			local data = EncodingService:Base64Decode(buffer.fromstring(plan.bundle))
+			for _, object in SerializationService:DeserializeInstancesAsync(data) do
+				local index = tonumber(object:GetAttribute(OP_TAG))
+				if index then
+					object:SetAttribute(OP_TAG, nil)
+					templates[index] = object
+				end
+			end
+		end
+		local ids = idMap()
+		local problems: { string } = {}
+		local applied, skipped = 0, 0
+		-- Removals go last, so moves and additions can still find everything they need.
+		local ordered = {}
+		for _, op in plan.operations do
+			if op.kind ~= "remove" then
+				table.insert(ordered, op)
+			end
+		end
+		for _, op in plan.operations do
+			if op.kind == "remove" then
+				table.insert(ordered, op)
+			end
+		end
+		local recording = ChangeHistoryService:TryBeginRecording("RoGitMerge", "RoGit merge " .. merge.branch)
+		for _, op in ordered do
+			if op.conflict and merge.choices[op.conflict] ~= "branch" then
+				skipped += 1
+				continue
+			end
+			local ok, err = pcall(applyOperation, op, templates, ids, problems)
+			if ok then
+				applied += 1
+			else
+				table.insert(problems, tostring(err))
+			end
+		end
+		-- Recorded in the same undo step, so undoing the merge (or not saving main) forgets it too. If something
+		-- couldn't be applied, the next merge starts from earlier and offers it again.
+		local recorded = #problems == 0 and merge.id ~= nil
+		if recorded then
+			recordMerge(merge.branch, merge.id)
+		end
+		if recording then
+			ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+		end
+		request("POST", "/api/branches/merged", {
+			name = merge.branch, applied = applied, skipped = skipped, failed = problems, merge = if recorded then merge.id else nil,
+		})
+		state.merge = nil
+		state.notice = string.format("Merged %s into main: %d change%s applied%s. Save main to keep it; Ctrl+Z undoes the merge.",
+			merge.branch, applied, if applied == 1 then "" else "s",
+			if #problems > 0 then string.format(", %d couldn't be applied (see the rogit serve terminal)", #problems) else "")
+	end)
+	refresh()
+end
+
+startMerge = function(name: string)
+	if state.busy then
+		return
+	end
+	state.review = nil
+	run("Giving new objects an ID…", function()
+		tagObjects(state.rojo)
+		step("Copying main…")
+		local capture = newId(16)
+		local manifest = copyPlace(capture)
+		step("Comparing " .. name .. " with main…")
+		local reply = call("POST", "/api/branches/merge", { name = name, capture = capture, manifest = manifest })
+		state.merge = {
+			branch = name, plan = reply.plan, source = reply.source, sourceTime = reply.sourceTime, since = reply.since, id = reply.merge,
+			choices = {},
+		}
+	end)
+	reviewWidget.Enabled = state.merge ~= nil
+	render()
+end
+
+mergeButton.Activated:Connect(applyMerge)
+cancelButton.Activated:Connect(function()
+	state.merge = nil
+	reviewWidget.Enabled = false
+	render()
+end)
 reviewButton.Activated:Connect(runReview)
 refreshButton.Activated:Connect(runReview)
 openReviewButton.Activated:Connect(function()

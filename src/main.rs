@@ -1,5 +1,6 @@
 mod branches;
 mod diff;
+mod merge;
 mod place;
 mod project;
 mod roblox;
@@ -16,7 +17,7 @@ const HELP: &str = "RoGit: branches for your Roblox places' assets.
 
 Usage:
   rogit serve [--port <port>]   Serve this project folder to the RoGit Studio plugin
-  rogit diff [<branch>] [--json] Show what a branch changed (from its saved file), or list branches
+  rogit diff [<branch>] [--json] Show what a branch changed, or list branches
   rogit plugin install          Install the RoGit plugin into Roblox Studio
   rogit --version               Show the version";
 
@@ -30,6 +31,8 @@ fn main() {
         ["diff"] => diff(None, false),
         ["diff", name] => diff(Some(name), false),
         ["diff", name, "--json"] => diff(Some(name), true),
+        // Development aid: plan a merge against a saved copy of main and print the plan.
+        ["plan-merge", name, main] => plan_merge(name, main),
         ["--version" | "-V"] => Ok(println!("rogit {}", env!("CARGO_PKG_VERSION"))),
         [] | ["help" | "--help" | "-h"] => Ok(println!("{HELP}")),
         _ => Err(format!("Unknown command.\n\n{HELP}")),
@@ -60,15 +63,26 @@ fn diff(name: Option<&str>, as_json: bool) -> Result<(), String> {
         return Ok(());
     };
     let start = branches.starting_point(name)?;
-    let file = branches.file(name);
-    let current = place::read(&file)?;
+    // Like a merge: the saved branch file, or the copy from the last review in Studio if that's newer.
+    let (current, source, time) = branches.newest(name)?;
     let review = diff::compare(&start, &current, &project.rojo_paths());
     if as_json {
         println!("{}", serde_json::to_string(&review).map_err(|e| e.to_string())?);
         return Ok(());
     }
-    let saved = fs::metadata(&file).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok());
-    print_review(name, &review, saved.map(|d| d.as_secs()));
+    print_review(name, &review, source, time);
+    Ok(())
+}
+
+fn plan_merge(name: &str, main: &str) -> Result<(), String> {
+    let root = env::current_dir().map_err(|e| format!("Couldn't read the current folder: {e}"))?;
+    let project = project::Project::new(root.clone());
+    let branches = branches::Branches::new(root.join(project::DATA_DIR));
+    let main = place::read(std::path::Path::new(main))?;
+    let (base, _) = branches.merge_base(name, merge::last_merge(&main, name).as_deref())?;
+    let (branch, _, _) = branches.newest(name)?;
+    let plan = merge::plan(&base, &branch, &main, &project.rojo_paths())?;
+    println!("{}", serde_json::to_string(&plan).map_err(|e| e.to_string())?);
     Ok(())
 }
 
@@ -82,14 +96,14 @@ fn ago(unix: u64) -> String {
     }
 }
 
-fn print_review(name: &str, review: &diff::Review, saved: Option<u64>) {
+fn print_review(name: &str, review: &diff::Review, source: &str, time: u64) {
     let color = io::stdout().is_terminal();
     let paint = |code: &str, text: &str| if color { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_owned() };
     let s = &review.summary;
     println!(
         "{}: {} added, {} removed, {} changed{}",
         paint("1", name), s.added, s.removed, s.changed,
-        saved.map(|t| format!(" (branch file saved {})", ago(t))).unwrap_or_default()
+        if source == "saved" { format!(" (branch file saved {})", ago(time)) } else { format!(" (as reviewed in Studio {})", ago(time)) }
     );
     if review.rows.is_empty() {
         println!("No changes since the branch started. Save the branch in Studio (Ctrl+S) to include recent edits.");

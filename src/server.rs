@@ -2,12 +2,13 @@
 
 use crate::branches::{self, Branches};
 use crate::diff;
+use crate::merge;
 use crate::project::{DATA_DIR, Game, Project};
 use crate::roblox::Roblox;
 use base64::Engine;
 use serde_json::{Value, json};
-use std::collections::HashSet;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 pub const DEFAULT_PORT: u16 = 34875;
@@ -19,13 +20,15 @@ struct State {
     branches: Branches,
     roblox: Roblox,
     seen_places: HashSet<String>,
+    /// Planned merges by branch: the merge's ID and the branch as it was merged, kept once the plugin applies it.
+    planned: HashMap<String, (String, rbx_dom_weak::WeakDom)>,
 }
 
 pub fn serve(project: Project, port: u16) -> Result<(), String> {
     let address = format!("127.0.0.1:{port}");
     let server = Server::http(&address).map_err(|e| format!("Couldn't listen on {address}: {e}"))?;
     let branches = Branches::new(project.root.join(DATA_DIR));
-    let mut state = State { project, branches, roblox: Roblox::new(), seen_places: HashSet::new() };
+    let mut state = State { project, branches, roblox: Roblox::new(), seen_places: HashSet::new(), planned: HashMap::new() };
     println!("RoGit {} is serving {} on http://{address}", env!("CARGO_PKG_VERSION"), state.project.folder_name());
     match state.project.config() {
         Ok(Some(config)) => println!("Project: {} (main place {})", config.game.name, config.game.main_place_id),
@@ -53,6 +56,8 @@ fn handle(state: &mut State, mut request: Request) {
         (Method::Post, "/api/branches/start") => starting_point(state, &body),
         (Method::Post, "/api/branches/open") => open_branch(state, &body),
         (Method::Post, "/api/branches/review") => review_branch(state, &body),
+        (Method::Post, "/api/branches/merge") => plan_merge(state, &body),
+        (Method::Post, "/api/branches/merged") => merged(state, &body),
         _ => Err((404, "Not found.".to_owned())),
     };
     let (code, value) = match result {
@@ -234,6 +239,54 @@ fn review_branch(state: &mut State, body: &str) -> Reply {
         s.added, s.removed, s.changed, started.elapsed().as_millis()
     );
     Ok(json!({ "review": review }))
+}
+
+/// Plans merging a branch into main as it is in Studio right now (`capture` is main's copy).
+fn plan_merge(state: &mut State, body: &str) -> Reply {
+    require_game(state)?;
+    let started = Instant::now();
+    let (name, capture, manifest) = capture_request(body)?;
+    let upload = state.branches.upload_dir(&capture);
+    let main = crate::place::assemble(&upload, &manifest);
+    let _ = std::fs::remove_dir_all(&upload);
+    let main = main.map_err(|e| (500, e))?.0;
+    let last = merge::last_merge(&main, &name);
+    let (base, since_merge) = state.branches.merge_base(&name, last.as_deref()).map_err(|e| (409, e))?;
+    let (branch, source, time) = state.branches.newest(&name).map_err(|e| (500, e))?;
+    let plan = merge::plan(&base, &branch, &main, &state.project.rojo_paths()).map_err(|e| (500, e))?;
+    let s = &plan.summary;
+    println!(
+        "Planned merging {name} ({source} branch, since {}): {} added, {} removed, {} changed, {} conflicts ({} ms)",
+        if since_merge { "the last merge" } else { "it started" },
+        s.added, s.removed, s.changed, s.conflicts, started.elapsed().as_millis()
+    );
+    let id = format!("m{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let reply = json!({ "plan": plan, "source": source, "sourceTime": time, "since": if since_merge { "merge" } else { "start" }, "merge": id });
+    state.planned.insert(name, (id, branch));
+    Ok(reply)
+}
+
+fn merged(state: &mut State, body: &str) -> Reply {
+    let report = json_body(body)?;
+    let name = report["name"].as_str().unwrap_or_default();
+    state.branches.mark_merged(name).map_err(|e| (404, e))?;
+    println!(
+        "Merged {name} into main: {} operations applied, {} skipped by choice, {} problems",
+        report["applied"], report["skipped"], report["failed"].as_array().map(Vec::len).unwrap_or_default()
+    );
+    for problem in report["failed"].as_array().into_iter().flatten().take(20) {
+        println!("  {}", problem.as_str().unwrap_or_default());
+    }
+    // The plugin records the merge in main only when everything applied; then the next merge can start from here.
+    if let Some(id) = report["merge"].as_str() {
+        match state.planned.remove(name) {
+            Some((planned, branch)) if planned == id => {
+                state.branches.keep_merge(name, id, &branch).map_err(|e| (500, format!("Couldn't keep the merged copy: {e}")))?;
+            }
+            _ => println!("  This merge wasn't planned by this rogit serve, so the next merge of {name} starts from earlier."),
+        }
+    }
+    Ok(json!({ "branch": state.branches.get(name) }))
 }
 
 fn open_branch(state: &mut State, body: &str) -> Reply {

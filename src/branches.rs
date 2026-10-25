@@ -18,6 +18,17 @@ pub struct Branch {
     /// Unix time in seconds.
     pub created: u64,
     pub has_starting_point: bool,
+    /// Unix time of the last merge into main.
+    #[serde(default)]
+    pub merged: Option<u64>,
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
+}
+
+fn modified(path: &Path) -> Option<u64> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
 }
 
 pub struct Branches {
@@ -104,8 +115,7 @@ impl Branches {
         let report = place::build(&upload, manifest, &self.file(name));
         let _ = fs::remove_dir_all(&upload);
         let report = report?;
-        let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
-        self.save(&Branch { name: name.to_owned(), created, has_starting_point: false })?;
+        self.save(&Branch { name: name.to_owned(), created: now(), has_starting_point: false, merged: None })?;
         Ok(report)
     }
 
@@ -142,6 +152,57 @@ impl Branches {
         fs::rename(self.upload_dir(capture), &target).map_err(|e| format!("Couldn't keep the copy: {e}"))?;
         fs::write(target.join("manifest.json"), manifest.to_string()).map_err(|e| e.to_string())?;
         place::assemble(&target, manifest).map(|(dom, _)| dom)
+    }
+
+    /// The branch's newest content: its saved file, or the copy from its last review if that's newer (it includes
+    /// edits made before saving). Returns the place, where it came from, and when.
+    pub fn newest(&self, name: &str) -> Result<(rbx_dom_weak::WeakDom, &'static str, u64), String> {
+        let file = self.file(name);
+        let latest = self.dir().join(name).join("latest");
+        let file_time = modified(&file).unwrap_or_default();
+        match modified(&latest.join("manifest.json")) {
+            Some(review_time) if review_time > file_time => {
+                let manifest: Value = serde_json::from_slice(&fs::read(latest.join("manifest.json")).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                Ok((place::assemble(&latest, &manifest)?.0, "reviewed", review_time))
+            }
+            _ => Ok((place::read(&file)?, "saved", file_time)),
+        }
+    }
+
+    fn merge_copy(&self, name: &str, merge: &str) -> PathBuf {
+        self.dir().join(name).join("merges").join(format!("{merge}.rbxl"))
+    }
+
+    /// Keeps the branch as it was merged, so the next merge only brings what changed after it. Keeps the last few,
+    /// since main may still have an older merge (the newest one could be undone or never saved).
+    pub fn keep_merge(&self, name: &str, merge: &str, dom: &rbx_dom_weak::WeakDom) -> Result<(), String> {
+        let file = self.merge_copy(name, merge);
+        let dir = file.parent().unwrap();
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        place::write(dom, &file)?;
+        let mut copies: Vec<(u64, PathBuf)> =
+            fs::read_dir(dir).into_iter().flatten().flatten().map(|e| (modified(&e.path()).unwrap_or_default(), e.path())).collect();
+        copies.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, old) in copies.into_iter().skip(5) {
+            let _ = fs::remove_file(old);
+        }
+        Ok(())
+    }
+
+    /// What a merge compares the branch with: the branch as it was last merged, if main still has that merge (its
+    /// record says `last`), or else its starting point. Returns the place and whether it's a merge.
+    pub fn merge_base(&self, name: &str, last: Option<&str>) -> Result<(rbx_dom_weak::WeakDom, bool), String> {
+        if let Some(file) = last.filter(|id| valid_capture(id)).map(|id| self.merge_copy(name, id)).filter(|f| f.exists()) {
+            return Ok((place::read(&file)?, true));
+        }
+        Ok((self.starting_point(name)?, false))
+    }
+
+    pub fn mark_merged(&self, name: &str) -> Result<(), String> {
+        let mut branch = self.get(name).ok_or_else(|| format!("There's no branch called {name}."))?;
+        branch.merged = Some(now());
+        self.save(&branch)
     }
 
     pub fn open(&self, name: &str) -> Result<(), String> {

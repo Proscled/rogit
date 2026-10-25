@@ -9,16 +9,23 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 pub const TAG: &str = "RoGitId";
+/// Workspace attribute in main that records the last merge of each branch.
+pub const MERGES: &str = "RoGitMerges";
 const MAX_ROWS: usize = 2000;
 /// Services whose contents are saved in place files. Matches the plugin's list.
-const SERVICES: [&str; 18] = [
+pub(crate) const SERVICES: [&str; 18] = [
     "Workspace", "Lighting", "MaterialService", "ReplicatedFirst", "ReplicatedStorage", "ServerScriptService",
     "ServerStorage", "StarterGui", "StarterPack", "StarterPlayer", "Teams", "SoundService", "TextChatService",
     "Chat", "LocalizationService", "TestService", "SocialService", "VoiceChatService",
 ];
 /// Properties that Studio changes by itself, or that only one kind of copy contains.
-const IGNORED: [&str; 7] =
-    ["UniqueId", "HistoryId", "Capabilities", "DefinesCapabilities", "SourceAssetId", "PhysicsGrid", "NeedsPivotMigration"];
+pub(crate) const IGNORED: [&str; 8] = [
+    "UniqueId", "HistoryId", "Capabilities", "DefinesCapabilities", "SourceAssetId", "PhysicsGrid", "NeedsPivotMigration",
+    // Studio keeps this in step with the model's pivot; it can't be set and moves whenever the model moves.
+    "ModelMeshCFrame",
+];
+/// Changes that only move or turn an object. A moved model shows once, with these folded in from inside it.
+const SPATIAL: [&str; 3] = ["Position", "Rotation", "Pivot"];
 
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -34,6 +41,15 @@ pub struct Change {
     pub name: String,
     pub old: String,
     pub new: String,
+    /// Set when this change conflicts with main and needs a choice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<usize>,
+}
+
+impl Change {
+    pub fn new(name: impl Into<String>, old: impl Into<String>, new: impl Into<String>) -> Self {
+        Change { name: name.into(), old: old.into(), new: new.into(), conflict: None }
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -44,6 +60,8 @@ pub struct Row {
     pub class: String,
     pub status: Status,
     pub changes: Vec<Change>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<usize>,
 }
 
 #[derive(Serialize, Default, Debug, PartialEq)]
@@ -63,22 +81,25 @@ pub struct Review {
 
 // Index of the objects RoGit tracks in one place ----------------------------------------------------
 
-struct Entry {
-    key: String,
-    referent: Ref,
-    parent: Option<String>,
-    path: String,
+pub(crate) struct Entry {
+    /// The key shared across places (the starting point's, once matched).
+    pub key: String,
+    /// The key as found in this place: its own RoGit ID or path. Studio finds the object by this one.
+    pub own_key: String,
+    pub referent: Ref,
+    pub parent: Option<String>,
+    pub path: String,
 }
 
 #[derive(Default)]
-struct Index {
-    entries: Vec<Entry>,
-    by_key: HashMap<String, usize>,
-    by_ref: HashMap<Ref, String>,
+pub(crate) struct Index {
+    pub entries: Vec<Entry>,
+    pub by_key: HashMap<String, usize>,
+    pub by_ref: HashMap<Ref, String>,
 }
 
 impl Index {
-    fn get(&self, key: &str) -> Option<&Entry> {
+    pub fn get(&self, key: &str) -> Option<&Entry> {
         self.by_key.get(key).map(|&i| &self.entries[i])
     }
 
@@ -96,7 +117,7 @@ impl Index {
     }
 }
 
-fn is_script(inst: &Instance) -> bool {
+pub(crate) fn is_script(inst: &Instance) -> bool {
     matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript")
 }
 
@@ -118,7 +139,7 @@ fn tag(inst: &Instance) -> Option<String> {
 /// Lists what RoGit tracks, using the same rules as the plugin: everything in the saved services except
 /// scripts, Folders that contain a script anywhere inside, and whatever Rojo syncs. Objects are keyed by their
 /// RoGit ID; objects without one (or with a copied one) are keyed by their path.
-fn index(dom: &WeakDom, rojo: &RojoPaths) -> Index {
+pub(crate) fn index(dom: &WeakDom, rojo: &RojoPaths) -> Index {
     let mut index = Index::default();
     if rojo.all {
         return index;
@@ -131,7 +152,7 @@ fn index(dom: &WeakDom, rojo: &RojoPaths) -> Index {
             continue;
         }
         let key = format!("service:{}", service.name);
-        index.push(Entry { key: key.clone(), referent: service_ref, parent: None, path: service.name.clone() });
+        index.push(Entry { key: key.clone(), own_key: key.clone(), referent: service_ref, parent: None, path: service.name.clone() });
         visit(dom, service_ref, &service.name, &key, &rojo, &mut untagged, &mut index);
     }
     index
@@ -154,6 +175,10 @@ fn visit(
             has_script = true;
             continue;
         }
+        // Studio's camera moves whenever you look around; it isn't part of a branch.
+        if child.class.as_str() == "Camera" {
+            continue;
+        }
         if rojo.contains(path.as_str()) {
             continue;
         }
@@ -166,7 +191,7 @@ fn visit(
             }
         };
         let mark = index.entries.len();
-        index.push(Entry { key: key.clone(), referent: child_ref, parent: Some(parent_key.to_owned()), path: path.clone() });
+        index.push(Entry { key: key.clone(), own_key: key.clone(), referent: child_ref, parent: Some(parent_key.to_owned()), path: path.clone() });
         if visit(dom, child_ref, &path, &key, rojo, untagged, index) {
             has_script = true;
             if child.class.as_str() == "Folder" {
@@ -199,8 +224,13 @@ fn close_cframe(a: &CFrame, b: &CFrame) -> bool {
         && close3(&a.orientation.z, &b.orientation.z)
 }
 
+/// RoGit's own attributes, which never count as changes.
+fn own_attribute(name: &str) -> bool {
+    name == TAG || name == MERGES
+}
+
 /// Equal, allowing for rounding in saved numbers. References compare by what they point at.
-fn same(a: &Variant, b: &Variant, refs: (&Index, &Index)) -> bool {
+pub(crate) fn same(a: &Variant, b: &Variant, refs: (&Index, &Index)) -> bool {
     match (a, b) {
         (Variant::Float32(x), Variant::Float32(y)) => close(*x, *y),
         (Variant::Float64(x), Variant::Float64(y)) => close(*x as f32, *y as f32),
@@ -214,7 +244,7 @@ fn same(a: &Variant, b: &Variant, refs: (&Index, &Index)) -> bool {
         },
         (Variant::Ref(x), Variant::Ref(y)) => refs.0.by_ref.get(x) == refs.1.by_ref.get(y),
         (Variant::Attributes(x), Variant::Attributes(y)) => {
-            let keys: HashSet<&String> = x.iter().chain(y.iter()).map(|(k, _)| k).filter(|k| *k != TAG).collect();
+            let keys: HashSet<&String> = x.iter().chain(y.iter()).map(|(k, _)| k).filter(|k| !own_attribute(k)).collect();
             keys.into_iter().all(|k| match (x.get(k.as_str()), y.get(k.as_str())) {
                 (Some(a), Some(b)) => same(a, b, refs),
                 (a, b) => a.is_none() && b.is_none(),
@@ -240,7 +270,7 @@ fn vector(v: &Vector3) -> String {
 }
 
 /// A short, readable version of a value for the review.
-fn show(value: &Variant, class: &str, property: &str, index: &Index, other_rotation_differs: bool) -> String {
+pub(crate) fn show(value: &Variant, class: &str, property: &str, index: &Index, other_rotation_differs: bool) -> String {
     let text = match value {
         Variant::Bool(b) => b.to_string(),
         Variant::Float32(n) => number(*n as f64),
@@ -263,7 +293,7 @@ fn show(value: &Variant, class: &str, property: &str, index: &Index, other_rotat
         Variant::BinaryString(_) | Variant::SharedString(_) => "(data)".into(),
         Variant::Attributes(a) => {
             let mut parts: Vec<String> =
-                a.iter().filter(|(k, _)| k.as_str() != TAG).map(|(k, v)| format!("{k}={}", show(v, "", "", index, false))).collect();
+                a.iter().filter(|(k, _)| !own_attribute(k)).map(|(k, v)| format!("{k}={}", show(v, "", "", index, false))).collect();
             parts.sort();
             if parts.is_empty() { "none".into() } else { parts.join(", ") }
         }
@@ -288,7 +318,18 @@ fn enum_name(class: &str, property: &str, value: u32) -> Option<String> {
     db.enums.get(&name[..])?.items.iter().find(|(_, v)| **v == value).map(|(item, _)| item.to_string())
 }
 
-fn rotation_differs(a: &Variant, b: &Variant) -> bool {
+/// What builders call a property in the review.
+pub(crate) fn label(property: &str, rotated: bool) -> String {
+    match property {
+        "CFrame" if rotated => "Rotation",
+        "CFrame" => "Position",
+        "WorldPivotData" => "Pivot",
+        other => other,
+    }
+    .to_owned()
+}
+
+pub(crate) fn rotation_differs(a: &Variant, b: &Variant) -> bool {
     match (a, b) {
         (Variant::CFrame(x), Variant::CFrame(y)) => close3(&x.position, &y.position) && !close_cframe(x, y),
         _ => false,
@@ -299,7 +340,7 @@ fn changes(start: (&WeakDom, &Index, Ref), current: (&WeakDom, &Index, Ref)) -> 
     let (old, new) = (start.0.get_by_ref(start.2).unwrap(), current.0.get_by_ref(current.2).unwrap());
     let mut out = Vec::new();
     if old.name != new.name {
-        out.push(Change { name: "Name".into(), old: old.name.clone(), new: new.name.clone() });
+        out.push(Change::new("Name", old.name.clone(), new.name.clone()));
     }
     let class = new.class.as_str();
     let mut names: Vec<&str> = new.properties.keys().map(|k| k.as_str()).filter(|k| !IGNORED.contains(k)).collect();
@@ -309,17 +350,7 @@ fn changes(start: (&WeakDom, &Index, Ref), current: (&WeakDom, &Index, Ref)) -> 
         let (_, after) = new.properties.iter().find(|(k, _)| k.as_str() == name).unwrap();
         if !same(before, after, (start.1, current.1)) {
             let rotated = rotation_differs(before, after);
-            // Builders think in position and rotation, not CFrame.
-            let label = match name {
-                "CFrame" if rotated => "Rotation",
-                "CFrame" => "Position",
-                other => other,
-            };
-            out.push(Change {
-                name: label.into(),
-                old: show(before, class, name, start.1, rotated),
-                new: show(after, class, name, current.1, rotated),
-            });
+            out.push(Change::new(label(name, rotated), show(before, class, name, start.1, rotated), show(after, class, name, current.1, rotated)));
         }
     }
     out
@@ -332,18 +363,19 @@ struct Node {
     class: String,
     status: Status,
     changes: Vec<Change>,
+    conflict: Option<usize>,
     children: Vec<String>,
 }
 
 #[derive(Default)]
-struct Tree {
+pub(crate) struct Tree {
     nodes: HashMap<String, Node>,
     roots: Vec<String>,
 }
 
 impl Tree {
     /// Adds `key` and the chain of its parents, taking names from the place `key` lives in.
-    fn add(&mut self, dom: &WeakDom, index: &Index, key: &str, status: Status, changes: Vec<Change>) {
+    pub fn add(&mut self, dom: &WeakDom, index: &Index, key: &str, status: Status, changes: Vec<Change>) {
         let mut chain = vec![key.to_owned()];
         while let Some(parent) = index.get(chain.last().unwrap()).and_then(|e| e.parent.clone()) {
             chain.push(parent);
@@ -353,7 +385,9 @@ impl Tree {
         for link in &chain {
             if !self.nodes.contains_key(link) {
                 let inst = dom.get_by_ref(index.get(link).unwrap().referent).unwrap();
-                let node = Node { name: inst.name.clone(), class: inst.class.to_string(), status: Status::Context, changes: vec![], children: vec![] };
+                let node = Node {
+                    name: inst.name.clone(), class: inst.class.to_string(), status: Status::Context, changes: vec![], conflict: None, children: vec![],
+                };
                 self.nodes.insert(link.clone(), node);
                 match &parent {
                     Some(p) => self.nodes.get_mut(p).unwrap().children.push(link.clone()),
@@ -367,22 +401,51 @@ impl Tree {
         node.changes = changes;
     }
 
-    fn rows(mut self) -> (Vec<Row>, usize) {
-        let mut rows = Vec::new();
+    /// Marks a whole row (an added or removed object) as needing a choice.
+    pub fn mark_conflict(&mut self, key: &str, id: usize) {
+        if let Some(node) = self.nodes.get_mut(key) {
+            node.conflict = Some(id);
+        }
+    }
+
+    /// Rows in Explorer order. An object that only moved because its model moved is folded into the model's row
+    /// ("Moved with it: N objects") instead of getting a row of its own.
+    pub fn rows(mut self) -> (Vec<Row>, usize) {
+        let spatial = |changes: &[Change]| !changes.is_empty() && changes.iter().all(|c| SPATIAL.contains(&c.name.as_str()));
+        let mut rows: Vec<Row> = Vec::new();
         let mut truncated = 0;
+        let mut moved_with: HashMap<usize, usize> = HashMap::new();
         let mut roots = std::mem::take(&mut self.roots);
         self.sort(&mut roots);
-        let mut stack: Vec<(String, usize)> = roots.into_iter().rev().map(|k| (k, 0)).collect();
-        while let Some((key, depth)) = stack.pop() {
+        // Each entry: key, depth, and the row of the nearest shown ancestor that moved.
+        let mut stack: Vec<(String, usize, Option<usize>)> = roots.into_iter().rev().map(|k| (k, 0, None)).collect();
+        while let Some((key, depth, mover)) = stack.pop() {
             let mut node = self.nodes.remove(&key).unwrap();
+            let mut children = std::mem::take(&mut node.children);
+            self.sort(&mut children);
+            if let Some(owner) = mover {
+                if node.status == Status::Changed && node.conflict.is_none() && spatial(&node.changes) {
+                    *moved_with.entry(owner).or_default() += 1;
+                    stack.extend(children.into_iter().rev().map(|k| (k, depth, Some(owner))));
+                    continue;
+                }
+            }
+            let mut child_mover = None;
             if rows.len() >= MAX_ROWS {
                 truncated += 1;
             } else {
-                rows.push(Row { depth, key: key.clone(), name: node.name, class: node.class, status: node.status, changes: node.changes });
+                let moved = node.status == Status::Changed && node.changes.iter().any(|c| SPATIAL.contains(&c.name.as_str()));
+                rows.push(Row {
+                    depth, key: key.clone(), name: node.name, class: node.class, status: node.status, changes: node.changes, conflict: node.conflict,
+                });
+                if moved {
+                    child_mover = Some(rows.len() - 1);
+                }
             }
-            let mut children = std::mem::take(&mut node.children);
-            self.sort(&mut children);
-            stack.extend(children.into_iter().rev().map(|k| (k, depth + 1)));
+            stack.extend(children.into_iter().rev().map(|k| (k, depth + 1, child_mover)));
+        }
+        for (row, count) in moved_with {
+            rows[row].changes.push(Change::new("Moved with it", "", format!("{count} objects")));
         }
         (rows, truncated)
     }
@@ -392,21 +455,21 @@ impl Tree {
     }
 }
 
-/// An object with no ID at the start (Studio made it, or tagging skipped it) that got one later is the same object:
-/// re-key it under its starting-point key, and its children's parent links with it.
-fn adopt_new_ids(start: &WeakDom, old: &Index, current: &WeakDom, new: &mut Index) {
+/// Objects whose ID didn't carry over are still the same object: one Studio created after the start and RoGit
+/// tagged later, or one in main whose ID was never saved. Unmatched objects with the same path and class are paired
+/// and re-keyed under the starting point's key; each keeps its `own_key`, so Studio can still find it.
+pub(crate) fn adopt_new_ids(start: &WeakDom, old: &Index, current: &WeakDom, new: &mut Index) {
     let class = |dom: &WeakDom, r: Ref| dom.get_by_ref(r).map(|i| i.class.to_string()).unwrap_or_default();
-    // Untagged starting-point objects, by path and class.
-    let mut untagged: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for entry in old.entries.iter().filter(|e| e.key.starts_with("path:")) {
-        untagged.entry((entry.path.clone(), class(start, entry.referent))).or_default().push(entry.key.clone());
+    let mut unmatched: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for entry in old.entries.iter().filter(|e| !e.key.starts_with("service:") && new.get(&e.key).is_none()) {
+        unmatched.entry((entry.path.clone(), class(start, entry.referent))).or_default().push(entry.key.clone());
     }
     let mut renamed: HashMap<String, String> = HashMap::new();
     for entry in &new.entries {
-        if entry.key.starts_with("path:") || entry.key.starts_with("service:") || old.get(&entry.key).is_some() {
+        if entry.key.starts_with("service:") || old.get(&entry.key).is_some() {
             continue;
         }
-        if let Some(keys) = untagged.get_mut(&(entry.path.clone(), class(current, entry.referent))) {
+        if let Some(keys) = unmatched.get_mut(&(entry.path.clone(), class(current, entry.referent))) {
             if !keys.is_empty() {
                 renamed.insert(entry.key.clone(), keys.remove(0));
             }
@@ -461,7 +524,7 @@ pub fn compare(start: &WeakDom, current: &WeakDom, rojo: &RojoPaths) -> Review {
         let mut list = changes((start, &old, before.referent), (current, &new, entry.referent));
         if before.parent != entry.parent {
             let path = |index: &Index, key: &Option<String>| key.as_ref().and_then(|k| index.get(k)).map(|e| e.path.clone()).unwrap_or_default();
-            list.insert(0, Change { name: "Parent".into(), old: path(&old, &before.parent), new: path(&new, &entry.parent) });
+            list.insert(0, Change::new("Parent", path(&old, &before.parent), path(&new, &entry.parent)));
         }
         if !list.is_empty() {
             summary.changed += 1;
@@ -476,7 +539,7 @@ pub fn compare(start: &WeakDom, current: &WeakDom, rojo: &RojoPaths) -> Review {
         }
     }
     let contents = |key: &str| match inside.get(key) {
-        Some(n) => vec![Change { name: "Contains".into(), old: String::new(), new: format!("{n} objects") }],
+        Some(n) => vec![Change::new("Contains", "", format!("{n} objects"))],
         None => vec![],
     };
     for entry in new.entries.iter().filter(|e| added.contains(e.key.as_str()) && top(&new, &added, &e.key).is_none()) {
@@ -488,6 +551,7 @@ pub fn compare(start: &WeakDom, current: &WeakDom, rojo: &RojoPaths) -> Review {
         tree.add(start, &old, &entry.key, Status::Removed, contents(&entry.key));
     }
     let (rows, truncated) = tree.rows();
+    summary.changed = rows.iter().filter(|r| r.status == Status::Changed).count();
     Review { summary, rows, truncated }
 }
 
@@ -551,7 +615,7 @@ mod tests {
         assert_eq!(review.summary, Summary { added: 1, removed: 1, changed: 2 });
         let row = |name: &str| review.rows.iter().find(|r| r.name == name).unwrap();
         assert_eq!(row("Gate").status, Status::Changed);
-        assert_eq!(row("Gate").changes, vec![Change { name: "Color".into(), old: "128, 0, 0".into(), new: "255, 0, 0".into() }]);
+        assert_eq!(row("Gate").changes, vec![Change::new("Color", "128, 0, 0", "255, 0, 0")]);
         assert_eq!(row("Watchtower").changes[0].name, "Name");
         assert_eq!(row("Crate").status, Status::Added);
         assert_eq!(row("Crate").changes[0].new, "1 objects");
@@ -575,6 +639,33 @@ mod tests {
         current.get_by_ref_mut(effects).unwrap().properties.insert("Attributes".into(), Variant::Attributes(attributes));
         let review = compare(&start, &current, &RojoPaths::default());
         assert_eq!(review.summary, Summary::default());
+    }
+
+    #[test]
+    fn a_moved_model_is_one_row() {
+        let mut start = place(0.5, "Tower", true, false);
+        let mut current = place(0.5, "Tower", true, false);
+        let moved = Variant::CFrame(CFrame::new(Vector3::new(10.0, 0.0, 0.0), rbx_dom_weak::types::Matrix3::identity()));
+        let still = Variant::CFrame(CFrame::new(Vector3::new(0.0, 0.0, 0.0), rbx_dom_weak::types::Matrix3::identity()));
+        // The shed's pivot and its roof both moved: one row for the shed, the roof folded in.
+        for (dom, value) in [(&mut start, &still), (&mut current, &moved)] {
+            for name in ["Shed", "Roof"] {
+                let r = dom.descendants().find(|i| i.name == name).unwrap().referent();
+                let property = if name == "Shed" { "WorldPivotData" } else { "CFrame" };
+                let value = if name == "Shed" {
+                    match value { Variant::CFrame(c) => Variant::OptionalCFrame(Some(*c)), other => other.clone() }
+                } else {
+                    value.clone()
+                };
+                dom.get_by_ref_mut(r).unwrap().properties.insert(property.into(), value);
+            }
+        }
+        let review = compare(&start, &current, &RojoPaths::default());
+        assert_eq!(review.summary.changed, 1);
+        let shed = review.rows.iter().find(|r| r.name == "Shed").unwrap();
+        assert_eq!(shed.changes[0].name, "Pivot");
+        assert_eq!(shed.changes.last().unwrap(), &Change::new("Moved with it", "", "1 objects"));
+        assert!(review.rows.iter().all(|r| r.name != "Roof"));
     }
 
     #[test]
