@@ -21,10 +21,12 @@ pub(crate) const SERVICES: [&str; 18] = [
     "Chat", "LocalizationService", "TestService", "SocialService", "VoiceChatService",
 ];
 /// Properties that Studio changes by itself, or that only one kind of copy contains.
-pub(crate) const IGNORED: [&str; 8] = [
+pub(crate) const IGNORED: [&str; 9] = [
     "UniqueId", "HistoryId", "Capabilities", "DefinesCapabilities", "SourceAssetId", "PhysicsGrid", "NeedsPivotMigration",
     // Studio keeps this in step with the model's pivot; it can't be set and moves whenever the model moves.
     "ModelMeshCFrame",
+    // Studio's own camera, which isn't part of a branch.
+    "CurrentCamera",
 ];
 /// Changes that only move or turn an object. A moved model shows once, with these folded in from inside it.
 const SPATIAL: [&str; 3] = ["Position", "Rotation", "Pivot"];
@@ -66,7 +68,7 @@ pub struct Row {
     pub conflict: Option<usize>,
 }
 
-#[derive(Serialize, Default, Debug, PartialEq)]
+#[derive(Serialize, serde::Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Summary {
     pub added: usize,
     pub removed: usize,
@@ -226,9 +228,10 @@ fn close_cframe(a: &CFrame, b: &CFrame) -> bool {
         && close3(&a.orientation.z, &b.orientation.z)
 }
 
-/// RoGit's own attributes, which never count as changes.
-fn own_attribute(name: &str) -> bool {
-    name == TAG || name == MERGES || name == UPDATE
+/// Attributes that never count as changes: RoGit's own, and the `RBX_` ones Roblox keeps for itself (for example
+/// while upgrading a place's lighting).
+pub(crate) fn own_attribute(name: &str) -> bool {
+    name == TAG || name == MERGES || name == UPDATE || name.starts_with("RBX_")
 }
 
 /// Equal, allowing for rounding in saved numbers. References compare by what they point at.
@@ -416,6 +419,25 @@ impl Tree {
     /// the model's. A folded object's conflict with nothing to join keeps its own row.
     pub fn rows(mut self) -> (Vec<Row>, usize, HashMap<usize, usize>) {
         let spatial = |changes: &[Change]| !changes.is_empty() && changes.iter().all(|c| SPATIAL.contains(&c.name.as_str()));
+        // Parts of the tree where things only moved. A model like that is one moved row too, even if its own pivot
+        // didn't change (for example its parts were moved together).
+        let mut moves: HashMap<String, (bool, usize)> = HashMap::new();
+        let keys: Vec<String> = self.nodes.keys().cloned().collect();
+        for key in &keys {
+            self.only_moves_below(key, &spatial, &mut moves);
+        }
+        let moved_inside: HashSet<String> = keys
+            .iter()
+            .filter(|k| {
+                let node = &self.nodes[*k];
+                node.class == "Model"
+                    && node.status == Status::Context
+                    && moves[*k].0
+                    && moves[*k].1 >= 2
+                    && self.moved_together(k, &mut None)
+            })
+            .cloned()
+            .collect();
         let move_conflict = |changes: &[Change]| changes.iter().find(|c| SPATIAL.contains(&c.name.as_str())).and_then(|c| c.conflict);
         let mut rows: Vec<Row> = Vec::new();
         let mut truncated = 0;
@@ -430,6 +452,11 @@ impl Tree {
             let mut children = std::mem::take(&mut node.children);
             self.sort(&mut children);
             if let Some(owner) = mover {
+                // Something unchanged inside a moved model, with only moves below it: fold it and its contents in.
+                if node.status == Status::Context && moves.get(&key).is_some_and(|m| m.0) {
+                    stack.extend(children.into_iter().rev().map(|k| (k, depth, Some(owner))));
+                    continue;
+                }
                 let owner_conflict = move_conflict(&rows[owner].changes);
                 let conflicts: Vec<usize> = node.changes.iter().filter_map(|c| c.conflict).collect();
                 let can_join = conflicts.is_empty() || owner_conflict.is_some();
@@ -446,7 +473,11 @@ impl Tree {
             if rows.len() >= MAX_ROWS {
                 truncated += 1;
             } else {
-                let moved = node.status == Status::Changed && node.changes.iter().any(|c| SPATIAL.contains(&c.name.as_str()));
+                let mut moved = node.status == Status::Changed && node.changes.iter().any(|c| SPATIAL.contains(&c.name.as_str()));
+                if moved_inside.contains(&key) && !moved {
+                    moved = true;
+                    node.status = Status::Changed;
+                }
                 rows.push(Row {
                     depth, key: key.clone(), name: node.name, class: node.class, status: node.status, changes: node.changes, conflict: node.conflict,
                 });
@@ -457,9 +488,62 @@ impl Tree {
             stack.extend(children.into_iter().rev().map(|k| (k, depth + 1, child_mover)));
         }
         for (row, count) in moved_with {
-            rows[row].changes.push(Change::new("Moved with it", "", format!("{count} objects")));
+            let own_move = rows[row].changes.iter().any(|c| SPATIAL.contains(&c.name.as_str()));
+            let label = if own_move { "Moved with it" } else { "Moved inside" };
+            rows[row].changes.push(Change::new(label, "", format!("{count} objects")));
         }
         (rows, truncated, joined)
+    }
+
+    /// Whether everything that changed inside `key` only moved (no conflicts, nothing added or removed), and how
+    /// many objects moved. Remembered in `memo`.
+    fn only_moves_below(&self, key: &str, spatial: &impl Fn(&[Change]) -> bool, memo: &mut HashMap<String, (bool, usize)>) -> (bool, usize) {
+        if let Some(known) = memo.get(key) {
+            return *known;
+        }
+        let mut result = (true, 0);
+        for child in &self.nodes[key].children {
+            let c = &self.nodes[child];
+            let moved = match c.status {
+                Status::Context => Some(false),
+                Status::Changed if c.conflict.is_none() && c.changes.iter().all(|x| x.conflict.is_none()) && spatial(&c.changes) => Some(true),
+                _ => None,
+            };
+            let below = self.only_moves_below(child, spatial, memo);
+            match moved {
+                Some(counted) => result = (result.0 && below.0, result.1 + below.1 + counted as usize),
+                None => result.0 = false,
+            }
+        }
+        memo.insert(key.to_owned(), result);
+        result
+    }
+
+    /// Whether everything that moved inside `key` moved by the same offset, without turning, and no model inside
+    /// moved by its own pivot (that model shows its own row instead).
+    fn moved_together(&self, key: &str, offset: &mut Option<[f64; 3]>) -> bool {
+        let parse = |text: &str| -> Option<[f64; 3]> {
+            let mut parts = text.split(", ").map(|n| n.parse::<f64>().ok());
+            Some([parts.next()??, parts.next()??, parts.next()??])
+        };
+        self.nodes[key].children.iter().all(|child| {
+            let node = &self.nodes[child];
+            if node.status == Status::Changed {
+                if node.class == "Model" || node.changes.iter().any(|c| c.name == "Rotation") {
+                    return false;
+                }
+                for change in node.changes.iter().filter(|c| c.name == "Position" || c.name == "Pivot") {
+                    let (Some(old), Some(new)) = (parse(&change.old), parse(&change.new)) else { return false };
+                    let delta = [new[0] - old[0], new[1] - old[1], new[2] - old[2]];
+                    match offset {
+                        Some(first) if first.iter().zip(delta).any(|(a, b)| (a - b).abs() > 0.01) => return false,
+                        Some(_) => {}
+                        None => *offset = Some(delta),
+                    }
+                }
+            }
+            self.moved_together(child, offset)
+        })
     }
 
     fn sort(&self, keys: &mut [String]) {
@@ -678,6 +762,38 @@ mod tests {
         assert_eq!(shed.changes[0].name, "Pivot");
         assert_eq!(shed.changes.last().unwrap(), &Change::new("Moved with it", "", "1 objects"));
         assert!(review.rows.iter().all(|r| r.name != "Roof"));
+    }
+
+    #[test]
+    fn parts_moved_together_fold_into_their_model() {
+        let at = |x: f32| Variant::CFrame(CFrame::new(Vector3::new(x, 0.0, 0.0), rbx_dom_weak::types::Matrix3::identity()));
+        let mut start = place(0.5, "Tower", true, false);
+        let mut current = place(0.5, "Tower", true, false);
+        // The map has no pivot of its own; its parts (and the shed's roof, one model down) moved together.
+        for (dom, x) in [(&mut start, 0.0), (&mut current, 25.0)] {
+            for name in ["Gate", "Tower", "Roof"] {
+                let r = dom.descendants().find(|i| i.name == name).unwrap().referent();
+                dom.get_by_ref_mut(r).unwrap().properties.insert("CFrame".into(), at(x));
+            }
+        }
+        let review = compare(&start, &current, &RojoPaths::default());
+        let names: Vec<&str> = review.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Workspace", "Map"]);
+        assert_eq!(review.rows[1].changes, vec![Change::new("Moved inside", "", "3 objects")]);
+        assert_eq!(review.summary.changed, 1);
+    }
+
+    #[test]
+    fn roblox_and_rogit_attributes_are_not_changes() {
+        let start = place(0.5, "Tower", true, false);
+        let mut current = place(0.5, "Tower", true, false);
+        let gate = current.descendants().find(|i| i.name == "Gate").unwrap().referent();
+        let mut attributes = Attributes::new();
+        attributes.insert(TAG.to_owned(), Variant::BinaryString(b"gate".to_vec().into()));
+        attributes.insert("RBX_LightingCompatibilityMigrated".to_owned(), Variant::Bool(true));
+        attributes.insert(UPDATE.to_owned(), Variant::String("u1".into()));
+        current.get_by_ref_mut(gate).unwrap().properties.insert("Attributes".into(), Variant::Attributes(attributes));
+        assert_eq!(compare(&start, &current, &RojoPaths::default()).summary, Summary::default());
     }
 
     #[test]

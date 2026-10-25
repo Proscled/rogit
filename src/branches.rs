@@ -24,6 +24,23 @@ pub struct Branch {
     /// Unix time of the last update from main.
     #[serde(default)]
     pub updated: Option<u64>,
+    /// Pinned branches list first.
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+/// A saved state of a branch, like a git commit. Its copy lives in `<branch>/commits/<id>.rbxl`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Commit {
+    pub id: String,
+    pub message: String,
+    /// Unix time in seconds.
+    pub time: u64,
+    /// What changed since the commit before it (or since the branch started).
+    pub summary: crate::diff::Summary,
+    /// Made by RoGit to finish a pull or a revert; the graph shows the pull or revert instead.
+    #[serde(default)]
+    pub auto: bool,
 }
 
 /// Where a branch and main last met. Reviews, merges and updates compare against it.
@@ -118,8 +135,34 @@ impl Branches {
             .filter(|entry| entry.path().is_dir())
             .filter_map(|entry| self.get(&entry.file_name().to_string_lossy()))
             .collect();
-        list.sort_by(|a, b| b.created.cmp(&a.created));
+        list.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.created.cmp(&a.created)));
         list
+    }
+
+    pub fn set_pinned(&self, name: &str, pinned: bool) -> Result<(), String> {
+        let mut branch = self.get(name).ok_or_else(|| format!("There's no branch called {name}."))?;
+        branch.pinned = pinned;
+        self.save(&branch)
+    }
+
+    /// Deletes a branch: closes it in Studio if it's open, then removes its file and everything RoGit kept for it.
+    pub fn archive(&self, name: &str) -> Result<usize, String> {
+        if !valid_name(name) || self.get(name).is_none() {
+            return Err(format!("There's no branch called {name}."));
+        }
+        let file = self.file(name);
+        let closed = close_in_studio(&file);
+        if closed > 0 {
+            // Give Studio a moment to let go of the file.
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+        for path in [file.clone(), file.with_extension("rbxl.lock")] {
+            if path.exists() {
+                fs::remove_file(&path).map_err(|e| format!("Couldn't delete {}: {e}", path.display()))?;
+            }
+        }
+        fs::remove_dir_all(self.dir().join(name)).map_err(|e| format!("Couldn't delete {name}'s data: {e}"))?;
+        Ok(closed)
     }
 
     fn save(&self, branch: &Branch) -> Result<(), String> {
@@ -141,7 +184,7 @@ impl Branches {
         let report = place::build(&upload, manifest, &self.file(name));
         let _ = fs::remove_dir_all(&upload);
         let report = report?;
-        self.save(&Branch { name: name.to_owned(), created: now(), has_starting_point: false, merged: None, updated: None })?;
+        self.save(&Branch { name: name.to_owned(), created: now(), has_starting_point: false, merged: None, updated: None, pinned: false })?;
         Ok(report)
     }
 
@@ -180,8 +223,8 @@ impl Branches {
         place::assemble(&target, manifest).map(|(dom, _)| dom)
     }
 
-    /// The branch's newest content: its saved file, or the copy from its last review if that's newer (it includes
-    /// edits made before saving). Returns the place, where it came from, and when.
+    /// The branch's newest content: its saved file, or the copy RoGit made last (an autosave or review) if that's
+    /// newer (it includes edits made before saving). Returns the place, where it came from, and when.
     pub fn newest(&self, name: &str) -> Result<(rbx_dom_weak::WeakDom, &'static str, u64), String> {
         let file = self.file(name);
         let latest = self.dir().join(name).join("latest");
@@ -190,7 +233,7 @@ impl Branches {
             Some(review_time) if review_time > file_time => {
                 let manifest: Value = serde_json::from_slice(&fs::read(latest.join("manifest.json")).map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
-                Ok((place::assemble(&latest, &manifest)?.0, "reviewed", review_time))
+                Ok((place::assemble(&latest, &manifest)?.0, "autosaved", review_time))
             }
             _ => Ok((place::read(&file)?, "saved", file_time)),
         }
@@ -240,6 +283,74 @@ impl Branches {
         self.save(&branch)
     }
 
+    fn commits_file(&self, name: &str) -> PathBuf {
+        self.dir().join(name).join("commits.json")
+    }
+
+    fn commit_dir(&self, name: &str, id: &str) -> PathBuf {
+        self.dir().join(name).join("commits").join(id)
+    }
+
+    /// Newest first.
+    pub fn commits(&self, name: &str) -> Vec<Commit> {
+        fs::read(self.commits_file(name)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+    }
+
+    /// Keeps a commit: the branch as committed.
+    pub fn add_commit(&self, name: &str, dom: &rbx_dom_weak::WeakDom, commit: &Commit) -> Result<(), String> {
+        let target = self.commit_dir(name, &commit.id).with_extension("rbxl");
+        fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+        place::write(dom, &target)?;
+        let mut commits = self.commits(name);
+        commits.insert(0, commit.clone());
+        fs::write(self.commits_file(name), serde_json::to_vec_pretty(&commits).unwrap()).map_err(|e| e.to_string())
+    }
+
+    /// A commit's copy of the branch, put back together in memory.
+    pub fn commit_place(&self, name: &str, id: &str) -> Result<rbx_dom_weak::WeakDom, String> {
+        if !self.commits(name).iter().any(|c| c.id == id) {
+            return Err("That commit doesn't exist any more.".into());
+        }
+        let dir = self.commit_dir(name, id);
+        if !dir.is_dir() {
+            return place::read(&dir.with_extension("rbxl"));
+        }
+        // Early commits kept the copy as it came from Studio.
+        let manifest: Value = serde_json::from_slice(&fs::read(dir.join("manifest.json")).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        place::assemble(&dir, &manifest).map(|(dom, _)| dom)
+    }
+
+    /// The keys of the changes staged for the next commit.
+    pub fn staged(&self, name: &str) -> Vec<String> {
+        fs::read(self.dir().join(name).join("staged.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    pub fn set_staged(&self, name: &str, keys: &[String]) -> Result<(), String> {
+        fs::write(self.dir().join(name).join("staged.json"), serde_json::to_vec(keys).unwrap()).map_err(|e| e.to_string())
+    }
+
+    /// When the newest copy RoGit has from Studio (an autosave or a review) was made, if it's newer than the saved
+    /// branch file and hasn't been dismissed: unsaved work, for example after Studio closed unexpectedly.
+    pub fn unsaved_copy(&self, name: &str) -> Option<u64> {
+        let latest = self.dir().join(name).join("latest");
+        let copy = modified(&latest.join("manifest.json"))?;
+        let saved = modified(&self.file(name)).unwrap_or_default();
+        (copy > saved + 2 && !latest.join("dismissed").exists()).then_some(copy)
+    }
+
+    pub fn latest_place(&self, name: &str) -> Result<rbx_dom_weak::WeakDom, String> {
+        let latest = self.dir().join(name).join("latest");
+        let manifest: Value = serde_json::from_slice(&fs::read(latest.join("manifest.json")).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        place::assemble(&latest, &manifest).map(|(dom, _)| dom)
+    }
+
+    /// Stops offering the unsaved copy (until a newer one is made).
+    pub fn dismiss_unsaved(&self, name: &str) -> Result<(), String> {
+        fs::write(self.dir().join(name).join("latest").join("dismissed"), b"").map_err(|e| e.to_string())
+    }
+
     pub fn mark_updated(&self, name: &str) -> Result<(), String> {
         let mut branch = self.get(name).ok_or_else(|| format!("There's no branch called {name}."))?;
         branch.updated = Some(now());
@@ -267,6 +378,51 @@ fn write_at(file: &fs::File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
         written += std::os::windows::fs::FileExt::seek_write(file, &bytes[written..], offset + written as u64)?;
     }
     Ok(())
+}
+
+/// Closes the Studio windows opened for `file`: the Studio processes started for that file alone (a local file
+/// usually gets its own). A file Studio loaded into another process stays open; its plugin says it was archived.
+/// The branch is being deleted, so unsaved changes in it don't matter. Returns how many were closed.
+fn close_in_studio(file: &Path) -> usize {
+    let paths: Vec<String> =
+        [Some(file.to_path_buf()), file.canonicalize().ok()].into_iter().flatten().map(|p| p.display().to_string()).collect();
+    if cfg!(windows) {
+        let path = paths[0].replace('\'', "''");
+        let script = format!(
+            "$p = Get-CimInstance Win32_Process | Where-Object {{ $_.Name -like 'RobloxStudio*' -and $_.CommandLine -and $_.CommandLine.Contains('{path}') }}; \
+             $p | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}; @($p).Count"
+        );
+        let output = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output();
+        return output.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()).unwrap_or(0);
+    }
+    let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else { return 0 };
+    let pids: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim_start().split_once(' ')?;
+            let opens_file = paths.iter().any(|p| {
+                let flag = format!("-localPlaceFile {p}");
+                command.contains("RobloxStudio")
+                    && command.find(&flag).is_some_and(|i| command[i + flag.len()..].starts_with(' ') || command.ends_with(&flag))
+            });
+            opens_file.then(|| pid.to_owned())
+        })
+        .collect();
+    let running = |pid: &String| Command::new("kill").args(["-0", pid]).status().is_ok_and(|s| s.success());
+    for pid in &pids {
+        let _ = Command::new("kill").args(["-TERM", pid]).status();
+    }
+    // Studio often ignores a polite request while a place is open.
+    for _ in 0..10 {
+        if !pids.iter().any(running) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    for pid in pids.iter().filter(|p| running(p)) {
+        let _ = Command::new("kill").args(["-KILL", pid]).status();
+    }
+    pids.len()
 }
 
 fn open_in_studio(file: &Path) -> std::io::Result<()> {

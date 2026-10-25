@@ -28,7 +28,7 @@ local SERVICES = {
 }
 
 type Game = { name: string, universe_id: number, main_place_id: number }
-type Branch = { name: string, created: number, has_starting_point: boolean, merged: number?, updated: number? }
+type Branch = { name: string, created: number, has_starting_point: boolean, merged: number?, updated: number?, pinned: boolean? }
 type State = {
 	connected: boolean,
 	folder: string?,
@@ -41,11 +41,27 @@ type State = {
 	busy: string?,
 	notice: string?,
 	problem: string?,
-	review: any?,
-	merge: any?,
+	-- The open window of changes: a review, merge, update, revert, restore, commit or history entry.
+	view: any?,
+	-- A message with buttons, for example "Archive this branch?".
+	offer: any?,
+	-- The branch whose extra actions (pin, archive) are showing.
+	menu: string?,
+	commits: { any },
+	-- Everything that happened, newest first, for the graph.
+	graph: { any },
+	-- A branch's changes since its last commit, which of them are staged, and what they're measured from.
+	changes: any?,
+	staged: { [string]: boolean },
+	since: any?,
+	-- When unsaved work was found for this branch.
+	unsaved: number?,
+	-- The branch this window shows, if it was archived.
+	archived: string?,
+	autosaved: number?,
 }
 
-local state: State = { connected = false, branches = {} }
+local state: State = { connected = false, branches = {}, commits = {}, graph = {}, staged = {} }
 
 -- Talking to rogit serve ---------------------------------------------------------------------------
 
@@ -86,6 +102,12 @@ local function newId(length: number): string
 	return table.concat(chars)
 end
 
+-- This Studio window, so rogit serve can tell work from before it opened.
+local SESSION = newId(12)
+-- Whether this window just opened its place (nothing to undo yet), rather than the plugin reloading in a window
+-- that's been worked in. Only a window that just opened can be missing unsaved work.
+local FRESH_WINDOW = not ChangeHistoryService:GetCanUndo()
+
 -- Collects the objects RoGit tracks: everything saved in the place except scripts, Folders that
 -- contain a script anywhere inside, and whatever Rojo syncs.
 local function trackedObjects(rojoPaths: { [string]: boolean }): ({ Instance }, number)
@@ -102,7 +124,7 @@ local function trackedObjects(rojoPaths: { [string]: boolean }): ({ Instance }, 
 			local childPath = path .. "/" .. child.Name
 			if child:IsA("LuaSourceContainer") then
 				hasScript = true
-			elseif child.Archivable and not rojoPaths[childPath] then
+			elseif child.Archivable and not rojoPaths[childPath] and not child:IsA("Camera") then
 				local mark = #list
 				table.insert(list, child)
 				if visit(child, childPath) then
@@ -207,30 +229,25 @@ local function serviceSettings(service: Instance): { [string]: any }
 	return settingsOut
 end
 
-local function sendParts(capture: string, service: string, text: string)
-	local count = math.max(1, math.ceil(#text / PART_CHARS))
-	local pending, failure = count, nil
-	for i = 1, count do
+-- Starts sending one service's copy in 4 MiB parts. `uploads` tracks the parts still on their way, across services.
+local function sendParts(capture: string, service: string, text: string, uploads: { pending: number, failure: string? })
+	for i = 1, math.max(1, math.ceil(#text / PART_CHARS)) do
+		uploads.pending += 1
 		local part = string.sub(text, (i - 1) * PART_CHARS + 1, i * PART_CHARS)
 		task.spawn(function()
 			local ok, reply = request("POST", string.format("/api/upload?capture=%s&file=%s&part=%d", capture, service, i - 1), nil, part)
 			if not ok then
-				failure = reply or "Lost the connection to rogit serve."
+				uploads.failure = reply or "Lost the connection to rogit serve."
 			end
-			pending -= 1
+			uploads.pending -= 1
 		end)
-	end
-	while pending > 0 do
-		task.wait()
-	end
-	if failure then
-		error(failure, 0)
 	end
 end
 
 -- Copies every saved service (its children in Roblox's binary format, plus its settings) to rogit serve.
 local function copyPlace(capture: string): any
 	local services = {}
+	local uploads: { pending: number, failure: string? } = { pending = 0, failure = nil }
 	for _, name in SERVICES do
 		local ok, service = pcall(game.GetService, game, name)
 		if not (ok and service) then
@@ -247,13 +264,19 @@ local function copyPlace(capture: string): any
 			if not serialized then
 				error(string.format("Studio couldn't copy %s: %s", name, tostring(data)), 0)
 			end
-			sendParts(capture, name, buffer.tostring(EncodingService:Base64Encode(data)))
+			sendParts(capture, name, buffer.tostring(EncodingService:Base64Encode(data)), uploads)
 		end
 		local attributes = {}
 		for key, value in service:GetAttributes() do
 			attributes[key] = encode(value)
 		end
 		table.insert(services, { name = service.Name, className = service.ClassName, settings = serviceSettings(service), attributes = attributes })
+	end
+	while uploads.pending > 0 do
+		task.wait()
+	end
+	if uploads.failure then
+		error(uploads.failure, 0)
 	end
 	return { services = services }
 end
@@ -267,8 +290,11 @@ local MEDIUM = Font.fromEnum(Enum.Font.BuilderSansMedium)
 local BOLD = Font.fromEnum(Enum.Font.BuilderSansBold)
 local GREEN = Color3.fromRGB(63, 185, 80)
 local RED = Color3.fromRGB(239, 83, 80)
-local AMBER = Color3.fromRGB(240, 173, 58)
-local GREY = Color3.fromRGB(140, 140, 140)
+local AMBER = Color3.fromRGB(226, 161, 52)
+local GREY = Color3.fromRGB(128, 128, 128)
+local HEX = { green = "#3fb950", red = "#ef5350", amber = "#e2a134", grey = "#8c8c8c" }
+-- Letters for added, removed and changed objects, like VS Code's Source Control.
+local MARK = { added = { "A", GREEN }, removed = { "D", RED }, changed = { "M", AMBER } }
 
 -- Objects painted with Studio theme colors, repainted when the theme changes.
 local themed: { [Instance]: { [string]: any } } = {}
@@ -332,6 +358,15 @@ local function stack(parent: Instance, gap: number, horizontal: boolean?)
 	})
 end
 
+local function box(parent: Instance, order: number, gap: number, horizontal: boolean?): Frame
+	local frame = new("Frame", {
+		LayoutOrder = order, BackgroundTransparency = 1, Size = if horizontal then UDim2.new(0, 0, 0, 26) else UDim2.new(1, 0, 0, 0),
+		AutomaticSize = if horizontal then Enum.AutomaticSize.X else Enum.AutomaticSize.Y, Parent = parent,
+	})
+	stack(frame, gap, horizontal)
+	return frame
+end
+
 local function text(parent: Instance, order: number, size: number, font: Font, color: any, wrap: boolean?): TextLabel
 	local colors = if typeof(color) == "Color3" then nil else { TextColor3 = color }
 	local label = new("TextLabel", {
@@ -345,42 +380,109 @@ local function text(parent: Instance, order: number, size: number, font: Font, c
 	return label
 end
 
-local function card(parent: Instance, order: number): Frame
-	local frame = new("Frame", {
-		LayoutOrder = order, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BorderSizePixel = 0, Parent = parent,
-	}, { BackgroundColor3 = Color.Titlebar })
-	round(frame, 6)
-	new("UIStroke", { Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = frame }, { Color = Color.Border })
-	pad(frame, 10, 12)
-	stack(frame, 6)
-	return frame
+-- A one-line label that sizes to its text, for horizontal rows.
+local function inlineText(parent: Instance, order: number, size: number, font: Font, color: any): TextLabel
+	local label = text(parent, order, size, font, color, false)
+	label.Size = UDim2.new(0, 0, 1, 0)
+	label.AutomaticSize = Enum.AutomaticSize.X
+	return label
 end
 
-local function button(parent: Instance, order: number, label: string, primary: boolean, fullWidth: boolean?): TextButton
-	local b = new("TextButton", {
-		LayoutOrder = order, Text = label, TextSize = 14, FontFace = BOLD, AutoButtonColor = true, BorderSizePixel = 0,
-		Size = if fullWidth then UDim2.new(1, 0, 0, 30) else UDim2.new(0, 0, 0, 28),
-		AutomaticSize = if fullWidth then Enum.AutomaticSize.None else Enum.AutomaticSize.X, Parent = parent,
-	}, if primary
-		then { BackgroundColor3 = Color.DialogMainButton, TextColor3 = Color.DialogMainButtonText }
-		else { BackgroundColor3 = Color.Button, TextColor3 = Color.ButtonText })
-	round(b, 5)
-	if not primary then
-		new("UIStroke", { Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = b }, { Color = Color.ButtonBorder })
+local function clear(parent: Instance)
+	for _, child in parent:GetChildren() do
+		if child:IsA("GuiObject") then
+			child:Destroy()
+		end
 	end
-	new("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14), Parent = b })
+end
+
+type ButtonKind = "primary" | "secondary" | "danger" | "quiet"
+local BUTTON_COLORS: { [string]: { [string]: any } } = {
+	primary = { BackgroundColor3 = Color.DialogMainButton, TextColor3 = Color.DialogMainButtonText },
+	secondary = { BackgroundColor3 = Color.Button, TextColor3 = Color.ButtonText },
+	quiet = { BackgroundColor3 = { Color.Button, Modifier.Hover }, TextColor3 = Color.SubText },
+}
+
+local function styleButton(b: TextButton, kind: ButtonKind)
+	if kind == "danger" then
+		themed[b] = nil
+		b.BackgroundColor3, b.TextColor3 = RED, Color3.new(1, 1, 1)
+	else
+		local colors = BUTTON_COLORS[kind]
+		themed[b] = colors
+		for property, spec in colors do
+			(b :: any)[property] = themeColor(spec)
+		end
+	end
+	b.BackgroundTransparency = if kind == "quiet" then 1 else 0
+	local stroke = b:FindFirstChildOfClass("UIStroke")
+	if stroke then
+		stroke.Enabled = kind == "secondary"
+	end
+end
+
+local function button(parent: Instance, order: number, label: string, kind: ButtonKind, fullWidth: boolean?): TextButton
+	local b = new("TextButton", {
+		LayoutOrder = order, Text = label, TextSize = 13, FontFace = MEDIUM, AutoButtonColor = true, BorderSizePixel = 0,
+		Size = if fullWidth then UDim2.new(1, 0, 0, 28) else UDim2.new(0, 0, 0, 26),
+		AutomaticSize = if fullWidth then Enum.AutomaticSize.None else Enum.AutomaticSize.X, Parent = parent,
+	})
+	round(b, 4)
+	new("UIStroke", { Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = b }, { Color = Color.ButtonBorder })
+	new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10), Parent = b })
+	styleButton(b, kind)
+	if kind == "quiet" then
+		b.MouseEnter:Connect(function()
+			b.BackgroundTransparency = 0
+		end)
+		b.MouseLeave:Connect(function()
+			b.BackgroundTransparency = 1
+		end)
+	end
 	return b
 end
 
--- A small rounded badge, tinted with its own color.
-local function pill(parent: Instance, order: number, label: string, color: Color3): TextLabel
-	local badge = new("TextLabel", {
-		LayoutOrder = order, Text = label, TextColor3 = color, BackgroundColor3 = color, BackgroundTransparency = 0.85,
-		TextSize = 12, FontFace = BOLD, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.new(0, 0, 0, 20), Parent = parent,
-	})
-	round(badge, 10)
-	new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = badge })
-	return badge
+-- A text box with a button on its right.
+local function field(parent: Instance, order: number, placeholder: string, label: string): (TextBox, TextButton)
+	local row = new("Frame", { LayoutOrder = order, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28), Parent = parent })
+	local input = new("TextBox", {
+		Size = UDim2.new(1, -80, 1, 0), PlaceholderText = placeholder, Text = "", ClearTextOnFocus = false, TextSize = 13,
+		FontFace = REGULAR, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, BorderSizePixel = 0,
+		Parent = row,
+	}, { BackgroundColor3 = Color.InputFieldBackground, TextColor3 = Color.MainText, PlaceholderColor3 = Color.DimmedText })
+	round(input, 4)
+	new("UIStroke", { Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = input }, { Color = Color.InputFieldBorder })
+	new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = input })
+	local b = button(row, 2, label, "primary")
+	b.AutomaticSize = Enum.AutomaticSize.None
+	b.AnchorPoint = Vector2.new(1, 0)
+	b.Position = UDim2.fromScale(1, 0)
+	b.Size = UDim2.new(0, 74, 1, 0)
+	return input, b
+end
+
+-- A titled group: a small capitals heading over its contents.
+local function section(parent: Instance, order: number): (Frame, TextLabel, Frame)
+	local frame = box(parent, order, 6)
+	local heading = text(frame, 1, 11, BOLD, Color.DimmedText, false)
+	local body = box(frame, 2, 2)
+	return frame, heading, body
+end
+
+-- A list row that lights up under the mouse, like Studio's lists.
+local function listRow(parent: Instance, order: number, height: number): TextButton
+	local row = new("TextButton", {
+		LayoutOrder = order, Text = "", AutoButtonColor = false, BorderSizePixel = 0, BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, height), Parent = parent,
+	}, { BackgroundColor3 = { Color.Item, Modifier.Hover } })
+	round(row, 4)
+	row.MouseEnter:Connect(function()
+		row.BackgroundTransparency = 0
+	end)
+	row.MouseLeave:Connect(function()
+		row.BackgroundTransparency = 1
+	end)
+	return row
 end
 
 local function escape(value: string): string
@@ -391,6 +493,39 @@ local function formatTime(seconds: number): string
 	return DateTime.fromUnixTimestamp(seconds):FormatLocalTime("lll", "en-us")
 end
 
+local function clock(seconds: number): string
+	return DateTime.fromUnixTimestamp(seconds):FormatLocalTime("LT", "en-us")
+end
+
+local function ago(seconds: number): string
+	local passed = os.time() - seconds
+	if passed < 60 then
+		return "just now"
+	elseif passed < 3600 then
+		return math.floor(passed / 60) .. " min ago"
+	elseif passed < 86400 then
+		return math.floor(passed / 3600) .. " h ago"
+	end
+	return math.floor(passed / 86400) .. " d ago"
+end
+
+-- "2 added, 1 changed", with colored numbers.
+local function counts(summary: any): string
+	local parts = {}
+	local function add(n: number?, label: string, hex: string)
+		if n and n > 0 then
+			table.insert(parts, string.format('<font color="%s">%d</font> %s', hex, n, label))
+		end
+	end
+	add(summary.added, "added", HEX.green)
+	add(summary.removed, "removed", HEX.red)
+	add(summary.changed, "changed", HEX.amber)
+	if summary.conflicts and summary.conflicts > 0 then
+		add(summary.conflicts, if summary.conflicts == 1 then "conflict" else "conflicts", HEX.red)
+	end
+	return if #parts == 0 then "No changes" else table.concat(parts, "   ")
+end
+
 -- Main panel ---------------------------------------------------------------------------------------
 
 local toolbar = plugin:CreateToolbar("RoGit")
@@ -399,7 +534,7 @@ toggle.ClickableWhenViewportHidden = true
 
 local widget = plugin:CreateDockWidgetPluginGui(
 	"RoGitPanel",
-	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 420, 280, 260)
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 300, 440, 260, 240)
 )
 widget.Title = "RoGit"
 toggle.Click:Connect(function()
@@ -414,190 +549,551 @@ local root = new("ScrollingFrame", {
 	AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = widget,
 }, { BackgroundColor3 = Color.MainBackground, ScrollBarImageColor3 = Color.ScrollBar })
 pad(root, 12, 12)
-stack(root, 10)
+stack(root, 14)
 
--- Header: name and connection badge.
-local header = new("Frame", { LayoutOrder = 1, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 24), Parent = root })
-local wordmark = text(header, 1, 18, BOLD, Color.MainText, false)
-wordmark.Size = UDim2.new(1, 0, 1, 0)
-wordmark.AutomaticSize = Enum.AutomaticSize.None
-wordmark.Text = "RoGit"
-local connection = pill(header, 2, "Offline", GREY)
-connection.AnchorPoint = Vector2.new(1, 0.5)
-connection.Position = UDim2.new(1, 0, 0.5, 0)
+-- Where you are, and whether rogit serve is there.
+local top = box(root, 1, 2)
+local kindRow = new("Frame", { LayoutOrder = 1, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14), Parent = top })
+local placeKind = text(kindRow, 1, 11, BOLD, Color.DimmedText, false)
+placeKind.AutomaticSize = Enum.AutomaticSize.None
+placeKind.Size = UDim2.new(1, -90, 1, 0)
+local connection = text(kindRow, 2, 11, MEDIUM, GREY, false)
+connection.AutomaticSize = Enum.AutomaticSize.None
+connection.AnchorPoint = Vector2.new(1, 0)
+connection.Position = UDim2.fromScale(1, 0)
+connection.Size = UDim2.new(0, 90, 1, 0)
+connection.TextXAlignment = Enum.TextXAlignment.Right
+local placeTitle = text(top, 2, 18, BOLD, Color.MainText, false)
+placeTitle.TextTruncate = Enum.TextTruncate.AtEnd
+local placeDetail = text(top, 3, 12, REGULAR, Color.SubText)
 
--- Where you are.
-local placeCard = card(root, 2)
-local placeKind = text(placeCard, 1, 11, BOLD, Color.DimmedText)
-local placeTitle = text(placeCard, 2, 17, BOLD, Color.MainText)
-local placeDetail = text(placeCard, 3, 13, REGULAR, Color.SubText)
+-- What just happened, or what's going on, with buttons when there's something to decide.
+local messageBox = box(root, 2, 8)
+local message = text(messageBox, 1, 13, REGULAR, Color.SubText)
+local messageActions = box(messageBox, 2, 6, true)
 
-local message = text(root, 3, 13, MEDIUM, Color.SubText)
+-- Unsaved work found when a branch opens (for example after Studio closed unexpectedly).
+local unsavedCard = new("Frame", {
+	LayoutOrder = 3, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BorderSizePixel = 0, Parent = root,
+}, { BackgroundColor3 = Color.Titlebar })
+round(unsavedCard, 4)
+new("UIStroke", { Thickness = 1, Color = AMBER, Transparency = 0.3, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = unsavedCard })
+pad(unsavedCard, 10, 10)
+stack(unsavedCard, 8)
+local unsavedText = text(unsavedCard, 1, 13, MEDIUM, Color.MainText)
+local unsavedButtons = box(unsavedCard, 2, 6, true)
+local restoreButton = button(unsavedButtons, 1, "Restore", "primary")
+local dismissButton = button(unsavedButtons, 2, "Dismiss", "quiet")
 
-local initButton = button(root, 4, "Init", true, true)
-local reviewButton = button(root, 5, "Review changes", true, true)
-local updateButton = button(root, 6, "Update from main", false, true)
-local openReviewButton = button(root, 7, "Open last review", false, true)
+local actions = box(root, 4, 6)
+local initButton = button(actions, 1, "Init", "primary", true)
 
--- New branch (main only).
-local newCard = card(root, 8)
-local newTitle = text(newCard, 1, 14, BOLD, Color.MainText)
-newTitle.Text = "New branch"
-local newHint = text(newCard, 2, 12, REGULAR, Color.DimmedText)
-newHint.Text = "Copies main as it is right now, including unsaved edits."
-local newRow = new("Frame", { LayoutOrder = 3, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28), Parent = newCard })
-local nameBox = new("TextBox", {
-	Size = UDim2.new(1, -86, 1, 0), PlaceholderText = "branch-name", Text = "", ClearTextOnFocus = false,
-	TextSize = 14, FontFace = REGULAR, TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0, Parent = newRow,
+local newSection, newHeading, newBody = section(root, 5)
+newHeading.Text = "NEW BRANCH"
+local nameBox, createButton = field(newBody, 1, "branch-name", "Create")
+
+local branchesSection, branchesHeading, branchRows = section(root, 6)
+
+-- In a branch, like VS Code's Source Control: a message, Commit, Pull, and the changes not committed yet.
+local sourceSection = box(root, 7, 6)
+local commitBox = new("TextBox", {
+	LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 28), PlaceholderText = "Message (Enter to commit)", Text = "", ClearTextOnFocus = false,
+	TextSize = 13, FontFace = REGULAR, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+	BorderSizePixel = 0, Parent = sourceSection,
 }, { BackgroundColor3 = Color.InputFieldBackground, TextColor3 = Color.MainText, PlaceholderColor3 = Color.DimmedText })
-round(nameBox, 5)
-new("UIStroke", { Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = nameBox }, { Color = Color.InputFieldBorder })
-new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = nameBox })
-local createButton = button(newRow, 1, "Create", true)
-createButton.AnchorPoint = Vector2.new(1, 0)
-createButton.Position = UDim2.fromScale(1, 0)
-createButton.AutomaticSize = Enum.AutomaticSize.None
-createButton.Size = UDim2.new(0, 78, 1, 0)
+round(commitBox, 4)
+new("UIStroke", { Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = commitBox }, { Color = Color.InputFieldBorder })
+new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = commitBox })
+local commitButton = button(sourceSection, 2, "Commit", "primary", true)
+local pullButton = button(sourceSection, 3, "Pull from main", "secondary", true)
 
--- Branch list (main only).
-local branchesCard = card(root, 9)
-local branchesTitle = text(branchesCard, 1, 14, BOLD, Color.MainText)
-local branchRows = new("Frame", {
-	LayoutOrder = 2, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = branchesCard,
-})
-stack(branchRows, 4)
+-- A list of changes with a heading and small buttons on its right ("Discard all", "Stage all").
+local function changeSection(order: number, actions: { string }): (Frame, TextLabel, Frame, { TextButton })
+	local frame = box(root, order, 2)
+	local head = new("Frame", { LayoutOrder = 1, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20), Parent = frame })
+	local heading = text(head, 1, 11, BOLD, Color.DimmedText, false)
+	heading.AutomaticSize = Enum.AutomaticSize.None
+	heading.Size = UDim2.new(1, -160, 1, 0)
+	heading.TextYAlignment = Enum.TextYAlignment.Center
+	local holder = box(head, 2, 0, true)
+	holder.AnchorPoint = Vector2.new(1, 0.5)
+	holder.Position = UDim2.fromScale(1, 0.5)
+	holder.Size = UDim2.new(0, 0, 0, 20)
+	local buttons = {}
+	for i, action in actions do
+		local b = button(holder, i, action, "quiet")
+		b.Size = UDim2.new(0, 0, 0, 20)
+		b.TextSize = 12
+		table.insert(buttons, b)
+	end
+	local body = box(frame, 2, 0)
+	return frame, heading, body, buttons
+end
+local stagedSection, stagedHeading, stagedRows, stagedButtons = changeSection(8, { "Unstage all" })
+local changesSection, changesHeading, changesRows, changesButtons = changeSection(9, { "Discard all", "Stage all" })
+local unstageAllButton = stagedButtons[1]
+local discardAllButton, stageAllButton = changesButtons[1], changesButtons[2]
 
-local shownBranches = ""
+local graphSection, graphHeading, graphRows = section(root, 10)
+graphHeading.Text = "GRAPH"
+graphRows:FindFirstChildOfClass("UIListLayout").Padding = UDim.new(0, 0)
+
+local render: () -> ()
 local openBranch: (string) -> ()
 local startMerge: (string) -> ()
+local setPinned: (string, boolean) -> ()
+local confirmArchive: (string) -> ()
+local openHistory: (any) -> ()
+local viewCommit: (any, string) -> ()
+local startRevert: (any) -> ()
+local selectObject: (string) -> ()
+local discard: ({ string }) -> ()
+local setStaged: ({ string }) -> ()
+
+local shownBranches = ""
 
 local function renderBranches()
-	local key = ""
+	local key = tostring(state.menu)
 	for _, branch in state.branches do
-		key ..= branch.name .. ":" .. tostring(branch.merged) .. ","
+		key ..= string.format("|%s:%s:%s:%s", branch.name, tostring(branch.merged), tostring(branch.pinned), ago(branch.merged or branch.created))
 	end
 	if key == shownBranches then
 		return
 	end
 	shownBranches = key
-	for _, child in branchRows:GetChildren() do
-		if child:IsA("Frame") then
-			child:Destroy()
-		end
-	end
-	branchesTitle.Text = string.format("Branches <font color=\"#8c8c8c\">%d</font>", #state.branches)
+	clear(branchRows)
+	branchesHeading.Text = string.format('BRANCHES  <font color="%s">%d</font>', HEX.grey, #state.branches)
 	for index, branch in state.branches do
-		local row = new("Frame", { LayoutOrder = index, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 36), Parent = branchRows })
-		local name = text(row, 1, 14, MEDIUM, Color.MainText, false)
+		local row = box(branchRows, index, 4)
+		local line = new("Frame", { LayoutOrder = 1, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 36), Parent = row })
+		local name = text(line, 1, 14, MEDIUM, Color.MainText, false)
 		name.AutomaticSize = Enum.AutomaticSize.None
-		name.Size = UDim2.new(1, -140, 0, 18)
+		name.Size = UDim2.new(1, -150, 0, 18)
 		name.TextTruncate = Enum.TextTruncate.AtEnd
-		name.Text = escape(branch.name)
-		local made = text(row, 2, 12, REGULAR, Color.DimmedText, false)
-		made.AutomaticSize = Enum.AutomaticSize.None
-		made.Position = UDim2.fromOffset(0, 18)
-		made.Size = UDim2.new(1, -140, 0, 16)
-		made.TextTruncate = Enum.TextTruncate.AtEnd
-		made.Text = if branch.merged then "Merged " .. formatTime(branch.merged) else "Made " .. formatTime(branch.created)
-		local open = button(row, 3, "Open", false)
-		open.AnchorPoint = Vector2.new(1, 0.5)
-		open.Position = UDim2.new(1, -72, 0.5, 0)
-		open.Activated:Connect(function()
+		name.Text = (if branch.pinned then "📌 " else "") .. escape(branch.name)
+		local caption = text(line, 2, 12, REGULAR, Color.DimmedText, false)
+		caption.AutomaticSize = Enum.AutomaticSize.None
+		caption.Position = UDim2.fromOffset(0, 18)
+		caption.Size = UDim2.new(1, -150, 0, 16)
+		caption.TextTruncate = Enum.TextTruncate.AtEnd
+		caption.Text = if branch.merged then "merged " .. ago(branch.merged) else "made " .. ago(branch.created)
+		local buttons = box(line, 3, 4, true)
+		buttons.AnchorPoint = Vector2.new(1, 0.5)
+		buttons.Position = UDim2.fromScale(1, 0.5)
+		button(buttons, 1, "Open", "secondary").Activated:Connect(function()
 			openBranch(branch.name)
 		end)
-		local merge = button(row, 4, "Merge", true)
-		merge.AnchorPoint = Vector2.new(1, 0.5)
-		merge.Position = UDim2.fromScale(1, 0.5)
-		merge.AutomaticSize = Enum.AutomaticSize.None
-		merge.Size = UDim2.fromOffset(66, 28)
-		merge.Activated:Connect(function()
+		button(buttons, 2, "Merge", "primary").Activated:Connect(function()
 			startMerge(branch.name)
+		end)
+		local more = button(buttons, 3, "···", "quiet")
+		more.Activated:Connect(function()
+			state.menu = if state.menu == branch.name then nil else branch.name
+			render()
+		end)
+		if state.menu == branch.name then
+			local menu = box(row, 2, 4, true)
+			button(menu, 1, if branch.pinned then "Unpin" else "Pin", "secondary").Activated:Connect(function()
+				setPinned(branch.name, not branch.pinned)
+			end)
+			button(menu, 2, "Archive…", "secondary").Activated:Connect(function()
+				state.menu = nil
+				confirmArchive(branch.name)
+			end)
+		end
+	end
+end
+
+local KIND_TEXT = {
+	create = "Created %s", merge = "Merged %s into main", update = "Pulled main into %s", revert = "Reverted %s",
+	restore = "Restored unsaved work in %s", archive = "Archived %s",
+}
+
+-- The graph, like VS Code's: a lane for main and one for each branch while it exists, newest at the top.
+local LANE_COLORS = {
+	Color3.fromRGB(77, 156, 255), Color3.fromRGB(229, 192, 123), Color3.fromRGB(224, 108, 159), Color3.fromRGB(209, 154, 102),
+	Color3.fromRGB(86, 182, 194), Color3.fromRGB(198, 120, 221), Color3.fromRGB(152, 195, 121),
+}
+local LANE_WIDTH = 12
+local GRAPH_ROW = 26
+local MAX_LANES = 6
+local shownGraph = ""
+
+local function laneColor(lane: number): Color3
+	return LANE_COLORS[(lane % #LANE_COLORS) + 1]
+end
+
+-- Each branch's lane, and the lanes in use at each row. Events are newest first; a branch's lane runs from its
+-- oldest event (usually "create") to its archive.
+local function lanes(events: { any }): ({ [string]: number }, { { [number]: boolean } }, { [string]: number })
+	local born, ended = {}, {}
+	for i = #events, 1, -1 do
+		local event = events[i]
+		if born[event.branch] == nil then
+			born[event.branch] = i
+		end
+		if event.kind == "archive" then
+			ended[event.branch] = i
+		end
+	end
+	local laneOf, used, active = {}, {}, {}
+	for i = #events, 1, -1 do
+		local event = events[i]
+		if born[event.branch] == i then
+			local lane = 1
+			while used[lane] and lane < MAX_LANES do
+				lane += 1
+			end
+			used[lane] = true
+			laneOf[event.branch] = lane
+		end
+		local row = {}
+		for lane in used do
+			row[lane] = true
+		end
+		active[i] = row
+		if ended[event.branch] == i then
+			used[laneOf[event.branch]] = nil
+		end
+	end
+	return laneOf, active, born
+end
+
+local function graphLine(parent: Instance, x: number, from: number, to: number, color: Color3)
+	new("Frame", {
+		Position = UDim2.fromOffset(x - 1, from), Size = UDim2.fromOffset(2, to - from), BackgroundColor3 = color,
+		BorderSizePixel = 0, Parent = parent,
+	})
+end
+
+local function renderGraph()
+	local events = state.graph
+	local key = ""
+	for _, event in events do
+		key ..= event.id .. ago(event.time)
+	end
+	if key == shownGraph then
+		return
+	end
+	shownGraph = key
+	clear(graphRows)
+	local laneOf, active, born = lanes(events)
+	local widest = 0
+	for _, lane in laneOf do
+		widest = math.max(widest, lane)
+	end
+	local width = 8 + (widest + 1) * LANE_WIDTH
+	local middle = GRAPH_ROW / 2
+	local function x(lane: number): number
+		return 8 + lane * LANE_WIDTH
+	end
+	for index, event in events do
+		local row = listRow(graphRows, index, GRAPH_ROW)
+		local lane = laneOf[event.branch] or 0
+		-- Main's lane runs through every row; it starts at the oldest and ends at the newest.
+		graphLine(row, x(0), if index == 1 then middle else 0, if index == #events then middle else GRAPH_ROW, laneColor(0))
+		for used in active[index] do
+			local from, to = 0, GRAPH_ROW
+			if used == lane and born[event.branch] == index then
+				to = middle -- the branch starts here
+			end
+			if used == lane and event.kind == "archive" then
+				from = middle -- and ends here
+			end
+			graphLine(row, x(used), from, to, laneColor(used))
+		end
+		-- Branching off, merging and pulling join the branch's lane to main's.
+		if event.kind == "create" or event.kind == "merge" or event.kind == "update" then
+			new("Frame", {
+				Position = UDim2.fromOffset(x(0), middle - 1), Size = UDim2.fromOffset(x(lane) - x(0), 2),
+				BackgroundColor3 = laneColor(lane), BorderSizePixel = 0, Parent = row,
+			})
+		end
+		local dotLane = if event.kind == "merge" then 0 else lane
+		local ring = event.kind == "merge" or event.kind == "update"
+		local size = if event.kind == "create" or event.kind == "archive" then 6 else 9
+		local dot = new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(x(dotLane), middle), Size = UDim2.fromOffset(size, size),
+			BackgroundColor3 = laneColor(dotLane), BorderSizePixel = 0, ZIndex = 2, Parent = row,
+		}, if ring then { BackgroundColor3 = Color.MainBackground } else nil)
+		round(dot, size)
+		if ring then
+			new("UIStroke", { Thickness = 2, Color = laneColor(dotLane), Parent = dot })
+		end
+		local branchText = string.format('<font color="#%s">%s</font>', laneColor(lane):ToHex(), escape(event.branch))
+		local label = text(row, 1, 13, REGULAR, if event.kind == "commit" then Color.MainText else Color.SubText, false)
+		label.AutomaticSize = Enum.AutomaticSize.None
+		label.Position = UDim2.fromOffset(width + 2, 0)
+		label.Size = UDim2.new(1, -(width + 2 + 58), 1, 0)
+		label.TextTruncate = Enum.TextTruncate.AtEnd
+		label.Text = if event.kind == "commit"
+			then escape(event.message or "") .. "  " .. branchText
+			else string.format(KIND_TEXT[event.kind] or "%s", branchText)
+		local when = text(row, 2, 12, REGULAR, Color.DimmedText, false)
+		when.AutomaticSize = Enum.AutomaticSize.None
+		when.AnchorPoint = Vector2.new(1, 0)
+		when.Position = UDim2.new(1, -4, 0, 0)
+		when.Size = UDim2.new(0, 56, 1, 0)
+		when.TextXAlignment = Enum.TextXAlignment.Right
+		when.Text = string.gsub(ago(event.time), " ago", "")
+		row.Activated:Connect(function()
+			if event.has_rows then
+				openHistory(event)
+			elseif event.kind == "commit" then
+				viewCommit({ id = event.id, message = event.message, time = event.time }, event.branch)
+			end
 		end)
 	end
 end
 
--- Review window (a branch's changes, a merge into main, or an update from main) ----------------------
+-- What a branch's changes are measured from, in words.
+local function sinceText(): string
+	local since = state.since
+	if since and since.kind == "commit" then
+		return "“" .. since.message .. "”"
+	elseif since and since.kind == "update" then
+		return "the last pull from main"
+	end
+	return "the branch was made"
+end
 
--- How a merge (the branch into main) and an update (main into the branch) are worded. "Keep" leaves this place as
--- it is; "use" takes the incoming side.
-local WORDS = {
-	merge = {
-		keep = "Keep main", use = "Use branch", apply = "Merge into main", window = "RoGit · Merge",
-		remove = "Remove it from main?", restore = "Bring it back from the branch?",
-		nothing = "Nothing to merge: main already has everything from this branch.",
-		nothingSince = "Nothing new to merge: main has everything from this branch's last merge.",
-		undo = "Applies as one step. Ctrl+Z undoes the whole merge.",
-	},
-	update = {
-		keep = "Keep branch", use = "Use main", apply = "Update branch", window = "RoGit · Update",
-		remove = "Remove it from the branch?", restore = "Bring it back from main?",
-		nothing = "Nothing to update: the branch already has everything from main.",
-		nothingSince = "Nothing to update: the branch already has everything from main.",
-		undo = "Applies as one step. Ctrl+Z undoes the whole update.",
-	},
-}
+-- A branch's changes as a flat list (each with its parent's path), split into staged and not staged.
+local function changeList(): ({ any }, { any })
+	local staged, unstaged = {}, {}
+	if not state.changes then
+		return staged, unstaged
+	end
+	local names = {}
+	for _, row in state.changes.rows do
+		names[row.depth] = row.name
+		if row.status ~= "context" then
+			local path = {}
+			for depth = 0, row.depth - 1 do
+				table.insert(path, names[depth])
+			end
+			table.insert(if state.staged[row.key] then staged else unstaged, { row = row, path = table.concat(path, "/") })
+		end
+	end
+	return staged, unstaged
+end
+
+local function stagedKeys(): { string }
+	local keys = {}
+	for key in state.staged do
+		table.insert(keys, key)
+	end
+	return keys
+end
+
+-- Changes whose details are showing in the panel, by key.
+local expandedChanges: { [string]: boolean } = {}
+local shownChanges = ""
+
+-- One property change under its row: "Color  91, 91, 91 → 255, 0, 0".
+local function changeDetail(parent: Instance, order: number, change: any)
+	local line = new("Frame", { LayoutOrder = order, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20), Parent = parent })
+	local label = text(line, 1, 12, REGULAR, Color.SubText, false)
+	label.AutomaticSize = Enum.AutomaticSize.None
+	label.Position = UDim2.fromOffset(26, 0)
+	label.Size = UDim2.new(1, -30, 1, 0)
+	label.TextTruncate = Enum.TextTruncate.AtEnd
+	label.Text = if change.old == ""
+		then string.format('<font color="%s">%s</font>  %s', HEX.grey, escape(change.name), escape(change.new))
+		else string.format(
+			'<font color="%s">%s</font>  <font color="%s"><s>%s</s></font>  →  <font color="%s">%s</font>',
+			HEX.grey, escape(change.name), HEX.red, escape(change.old), HEX.green, escape(change.new)
+		)
+end
+
+local function changeRow(parent: Instance, order: number, item: any, isStaged: boolean)
+	local row = item.row
+	local frame = listRow(parent, order * 100, 24)
+	local icon = new("ImageLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 4), Size = UDim2.fromOffset(16, 16), Parent = frame })
+	local ok, image = pcall(StudioService.GetClassIcon, StudioService, row.class)
+	if ok and image then
+		icon.Image, icon.ImageRectOffset, icon.ImageRectSize = image.Image, image.ImageRectOffset, image.ImageRectSize
+	end
+	local name = text(frame, 1, 13, REGULAR, Color.MainText, false)
+	name.AutomaticSize = Enum.AutomaticSize.None
+	name.Position = UDim2.fromOffset(26, 0)
+	name.Size = UDim2.new(1, -(26 + 52), 1, 0)
+	name.TextTruncate = Enum.TextTruncate.AtEnd
+	local shown = escape(row.name)
+	if row.status == "removed" then
+		shown = "<s>" .. shown .. "</s>"
+	end
+	if item.path ~= "" then
+		shown ..= string.format('  <font color="%s" size="11">%s</font>', HEX.grey, escape(item.path))
+	end
+	name.Text = shown
+	local mark = MARK[row.status]
+	if mark then
+		local letter = text(frame, 2, 12, BOLD, mark[2], false)
+		letter.AutomaticSize = Enum.AutomaticSize.None
+		letter.AnchorPoint = Vector2.new(1, 0)
+		letter.Position = UDim2.new(1, -30, 0, 0)
+		letter.Size = UDim2.new(0, 14, 1, 0)
+		letter.TextXAlignment = Enum.TextXAlignment.Right
+		letter.Text = mark[1]
+	end
+	local toggle = button(frame, 3, if isStaged then "−" else "+", "quiet")
+	toggle:FindFirstChildOfClass("UIPadding"):Destroy()
+	toggle.AutomaticSize = Enum.AutomaticSize.None
+	toggle.AnchorPoint = Vector2.new(1, 0.5)
+	toggle.Position = UDim2.new(1, -2, 0.5, 0)
+	toggle.Size = UDim2.fromOffset(22, 20)
+	toggle.TextSize = 16
+	toggle.Activated:Connect(function()
+		local keys = stagedKeys()
+		if isStaged then
+			table.remove(keys, table.find(keys, row.key) :: number)
+		else
+			table.insert(keys, row.key)
+		end
+		setStaged(keys)
+	end)
+	if not isStaged then
+		local discardButton = button(frame, 4, "Discard", "secondary")
+		discardButton.AnchorPoint = Vector2.new(1, 0.5)
+		discardButton.Position = UDim2.new(1, -26, 0.5, 0)
+		discardButton.Size = UDim2.new(0, 0, 0, 20)
+		discardButton.TextSize = 12
+		discardButton.ZIndex = 2
+		discardButton.Visible = false
+		frame.MouseEnter:Connect(function()
+			discardButton.Visible = true
+		end)
+		frame.MouseLeave:Connect(function()
+			discardButton.Visible = false
+		end)
+		discardButton.Activated:Connect(function()
+			discard({ row.key })
+		end)
+	end
+	-- Clicking a change shows what changed under it, and selects the object in Studio.
+	frame.Activated:Connect(function()
+		expandedChanges[row.key] = not expandedChanges[row.key] or nil
+		shownChanges = ""
+		render()
+		selectObject(row.key)
+	end)
+	if expandedChanges[row.key] then
+		for i, change in row.changes do
+			changeDetail(parent, order * 100 + math.min(i, 99), change)
+		end
+	end
+end
+
+local MAX_CHANGE_ROWS = 200
+local stagedCount, unstagedCount = 0, 0
+
+local function renderChanges()
+	local key = tostring(state.changes)
+	for staged in state.staged do
+		key ..= "|" .. staged
+	end
+	if key == shownChanges then
+		return
+	end
+	shownChanges = key
+	clear(stagedRows)
+	clear(changesRows)
+	local staged, unstaged = changeList()
+	stagedCount, unstagedCount = #staged, #unstaged
+	stagedHeading.Text = string.format('STAGED CHANGES  <font color="%s">%d</font>', HEX.grey, #staged)
+	changesHeading.Text = string.format('CHANGES  <font color="%s">%d</font>', HEX.grey, #unstaged)
+	stageAllButton.Visible = #unstaged > 0
+	discardAllButton.Visible = #unstaged > 0
+	for list, items in { [stagedRows] = staged, [changesRows] = unstaged } do
+		for i, item in items do
+			if i > MAX_CHANGE_ROWS then
+				local more = text(list, i * 100, 12, REGULAR, Color.DimmedText)
+				more.Text = string.format("…and %d more.", #items - MAX_CHANGE_ROWS)
+				break
+			end
+			changeRow(list, i, item, list == stagedRows)
+		end
+	end
+	if #unstaged == 0 then
+		local empty = text(changesRows, 1, 12, REGULAR, Color.DimmedText)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingTop = UDim.new(0, 2), Parent = empty })
+		empty.Text = if state.changes == nil then "Looking for changes…"
+			elseif #staged > 0 then "Everything else is committed."
+			else "No changes since " .. escape(sinceText()) .. "."
+	end
+end
+
+-- Changes window: a branch's changes, a merge, an update or a revert, laid out like Studio's Explorer ----
+
+local MAX_ROWS = 600
+local ROW_HEIGHT = 24
+local INDENT = 16
 local SINCE = { start = "Since the branch started", merge = "Since the last merge", update = "Since the last update from main" }
 
-local MAX_REVIEW_ROWS = 400
-local STATUS = {
-	added = { label = "Added", color = GREEN },
-	removed = { label = "Removed", color = RED },
-	changed = { label = "Changed", color = AMBER },
+-- What each kind of window says and does. "Keep" leaves this place as it is; "use" takes the incoming side.
+local KINDS: { [string]: any } = {
+	review = { empty = "No changes yet." },
+	history = { empty = "Nothing changed." },
+	commit = { empty = "Nothing changed in this commit." },
+	merge = {
+		apply = "Merge", keep = "Keep main", use = "Use branch", remove = "Remove it from main?",
+		restore = "Bring it back from the branch?", empty = "Nothing to merge: main has everything in this branch.",
+	},
+	update = {
+		apply = "Pull", keep = "Keep branch", use = "Use main", remove = "Remove it from the branch?",
+		restore = "Bring it back from main?", empty = "Already up to date with main.",
+	},
+	revert = { apply = "Revert", empty = "The branch already matches this commit." },
+	restore = { apply = "Restore", empty = "Nothing to restore." },
 }
 
 local reviewWidget = plugin:CreateDockWidgetPluginGui(
 	"RoGitReview",
-	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 600, 620, 420, 300)
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 560, 600, 380, 280)
 )
-reviewWidget.Title = "RoGit · Review"
+reviewWidget.Title = "RoGit"
 
 local reviewRoot = new("Frame", { Size = UDim2.fromScale(1, 1), BorderSizePixel = 0, Parent = reviewWidget }, { BackgroundColor3 = Color.MainBackground })
 local reviewHeader = new("Frame", {
 	Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BorderSizePixel = 0, Parent = reviewRoot,
 }, { BackgroundColor3 = Color.Titlebar })
-pad(reviewHeader, 12, 14)
-stack(reviewHeader, 6)
-local reviewTitle = text(reviewHeader, 1, 17, BOLD, Color.MainText)
-local reviewSubtitle = text(reviewHeader, 2, 12, REGULAR, Color.DimmedText)
-local chips = new("Frame", { LayoutOrder = 3, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 20), Parent = reviewHeader })
-stack(chips, 6, true)
-local addedChip = pill(chips, 1, "", GREEN)
-local removedChip = pill(chips, 2, "", RED)
-local changedChip = pill(chips, 3, "", AMBER)
-local conflictChip = pill(chips, 4, "", RED)
+pad(reviewHeader, 10, 12)
+stack(reviewHeader, 3)
+local viewTitle = text(reviewHeader, 1, 15, BOLD, Color.MainText, false)
+viewTitle.TextTruncate = Enum.TextTruncate.AtEnd
+local viewSubtitle = text(reviewHeader, 2, 12, REGULAR, Color.DimmedText, false)
+local viewCounts = text(reviewHeader, 3, 12, MEDIUM, Color.SubText, false)
 local headerLine = new("Frame", { Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0, Parent = reviewRoot }, { BackgroundColor3 = Color.Border })
 
-local reviewList = new("ScrollingFrame", {
+local list = new("ScrollingFrame", {
 	BorderSizePixel = 0, BackgroundTransparency = 1, ScrollBarThickness = 6, CanvasSize = UDim2.new(),
 	AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = reviewRoot,
 }, { ScrollBarImageColor3 = Color.ScrollBar })
-new("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), Parent = reviewList })
-stack(reviewList, 0)
+new("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), Parent = list })
+stack(list, 0)
 
 local footer = new("Frame", {
-	AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 48), BorderSizePixel = 0, Parent = reviewRoot,
+	AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 44), BorderSizePixel = 0, Parent = reviewRoot,
 }, { BackgroundColor3 = Color.Titlebar })
 new("Frame", { Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0, Parent = footer }, { BackgroundColor3 = Color.Border })
-local footerHint = text(footer, 1, 12, REGULAR, Color.DimmedText, true)
-footerHint.AutomaticSize = Enum.AutomaticSize.None
-footerHint.Position = UDim2.fromOffset(14, 0)
-footerHint.Size = UDim2.new(1, -280, 1, 0)
-local refreshButton = button(footer, 2, "Refresh", false)
-refreshButton.AnchorPoint = Vector2.new(1, 0.5)
-refreshButton.Position = UDim2.new(1, -14, 0.5, 0)
-local mergeButton = button(footer, 3, "Merge into main", true)
-mergeButton.AnchorPoint = Vector2.new(1, 0.5)
-mergeButton.Position = UDim2.new(1, -14, 0.5, 0)
-local cancelButton = button(footer, 4, "Cancel", false)
-cancelButton.AnchorPoint = Vector2.new(1, 0.5)
-cancelButton.Position = UDim2.new(1, -160, 0.5, 0)
+local footerLeft = box(footer, 1, 6, true)
+footerLeft.AnchorPoint = Vector2.new(0, 0.5)
+footerLeft.Position = UDim2.new(0, 12, 0.5, 0)
+local footerText = inlineText(footerLeft, 1, 12, REGULAR, Color.DimmedText)
+local keepAllButton = button(footerLeft, 2, "", "quiet")
+local useAllButton = button(footerLeft, 3, "", "quiet")
+local footerRight = box(footer, 2, 6, true)
+footerRight.AnchorPoint = Vector2.new(1, 0.5)
+footerRight.Position = UDim2.new(1, -12, 0.5, 0)
+local closeButton = button(footerRight, 1, "Cancel", "secondary")
+local applyButton = button(footerRight, 2, "Merge", "primary")
 
 -- The list fills the space between the header and the footer.
 local function layoutReview()
 	local top = reviewHeader.AbsoluteSize.Y
 	headerLine.Position = UDim2.fromOffset(0, top)
-	reviewList.Position = UDim2.fromOffset(0, top + 1)
-	reviewList.Size = UDim2.new(1, 0, 1, -(top + 1 + footer.AbsoluteSize.Y))
+	list.Position = UDim2.fromOffset(0, top + 1)
+	list.Size = UDim2.new(1, 0, 1, -(top + 1 + footer.AbsoluteSize.Y))
 end
 reviewHeader:GetPropertyChangedSignal("AbsoluteSize"):Connect(layoutReview)
 reviewWidget:GetPropertyChangedSignal("AbsoluteSize"):Connect(layoutReview)
@@ -640,316 +1136,426 @@ local function findObject(key: string, ids: { [string]: Instance }?): Instance?
 	return nil
 end
 
-local function setStyle(b: TextButton, primary: boolean)
-	local colors = if primary
-		then { BackgroundColor3 = Color.DialogMainButton, TextColor3 = Color.DialogMainButtonText }
-		else { BackgroundColor3 = Color.Button, TextColor3 = Color.ButtonText }
-	themed[b] = colors
-	for property, spec in colors do
-		(b :: any)[property] = themeColor(spec)
+type ViewRow = { row: any, frame: TextButton, details: { Frame }, chevron: TextButton, expanded: boolean, hasChildren: boolean }
+local viewRows: { ViewRow } = {}
+local selectedRow: ViewRow? = nil
+local choiceShows: { () -> () } = {}
+local shownData: any = nil
+local updateFooter: () -> ()
+
+-- Shows rows and detail lines the way Explorer does: a collapsed row hides everything inside it.
+local function updateVisibility()
+	local hideBelow: number? = nil
+	for _, v in viewRows do
+		local depth = v.row.depth
+		local visible = hideBelow == nil or depth <= hideBelow
+		if visible then
+			hideBelow = if v.expanded then nil else depth
+		end
+		v.frame.Visible = visible
+		for _, detail in v.details do
+			detail.Visible = visible and v.expanded
+		end
+		local canOpen = v.hasChildren or #v.details > 0
+		v.chevron.Text = if canOpen then "›" else ""
+		v.chevron.Rotation = if v.expanded and canOpen then 90 else 0
 	end
 end
 
-local updateFooter: () -> ()
+local function paintRow(v: ViewRow, hover: boolean)
+	local isSelected = selectedRow == v
+	v.frame.BackgroundTransparency = if isSelected or hover then 0 else 1
+	v.frame.BackgroundColor3 = themeColor({ Color.Item, if isSelected then Modifier.Selected else Modifier.Hover })
+end
 
 -- "Keep main" / "Use branch" (or "Keep branch" / "Use main" in an update) for one conflict.
 local function choice(parent: Instance, id: number)
-	local words = WORDS[state.merge.kind]
-	local holder = new("Frame", {
-		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(0, 22),
-		AutomaticSize = Enum.AutomaticSize.X, BackgroundTransparency = 1, Parent = parent,
-	})
-	stack(holder, 4, true)
-	local keep = button(holder, 1, words.keep, false)
-	local use = button(holder, 2, words.use, false)
+	local view = state.view
+	local words = KINDS[view.kind]
+	local holder = box(parent, 9, 4, true)
+	holder.AnchorPoint = Vector2.new(1, 0.5)
+	holder.Position = UDim2.new(1, -10, 0.5, 0)
+	holder.Size = UDim2.new(0, 0, 0, 20)
+	local keep = button(holder, 1, words.keep, "secondary")
+	local use = button(holder, 2, words.use, "secondary")
 	for _, b in { keep, use } do
-		b.Size = UDim2.new(0, 0, 0, 22)
+		b.Size = UDim2.new(0, 0, 0, 20)
 		b.TextSize = 12
 	end
 	local function show()
-		local picked = state.merge and state.merge.choices[id]
-		setStyle(keep, picked == "keep")
-		setStyle(use, picked == "use")
+		local picked = view.choices[id]
+		styleButton(keep, if picked == "keep" then "primary" else "secondary")
+		styleButton(use, if picked == "use" then "primary" else "secondary")
 	end
 	keep.Activated:Connect(function()
-		state.merge.choices[id] = "keep"
+		view.choices[id] = "keep"
 		show()
 		updateFooter()
 	end)
 	use.Activated:Connect(function()
-		state.merge.choices[id] = "use"
+		view.choices[id] = "use"
 		show()
 		updateFooter()
 	end)
+	table.insert(choiceShows, show)
 	show()
 end
 
-local selectedRow: TextButton? = nil
+local function colorOf(value: string): Color3?
+	local r, g, b = string.match(value, "^(%d+), (%d+), (%d+)$")
+	return if r then Color3.fromRGB(tonumber(r) :: number, tonumber(g) :: number, tonumber(b) :: number) else nil
+end
 
 local function detailLine(order: number, indent: number, change: any): Frame
-	local line = new("Frame", { LayoutOrder = order, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 24), Parent = reviewList })
-	local name = text(line, 1, 12, MEDIUM, Color.DimmedText, false)
+	local line = new("Frame", {
+		LayoutOrder = order, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22), ClipsDescendants = true, Parent = list,
+	})
+	local name = text(line, 1, 12, REGULAR, Color.DimmedText, false)
 	name.AutomaticSize = Enum.AutomaticSize.None
 	name.Position = UDim2.fromOffset(indent, 0)
-	name.Size = UDim2.new(0, 120, 1, 0)
+	name.Size = UDim2.new(0, 110, 1, 0)
 	name.TextTruncate = Enum.TextTruncate.AtEnd
 	name.Text = escape(change.name)
-	local value = text(line, 2, 12, REGULAR, Color.MainText, false)
-	value.AutomaticSize = Enum.AutomaticSize.None
-	value.Position = UDim2.fromOffset(indent + 126, 0)
-	value.Size = UDim2.new(1, -(indent + 136 + (if change.conflict then 170 else 0)), 1, 0)
-	value.TextTruncate = Enum.TextTruncate.AtEnd
-	value.Text = if change.old == ""
-		then escape(change.new)
-		else string.format('<font color="#ef5350"><s>%s</s></font>  →  <font color="#3fb950">%s</font>', escape(change.old), escape(change.new))
+	local values = box(line, 2, 5, true)
+	values.Position = UDim2.fromOffset(indent + 116, 0)
+	values.Size = UDim2.new(0, 0, 1, 0)
+	local isColor = string.find(change.name, "Color") ~= nil
+	local function value(order: number, shown: string, hex: string, struck: boolean)
+		local color = if isColor then colorOf(shown) else nil
+		if color then
+			local swatch = new("Frame", { LayoutOrder = order, Size = UDim2.fromOffset(10, 10), BackgroundColor3 = color, BorderSizePixel = 0, Parent = values })
+			round(swatch, 2)
+			new("UIStroke", { Thickness = 1, Parent = swatch }, { Color = Color.Border })
+		end
+		local label = inlineText(values, order + 1, 12, REGULAR, Color.MainText)
+		label.Text = string.format('<font color="%s">%s</font>', hex, if struck then "<s>" .. escape(shown) .. "</s>" else escape(shown))
+	end
+	if change.old == "" then
+		inlineText(values, 1, 12, REGULAR, Color.SubText).Text = escape(change.new)
+	else
+		value(1, change.old, HEX.red, true)
+		inlineText(values, 3, 12, REGULAR, Color.DimmedText).Text = "→"
+		value(4, change.new, HEX.green, false)
+	end
 	if change.conflict then
 		choice(line, change.conflict)
 	end
 	return line
 end
 
-local function reviewRow(order: number, row: any)
-	local status = STATUS[row.status]
-	local indent = 10 + row.depth * 16
+local lastClick = { row = nil :: ViewRow?, time = 0 }
+
+local function viewRow(index: number, row: any): ViewRow
+	local words = KINDS[state.view.kind]
+	local indent = 4 + row.depth * INDENT
 	local frame = new("TextButton", {
-		LayoutOrder = order, Text = "", AutoButtonColor = false, BackgroundTransparency = 1, BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 0, 26), Parent = reviewList,
-	}, { BackgroundColor3 = { Color.Item, Modifier.Hover } })
-	local details: { Frame } = {}
-	local hasConflict = row.conflict ~= nil
-	for _, change in row.changes do
-		hasConflict = hasConflict or change.conflict ~= nil
-	end
-	local expanded = hasConflict or (row.status == "changed" and #row.changes <= 4)
-	local chevron = text(frame, 1, 12, BOLD, Color.DimmedText, false)
-	chevron.AutomaticSize = Enum.AutomaticSize.None
-	chevron.Position = UDim2.fromOffset(indent, 0)
-	chevron.Size = UDim2.fromOffset(12, 26)
-	chevron.TextXAlignment = Enum.TextXAlignment.Center
-	local icon = new("ImageLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(indent + 14, 5), Size = UDim2.fromOffset(16, 16), Parent = frame })
+		LayoutOrder = index * 100, Text = "", AutoButtonColor = false, BorderSizePixel = 0, BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, ROW_HEIGHT), Parent = list,
+	})
+	local chevron = new("TextButton", {
+		Text = "", TextSize = 15, FontFace = BOLD, BackgroundTransparency = 1, Position = UDim2.fromOffset(indent, 0),
+		Size = UDim2.fromOffset(16, ROW_HEIGHT), ZIndex = 2, Parent = frame,
+	}, { TextColor3 = Color.DimmedText })
+	local icon = new("ImageLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(indent + 18, 4), Size = UDim2.fromOffset(16, 16), Parent = frame })
 	local ok, image = pcall(StudioService.GetClassIcon, StudioService, row.class)
 	if ok and image then
 		icon.Image, icon.ImageRectOffset, icon.ImageRectSize = image.Image, image.ImageRectOffset, image.ImageRectSize
 	end
-	local name = text(frame, 2, 14, if status then MEDIUM else REGULAR, if status then Color.MainText else Color.SubText, false)
-	name.AutomaticSize = Enum.AutomaticSize.None
-	name.Position = UDim2.fromOffset(indent + 36, 0)
-	name.Size = UDim2.new(1, -(indent + 36 + 100), 1, 0)
-	name.TextTruncate = Enum.TextTruncate.AtEnd
-	name.Text = if row.status == "removed" then "<s>" .. escape(row.name) .. "</s>" else escape(row.name)
-	if status then
-		local badge = pill(frame, 3, if hasConflict then "Conflict" else status.label, if hasConflict then RED else status.color)
-		badge.AnchorPoint = Vector2.new(1, 0.5)
-		badge.Position = UDim2.new(1, -12, 0.5, 0)
-	end
-	local line = 0
+	-- Sizes and moves read inline, next to the name; property changes become detail lines.
+	local inline, changes = "", {}
 	for _, change in row.changes do
-		-- A whole added or removed model shows its size next to its name instead of as a detail line.
 		if change.name == "Contains" then
-			name.Text ..= '  <font color="#8c8c8c" size="12">' .. escape(change.new) .. " inside</font>"
-			continue
+			inline = change.new .. " inside"
+		elseif change.name == "Moved with it" then
+			inline = "moved with " .. change.new
+		elseif change.name == "Moved inside" then
+			inline = change.new .. " moved"
+		else
+			table.insert(changes, change)
 		end
-		line += 1
-		local detail = detailLine(order + math.min(line, 98), indent + 36, change)
-		detail.Visible = expanded
-		table.insert(details, detail)
 	end
-	if row.conflict then
-		local detail = detailLine(order + 99, indent + 36, {
-			name = "Choose", old = "", new = if row.status == "removed" then WORDS[state.merge.kind].remove else WORDS[state.merge.kind].restore,
-			conflict = row.conflict,
-		})
-		table.insert(details, detail)
+	local conflicted = row.conflict ~= nil
+	for _, change in changes do
+		conflicted = conflicted or change.conflict ~= nil
 	end
-	local function showChevron()
-		chevron.Text = if #details == 0 then "" else "›"
-		chevron.Rotation = if expanded then 90 else 0
+	local name = text(frame, 1, 13, REGULAR, Color.MainText, false)
+	name.AutomaticSize = Enum.AutomaticSize.None
+	name.Position = UDim2.fromOffset(indent + 40, 0)
+	name.Size = UDim2.new(1, -(indent + 40 + 34), 1, 0)
+	name.TextTruncate = Enum.TextTruncate.AtEnd
+	local shown = escape(row.name)
+	if row.status == "added" then
+		shown = string.format('<font color="%s">%s</font>', HEX.green, shown)
+	elseif row.status == "removed" then
+		shown = string.format('<font color="%s"><s>%s</s></font>', HEX.red, shown)
+	elseif row.status == "context" then
+		name.TextColor3 = themeColor(Color.SubText)
+		themed[name] = { TextColor3 = Color.SubText }
 	end
-	showChevron()
+	if inline ~= "" then
+		shown ..= string.format('  <font color="%s" size="12">%s</font>', HEX.grey, escape(inline))
+	end
+	name.Text = shown
+	local mark = MARK[row.status]
+	if mark or conflicted then
+		local badge = text(frame, 2, 12, BOLD, if conflicted then RED else mark[2], false)
+		badge.AutomaticSize = Enum.AutomaticSize.None
+		badge.AnchorPoint = Vector2.new(1, 0)
+		badge.Position = UDim2.new(1, -12, 0, 0)
+		badge.Size = UDim2.new(0, 20, 1, 0)
+		badge.TextXAlignment = Enum.TextXAlignment.Right
+		badge.Text = if conflicted then "!" else mark[1]
+	end
+	local v: ViewRow = { row = row, frame = frame, details = {}, chevron = chevron, expanded = true, hasChildren = false }
+	for i, change in changes do
+		table.insert(v.details, detailLine(index * 100 + math.min(i, 98), indent + 40, change))
+	end
+	if row.conflict and words.remove then
+		table.insert(v.details, detailLine(index * 100 + 99, indent + 40, {
+			name = "Choose", old = "", new = if row.status == "removed" then words.remove else words.restore, conflict = row.conflict,
+		}))
+	end
+	v.expanded = row.status == "context" or conflicted or #v.details <= 3
+	local function toggleRow()
+		v.expanded = not v.expanded
+		updateVisibility()
+	end
+	chevron.Activated:Connect(toggleRow)
 	frame.MouseEnter:Connect(function()
-		frame.BackgroundTransparency = 0
+		paintRow(v, true)
 	end)
 	frame.MouseLeave:Connect(function()
-		if selectedRow ~= frame then
-			frame.BackgroundTransparency = 1
-		end
+		paintRow(v, false)
 	end)
 	frame.Activated:Connect(function()
-		if #details > 0 then
-			expanded = not expanded
-			for _, detail in details do
-				detail.Visible = expanded
-			end
-			showChevron()
+		-- A second click soon after the first opens or closes the row, like in Explorer.
+		if lastClick.row == v and os.clock() - lastClick.time < 0.35 then
+			toggleRow()
 		end
-		if selectedRow and selectedRow ~= frame then
-			selectedRow.BackgroundTransparency = 1
+		lastClick.row, lastClick.time = v, os.clock()
+		local previous = selectedRow
+		selectedRow = v
+		if previous and previous ~= v then
+			paintRow(previous, false)
 		end
-		selectedRow = frame
-		frame.BackgroundTransparency = 0
-		local object = if row.status == "removed" and not state.merge then nil else findObject(row.key)
+		paintRow(v, true)
+		local object = findObject(row.key)
 		if object then
 			Selection:Set({ object })
 		end
 	end)
+	return v
 end
 
 updateFooter = function()
-	local merge = state.merge
-	refreshButton.Visible = merge == nil
-	mergeButton.Visible = merge ~= nil
-	cancelButton.Visible = merge ~= nil
-	if not merge then
-		footerHint.Text = "Click a row to select it in Explorer."
+	local view = state.view
+	if not view then
 		return
 	end
+	local kind = KINDS[view.kind]
+	local data = view.data
+	local conflicts = data.conflicts or {}
 	local open = 0
-	for _, conflict in merge.plan.conflicts do
-		if not merge.choices[conflict.id] then
+	for _, conflict in conflicts do
+		if not view.choices[conflict.id] then
 			open += 1
 		end
 	end
-	local words = WORDS[merge.kind]
-	merge.ready = open == 0 and #merge.plan.operations > 0
-	mergeButton.Text = words.apply
-	mergeButton.BackgroundTransparency = if merge.ready then 0 else 0.6
-	mergeButton.AutoButtonColor = merge.ready
-	footerHint.Text = if #merge.plan.operations == 0
-		then words.nothing
-		elseif open > 0 then string.format("Choose a side for %d conflict%s first.", open, if open == 1 then "" else "s")
-		else words.undo
+	keepAllButton.Visible, useAllButton.Visible = #conflicts > 0, #conflicts > 0
+	keepAllButton.Text, useAllButton.Text = (kind.keep or "") .. " for all", (kind.use or "") .. " for all"
+	footerText.Text = if open > 0 then string.format("%d conflict%s to decide", open, if open == 1 then "" else "s")
+		elseif #conflicts > 0 then "All conflicts decided"
+		else ""
+	footerText.Visible = footerText.Text ~= ""
+	closeButton.Text = if kind.apply then "Cancel" else "Close"
+	closeButton.Visible = view.kind ~= "review"
+	if view.kind == "review" then
+		applyButton.Visible, applyButton.Text, applyButton.AutoButtonColor = true, "Refresh", true
+		styleButton(applyButton, "secondary")
+		view.ready = true
+	elseif view.kind == "commit" then
+		applyButton.Visible, applyButton.Text, applyButton.AutoButtonColor = view.canRevert == true, "Revert to this", true
+		styleButton(applyButton, "secondary")
+		view.ready = true
+	elseif kind.apply then
+		view.ready = open == 0 and #data.operations > 0
+		applyButton.Visible, applyButton.Text = #data.operations > 0, kind.apply
+		styleButton(applyButton, "primary")
+		applyButton.BackgroundTransparency = if view.ready then 0 else 0.6
+		applyButton.AutoButtonColor = view.ready
+	else
+		applyButton.Visible = false
+	end
 end
 
-local shownReview: any = nil
-
-local function renderReview()
-	local data = if state.merge then state.merge.plan else state.review
-	if data == shownReview then
+local function renderView()
+	local view = state.view
+	local data = view and view.data
+	if data == shownData then
 		return
 	end
-	shownReview = data
+	shownData = data
 	selectedRow = nil
-	for _, child in reviewList:GetChildren() do
-		if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
-			child:Destroy()
-		end
-	end
-	updateFooter()
-	if not data then
+	table.clear(viewRows)
+	table.clear(choiceShows)
+	clear(list)
+	if not view then
 		return
 	end
-	local s = data.summary
-	if state.merge then
-		local merge = state.merge
-		reviewWidget.Title = WORDS[merge.kind].window
-		local since = (SINCE[merge.since] or SINCE.start) .. (if merge.since == "start" then "" else " " .. formatTime(merge.sinceTime))
-		if merge.kind == "update" then
-			reviewTitle.Text = "Update " .. escape(merge.branch) .. " from main"
-			reviewSubtitle.Text = since .. " · main and the branch as they are now"
-		else
-			reviewTitle.Text = "Merge " .. escape(merge.branch) .. " into main"
-			reviewSubtitle.Text = string.format("%s · branch as %s %s · main as it is now", since, merge.source, formatTime(merge.sourceTime))
-		end
-	else
-		reviewWidget.Title = "RoGit · Review"
-		reviewTitle.Text = "Changes in " .. escape(if state.branch then (state.branch :: Branch).name else "branch")
-		reviewSubtitle.Text = (if data.since == "update"
-			then "Compared with main at the last update, " .. formatTime(data.sinceTime)
-			else "Compared with how the branch started") .. " · " .. DateTime.now():FormatLocalTime("LT", "en-us")
-	end
-	addedChip.Text, removedChip.Text, changedChip.Text = "+ " .. s.added .. " added", "− " .. s.removed .. " removed", "● " .. s.changed .. " changed"
-	addedChip.Visible, removedChip.Visible, changedChip.Visible = s.added > 0, s.removed > 0, s.changed > 0
-	local conflicts = s.conflicts or 0
-	conflictChip.Text = conflicts .. (if conflicts == 1 then " conflict" else " conflicts")
-	conflictChip.Visible = conflicts > 0
+	viewTitle.Text = escape(view.title)
+	viewSubtitle.Text = escape(view.subtitle or "")
+	viewSubtitle.Visible = viewSubtitle.Text ~= ""
+	viewCounts.Text = counts(data.summary or {})
 	if #data.rows == 0 then
-		local empty = text(reviewList, 1, 14, REGULAR, Color.SubText)
+		local empty = text(list, 1, 13, REGULAR, Color.SubText)
 		new("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingTop = UDim.new(0, 10), Parent = empty })
-		empty.Text = if state.merge
-			then (if state.merge.since == "start" then WORDS[state.merge.kind].nothing else WORDS[state.merge.kind].nothingSince)
-			else "No changes yet. Build something in this branch, then click Refresh."
+		empty.Text = KINDS[view.kind].empty
 	end
 	for index, row in data.rows do
-		if index > MAX_REVIEW_ROWS then
-			local more = text(reviewList, index * 100, 13, REGULAR, Color.DimmedText)
+		if index > MAX_ROWS then
+			local more = text(list, index * 100, 12, REGULAR, Color.DimmedText)
 			new("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingTop = UDim.new(0, 8), Parent = more })
-			more.Text = string.format("…and %d more rows.", #data.rows - MAX_REVIEW_ROWS + data.truncated)
+			more.Text = string.format("…and %d more.", #data.rows - MAX_ROWS + (data.truncated or 0))
 			break
 		end
-		-- Rows are 100 apart, so each row's detail lines sort right under it.
-		reviewRow(index * 100, row)
+		table.insert(viewRows, viewRow(index, row))
 	end
-	task.defer(layoutReview)
+	for i, v in viewRows do
+		local following = viewRows[i + 1]
+		v.hasChildren = following ~= nil and following.row.depth > v.row.depth
+	end
+	updateVisibility()
+	updateFooter()
+	layoutReview()
 end
 
--- Showing state ------------------------------------------------------------------------------------
+-- Shows a window of changes.
+local function showView(view: any)
+	view.choices = view.choices or {}
+	state.view = view
+	reviewWidget.Enabled = true
+	render()
+end
 
-local function render()
+local function decideAll(side: string)
+	local view = state.view
+	if view and view.data.conflicts then
+		for _, conflict in view.data.conflicts do
+			view.choices[conflict.id] = side
+		end
+		for _, show in choiceShows do
+			show()
+		end
+		updateFooter()
+	end
+end
+keepAllButton.Activated:Connect(function()
+	decideAll("keep")
+end)
+useAllButton.Activated:Connect(function()
+	decideAll("use")
+end)
+
+render = function()
 	local g = state.game
 	local isMain = g ~= nil and game.GameId == g.universe_id and game.PlaceId == g.main_place_id
 	local mode = "other"
 	if state.busy then
-		connection.Text, connection.TextColor3, connection.BackgroundColor3 = "Working…", AMBER, AMBER
+		connection.Text, connection.TextColor3 = "● Working", AMBER
 	elseif state.connected then
-		connection.Text, connection.TextColor3, connection.BackgroundColor3 = "● Connected", GREEN, GREEN
+		connection.Text, connection.TextColor3 = "● Connected", GREEN
 	else
-		connection.Text, connection.TextColor3, connection.BackgroundColor3 = "● Offline", GREY, GREY
+		connection.Text, connection.TextColor3 = "● Offline", GREY
 	end
 	if not state.connected and not state.busy then
-		placeKind.Text, placeTitle.Text = "NOT CONNECTED", "Start rogit serve"
-		placeDetail.Text = "Run <b>rogit serve</b> in your project folder, for example in VS Code's terminal."
+		placeKind.Text, placeTitle.Text = "NOT CONNECTED", "Run rogit serve"
+		placeDetail.Text = "In your project folder, for example in VS Code's terminal."
+	elseif state.archived then
+		placeKind.Text, placeTitle.Text = "ARCHIVED", escape(state.archived)
+		placeDetail.Text = "This branch was archived. Close this window without saving."
 	elseif state.branch then
 		local branch = state.branch :: Branch
 		mode = if branch.has_starting_point then "branch" else "other"
 		placeKind.Text, placeTitle.Text = "BRANCH", escape(branch.name)
-		placeDetail.Text = if not branch.has_starting_point
-			then "Recording the starting point…"
-			elseif branch.updated then "Updated from main " .. formatTime(branch.updated) .. ". Save with Ctrl+S as you work."
-			else "Started from main " .. formatTime(branch.created) .. ". Save with Ctrl+S as you work."
+		local parts = {}
+		if not branch.has_starting_point then
+			table.insert(parts, "Getting ready…")
+		else
+			table.insert(parts, if branch.updated then "pulled from main " .. ago(branch.updated) else "made " .. ago(branch.created))
+			if state.autosaved then
+				table.insert(parts, "autosaved " .. clock(state.autosaved))
+			end
+		end
+		placeDetail.Text = (string.gsub(table.concat(parts, " · "), "^%l", string.upper))
 	elseif g and isMain then
 		mode = "main"
-		placeKind.Text, placeTitle.Text = "MAIN", escape(g.name)
-		placeDetail.Text = "Make a branch to build an update without touching main."
+		placeKind.Text, placeTitle.Text, placeDetail.Text = "MAIN", escape(g.name), ""
 	elseif g then
 		placeKind.Text, placeTitle.Text = "OTHER PLACE", escape(game.Name)
-		placeDetail.Text = "This project belongs to " .. escape(g.name) .. ". Open its start place to use RoGit."
+		placeDetail.Text = "Open " .. escape(g.name) .. "'s start place to use RoGit."
 	elseif game.PlaceId == 0 or game.GameId == 0 then
 		placeKind.Text, placeTitle.Text = "NOT SET UP", escape(state.folder or "")
-		placeDetail.Text = "Open your published game's start place to set up RoGit."
+		placeDetail.Text = "Open your published game's start place."
 	elseif state.isMain == nil then
-		placeKind.Text, placeTitle.Text, placeDetail.Text = "CHECKING", escape(state.experience or game.Name), "Checking this place…"
+		placeKind.Text, placeTitle.Text, placeDetail.Text = "CHECKING", escape(state.experience or game.Name), ""
 	elseif state.isMain then
 		mode = "init"
 		placeKind.Text, placeTitle.Text = "SET UP", escape(state.experience or game.Name)
-		placeDetail.Text = "Init gives every object in this place a small hidden ID (an attribute), so RoGit can follow it "
-			.. "between branches. Scripts and Rojo's folders are left alone. Save main afterwards."
+		placeDetail.Text = "Init gives every object a small hidden ID, so RoGit can follow it between branches. "
+			.. "Scripts and Rojo's folders are left alone."
 	else
 		placeKind.Text, placeTitle.Text = "NOT THE START PLACE", escape(state.experience or game.Name)
-		placeDetail.Text = "Open the start place of this game to set up RoGit."
+		placeDetail.Text = "Open this game's start place to set up RoGit."
 	end
+	placeDetail.Visible = placeDetail.Text ~= ""
+	local offer = state.offer
 	if state.problem then
 		message.Text, message.TextColor3 = escape(state.problem), RED
 	elseif state.busy then
 		message.Text, message.TextColor3 = escape(state.busy), themeColor(Color.SubText)
 	else
-		message.Text, message.TextColor3 = escape(state.notice or ""), themeColor(Color.SubText)
+		message.Text = escape(if offer then offer.text else state.notice or "")
+		message.TextColor3 = themeColor(Color.SubText)
 	end
+	if messageActions:GetAttribute("Shown") ~= tostring(offer) then
+		messageActions:SetAttribute("Shown", tostring(offer))
+		clear(messageActions)
+		for i, action in (if offer then offer.actions else {}) do
+			button(messageActions, i, action.label, action.kind).Activated:Connect(function()
+				state.offer = nil
+				render()
+				action.run()
+			end)
+		end
+	end
+	messageActions.Visible = offer ~= nil and not state.busy
 	message.Visible = message.Text ~= ""
+	messageBox.Visible = message.Visible or messageActions.Visible
 	local idle = not state.busy
+	unsavedCard.Visible = mode == "branch" and idle and state.unsaved ~= nil and FRESH_WINDOW
+	unsavedText.Text = if state.unsaved then "Unsaved work from " .. formatTime(state.unsaved) else ""
 	initButton.Visible = mode == "init" and idle
-	newCard.Visible = mode == "main" and idle
-	branchesCard.Visible = mode == "main" and #state.branches > 0
-	reviewButton.Visible = mode == "branch" and idle
-	updateButton.Visible = mode == "branch" and idle
-	openReviewButton.Visible = idle and not reviewWidget.Enabled and (state.review ~= nil or state.merge ~= nil) and (mode == "branch" or mode == "main")
-	openReviewButton.Text = if state.merge and state.merge.kind == "update" then "Open update from main"
-		elseif state.merge then "Open merge of " .. state.merge.branch
-		else "Open last review"
+	newSection.Visible = mode == "main" and idle
+	branchesSection.Visible = mode == "main" and #state.branches > 0
+	renderChanges()
+	sourceSection.Visible = mode == "branch"
+	stagedSection.Visible = mode == "branch" and stagedCount > 0
+	changesSection.Visible = mode == "branch"
+	commitButton.Text = if stagedCount > 0 then string.format("Commit %d staged", stagedCount) else "Commit"
+	graphSection.Visible = (mode == "main" or mode == "branch") and #state.graph > 0
 	renderBranches()
-	renderReview()
+	renderGraph()
+	renderView()
 end
 
-reviewWidget:GetPropertyChangedSignal("Enabled"):Connect(render)
+local dropView: () -> ()
+reviewWidget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	-- Closing the window with its X is the same as Cancel or Close.
+	if not reviewWidget.Enabled and state.view then
+		dropView()
+	end
+	render()
+end)
 
 -- Actions ------------------------------------------------------------------------------------------
 
@@ -959,7 +1565,7 @@ local function run(first: string, action: () -> ())
 	if state.busy then
 		return
 	end
-	state.busy, state.problem, state.notice = first, nil, nil
+	state.busy, state.problem, state.notice, state.offer = first, nil, nil, nil
 	render()
 	local ok, failure = pcall(action)
 	state.busy = nil
@@ -967,6 +1573,17 @@ local function run(first: string, action: () -> ())
 		state.problem = tostring(failure)
 	end
 	render()
+end
+
+-- Good news shows for a few seconds, then clears.
+local function flash(textValue: string)
+	state.notice = textValue
+	task.delay(5, function()
+		if state.notice == textValue then
+			state.notice = nil
+			render()
+		end
+	end)
 end
 
 local function step(textValue: string)
@@ -982,16 +1599,22 @@ local function call(method: string, path: string, body: any?): any
 	return reply
 end
 
+-- Copies this place to rogit serve and returns the capture ID and manifest.
+local function copy(): (string, any)
+	local capture = newId(16)
+	return capture, copyPlace(capture)
+end
+
 openBranch = function(name: string)
 	local ok, reply = request("POST", "/api/branches/open", { name = name })
 	state.problem = if ok then nil else (reply or "Couldn't reach rogit serve.")
-	state.notice = if ok then "Opening " .. name .. " in Studio…" else nil
+	state.notice = if ok then "Opening " .. name .. "…" else nil
 	render()
 end
 
 local function refresh()
 	local file = if game.PlaceId == 0 then "&file=" .. HttpService:UrlEncode(game.Name) else ""
-	local ok, reply = request("GET", "/api/rogit?place=" .. string.format("%d", game.PlaceId) .. file)
+	local ok, reply = request("GET", "/api/rogit?place=" .. string.format("%d", game.PlaceId) .. file .. "&session=" .. SESSION)
 	if ok and not state.connected then
 		-- rogit serve (re)started, possibly in another folder: check this place again.
 		state.isMain, state.problem = nil, nil
@@ -1003,6 +1626,10 @@ local function refresh()
 		state.rojo = reply.rojo
 		state.branches = reply.branches or {}
 		state.branch = reply.branch
+		state.commits = reply.commits or {}
+		state.unsaved = reply.unsaved
+		state.graph = reply.graph or {}
+		state.archived = reply.archived
 		if not state.game and state.isMain == nil and game.PlaceId ~= 0 and game.GameId ~= 0 then
 			local found, place = request("GET", string.format("/api/place?game=%d&place=%d", game.GameId, game.PlaceId))
 			if found then
@@ -1017,27 +1644,26 @@ local function refresh()
 	local branch = state.branch
 	if branch and not branch.has_starting_point and not recordingStart then
 		recordingStart = true
-		run("Recording the starting point…", function()
-			local capture = newId(16)
-			local manifest = copyPlace(capture)
+		run("Getting the branch ready…", function()
+			local capture, manifest = copy()
 			call("POST", "/api/branches/start", { name = branch.name, capture = capture, manifest = manifest })
 		end)
 		recordingStart = false
 	end
 	-- A branch is waiting to be updated from main: send it a copy of main.
-	local copy = ok and reply.copy
-	if copy and not state.busy then
-		run("Sending a copy of main to " .. copy.branch .. "…", function()
+	local wanted = ok and reply.copy
+	if wanted and not state.busy then
+		run("Sending main to " .. wanted.branch .. "…", function()
 			local sent, failure = pcall(function()
 				tagObjects(state.rojo)
-				local manifest = copyPlace(copy.capture)
-				call("POST", "/api/main/copy", { capture = copy.capture, manifest = manifest })
+				local manifest = copyPlace(wanted.capture)
+				call("POST", "/api/main/copy", { capture = wanted.capture, manifest = manifest })
 			end)
 			if not sent then
-				request("POST", "/api/main/copy", { capture = copy.capture, failed = tostring(failure) })
+				request("POST", "/api/main/copy", { capture = wanted.capture, failed = tostring(failure) })
 				error(failure, 0)
 			end
-			state.notice = "Sent a copy of main to " .. copy.branch .. " so it can update."
+			flash("Sent main to " .. wanted.branch .. ".")
 		end)
 	end
 end
@@ -1060,17 +1686,13 @@ local function createBranch()
 		render()
 		return
 	end
-	run("Giving new objects an ID…", function()
-		local report = tagObjects(state.rojo)
-		step("Copying main…")
-		local started = os.clock()
-		local capture = newId(16)
-		local manifest = copyPlace(capture)
-		step("Building the branch file…")
-		local reply = call("POST", "/api/branches", { name = name, capture = capture, manifest = manifest })
+	run("Copying main…", function()
+		tagObjects(state.rojo)
+		local capture, manifest = copy()
+		step("Building " .. name .. "…")
+		call("POST", "/api/branches", { name = name, capture = capture, manifest = manifest })
 		nameBox.Text = ""
-		state.notice = string.format("Created %s from %d objects in %.1f s. It's opening in Studio.%s", name, reply.objects,
-			os.clock() - started, if report.added > 0 then string.format(" %d new objects got an ID; save main to keep them.", report.added) else "")
+		flash("Created " .. name .. ". It's opening in Studio.")
 	end)
 	refresh()
 end
@@ -1082,38 +1704,301 @@ nameBox.FocusLost:Connect(function(enter)
 	end
 end)
 
-local function runReview()
+-- Closes a window of changes that's waiting for a choice, telling rogit serve.
+dropView = function()
+	local view = state.view
+	if view and KINDS[view.kind].apply then
+		request("POST", "/api/branches/cancel", { name = view.branch, kind = view.kind })
+	end
+	state.view = nil
+	reviewWidget.Enabled = false
+end
+
+-- Takes a reply with a branch's changes (from a refresh or a commit).
+local function applyChanges(reply: any)
+	state.changes = reply.changes
+	state.since = reply.since
+	local staged = {}
+	for _, key in reply.staged or {} do
+		staged[key] = true
+	end
+	state.staged = staged
+	if reply.time then
+		state.autosaved = reply.time
+	end
+end
+
+local function uncommitted(): number
+	return stagedCount + unstagedCount
+end
+
+-- Commits everything in the branch as it is now, for a pull or a revert (like git's own commits for those).
+local function autoCommit(message: string)
+	local branch = state.branch :: Branch
+	local capture, manifest = copy()
+	local ok, reply = request("POST", "/api/branches/commit", { name = branch.name, capture = capture, manifest = manifest, message = message, auto = true })
+	if ok then
+		state.commits = reply.commits
+		applyChanges(reply)
+	end
+end
+
+-- Commits the staged changes (or all of them, when none are staged). Returns whether it worked.
+local function commitBranch(): boolean
+	local branch = state.branch
+	if not branch then
+		return false
+	end
+	local messageText = string.gsub(commitBox.Text, "^%s*(.-)%s*$", "%1")
+	local done = false
+	run("Committing…", function()
+		local capture, manifest = copy()
+		local reply = call("POST", "/api/branches/commit", { name = branch.name, capture = capture, manifest = manifest, message = messageText })
+		state.commits = reply.commits
+		applyChanges(reply)
+		commitBox.Text = ""
+		flash("Committed “" .. reply.commit.message .. "”.")
+		done = true
+	end)
+	return done
+end
+
+-- In a branch: copy it, then wait for main (open in Studio) to send its copy, and show what the pull brings.
+local function startUpdate()
+	local branch = state.branch
+	if not branch or state.busy then
+		return
+	end
+	dropView()
+	run("Copying the branch…", function()
+		tagObjects(state.rojo)
+		local capture, manifest = copy()
+		call("POST", "/api/branches/update", { name = branch.name, capture = capture, manifest = manifest })
+		step("Waiting for main… Keep " .. (if state.game then (state.game :: Game).name else "main") .. " open in Studio.")
+		local path = "/api/branches/update?name=" .. HttpService:UrlEncode(branch.name)
+		while true do
+			task.wait(0.5)
+			local reply = call("GET", path)
+			if not reply.waiting then
+				showView({
+					kind = "update", data = reply.plan, branch = branch.name, id = reply.update,
+					title = "Pull main into " .. branch.name, subtitle = SINCE[reply.since] or SINCE.start,
+				})
+				break
+			elseif reply.offered and state.busy ~= "Main is sending a copy…" then
+				step("Main is sending a copy…")
+			end
+		end
+	end)
+	render()
+end
+
+-- Like git, pulling wants the branch's own work committed first.
+local function startPull()
+	if state.busy then
+		return
+	end
+	if uncommitted() > 0 then
+		state.notice, state.problem = nil, nil
+		state.offer = {
+			text = "Commit your changes before pulling from main.",
+			actions = {
+				{ label = "Commit and pull", kind = "primary", run = function()
+					if commitBranch() then
+						startUpdate()
+					end
+				end },
+				{ label = "Cancel", kind = "quiet", run = function() end },
+			},
+		}
+		render()
+		return
+	end
+	startUpdate()
+end
+
+startMerge = function(name: string)
+	if state.busy then
+		return
+	end
+	dropView()
+	run("Copying main…", function()
+		tagObjects(state.rojo)
+		local capture, manifest = copy()
+		step("Comparing " .. name .. " with main…")
+		local reply = call("POST", "/api/branches/merge", { name = name, capture = capture, manifest = manifest })
+		local source = if reply.source == "commit"
+			then "branch at “" .. (reply.commit or "") .. "”"
+			else "branch as " .. reply.source .. " " .. clock(reply.sourceTime)
+		local left = if reply.uncommitted and reply.uncommitted > 0
+			then string.format(" · %d uncommitted change%s left out", reply.uncommitted, if reply.uncommitted == 1 then "" else "s")
+			else ""
+		showView({
+			kind = "merge", data = reply.plan, branch = name, id = reply.merge, title = "Merge " .. name .. " into main",
+			subtitle = (SINCE[reply.since] or SINCE.start) .. " · " .. source .. left,
+		})
+	end)
+	render()
+end
+
+setPinned = function(name: string, pinned: boolean)
+	state.menu = nil
+	local ok, reply = request("POST", "/api/branches/pin", { name = name, pinned = pinned })
+	if ok then
+		state.branches = reply.branches
+	else
+		state.problem = reply
+	end
+	render()
+end
+
+local function archiveBranch(name: string)
+	run("Archiving " .. name .. "…", function()
+		local reply = call("POST", "/api/branches/archive", { name = name })
+		state.branches = reply.branches
+		flash("Archived " .. name .. ".")
+	end)
+	refresh()
+end
+
+confirmArchive = function(name: string)
+	state.notice, state.problem = nil, nil
+	state.offer = {
+		text = "Archive " .. name .. "? This deletes its branch file and closes it in Studio.",
+		actions = {
+			{ label = "Archive", kind = "danger", run = function()
+				archiveBranch(name)
+			end },
+			{ label = "Cancel", kind = "quiet", run = function() end },
+		},
+	}
+	render()
+end
+
+openHistory = function(event: any)
+	run("Opening…", function()
+		local reply = call("GET", "/api/history/rows?id=" .. event.id)
+		showView({
+			kind = "history", branch = event.branch, data = { rows = reply.rows, truncated = reply.truncated, summary = event.summary or {} },
+			title = string.format(KIND_TEXT[event.kind] or "%s", event.branch), subtitle = formatTime(event.time),
+		})
+	end)
+end
+
+viewCommit = function(commit: any, branchName: string)
+	run("Opening…", function()
+		local reply = call("POST", "/api/branches/commit/view", { name = branchName, id = commit.id })
+		local here = state.branch ~= nil and (state.branch :: Branch).name == branchName
+		showView({
+			kind = "commit", data = reply.review, branch = branchName, commit = commit, canRevert = here,
+			title = commit.message, subtitle = branchName .. " · " .. formatTime(commit.time),
+		})
+	end)
+end
+
+startRevert = function(commit: any)
 	local branch = state.branch
 	if not branch then
 		return
 	end
-	if state.merge then
-		request("POST", "/api/branches/cancel", { name = state.merge.branch, kind = state.merge.kind })
-		state.merge = nil
-	end
-	run("Giving new objects an ID…", function()
-		tagObjects(state.rojo)
-		step("Copying the branch…")
-		local started = os.clock()
-		local capture = newId(16)
-		local manifest = copyPlace(capture)
-		step("Comparing…")
-		local reply = call("POST", "/api/branches/review", { name = branch.name, capture = capture, manifest = manifest })
-		state.review = reply.review
-		state.review.since, state.review.sinceTime = reply.since, reply.sinceTime
-		state.notice = string.format("Reviewed in %.1f s.", os.clock() - started)
+	dropView()
+	local lost = uncommitted()
+	run("Copying the branch…", function()
+		local capture, manifest = copy()
+		step("Comparing with “" .. commit.message .. "”…")
+		local reply = call("POST", "/api/branches/revert", { name = branch.name, id = commit.id, capture = capture, manifest = manifest })
+		showView({
+			kind = "revert", data = reply.plan, branch = branch.name, record = reply.record, message = commit.message,
+			title = "Revert to “" .. commit.message .. "”",
+			subtitle = formatTime(commit.time)
+				.. (if lost > 0 then string.format(" · %d uncommitted change%s will be undone too", lost, if lost == 1 then "" else "s") else ""),
+		})
 	end)
-	reviewWidget.Enabled = state.review ~= nil
-	refresh()
 end
 
--- Merging -----------------------------------------------------------------------------------------
+selectObject = function(key: string)
+	local object = findObject(key)
+	if object then
+		Selection:Set({ object })
+	end
+end
+
+setStaged = function(keys: { string })
+	local staged = {}
+	for _, key in keys do
+		staged[key] = true
+	end
+	state.staged = staged
+	render()
+	local branch = state.branch
+	if branch then
+		request("POST", "/api/branches/stage", { name = branch.name, keys = keys })
+	end
+end
+
+commitButton.Activated:Connect(commitBranch)
+commitBox.FocusLost:Connect(function(enter)
+	if enter then
+		commitBranch()
+	end
+end)
+pullButton.Activated:Connect(startPull)
+stageAllButton.Activated:Connect(function()
+	local keys = stagedKeys()
+	local _, unstaged = changeList()
+	for _, item in unstaged do
+		table.insert(keys, item.row.key)
+	end
+	setStaged(keys)
+end)
+unstageAllButton.Activated:Connect(function()
+	setStaged({})
+end)
+discardAllButton.Activated:Connect(function()
+	local keys = {}
+	local _, unstaged = changeList()
+	for _, item in unstaged do
+		table.insert(keys, item.row.key)
+	end
+	discard(keys)
+end)
+
+restoreButton.Activated:Connect(function()
+	local branch = state.branch
+	if not branch then
+		return
+	end
+	dropView()
+	local from = state.unsaved
+	run("Copying the branch…", function()
+		local capture, manifest = copy()
+		step("Comparing…")
+		local reply = call("POST", "/api/branches/restore", { name = branch.name, capture = capture, manifest = manifest })
+		showView({
+			kind = "restore", data = reply.plan, branch = branch.name, record = reply.record, title = "Restore unsaved work",
+			subtitle = if from then "From " .. formatTime(from) else nil,
+		})
+	end)
+end)
+
+dismissButton.Activated:Connect(function()
+	local branch = state.branch
+	if branch then
+		request("POST", "/api/branches/unsaved/dismiss", { name = branch.name })
+		state.unsaved = nil
+		render()
+	end
+end)
+
+-- Applying changes ----------------------------------------------------------------------------------
 
 -- Bundle attributes (set by rogit): which operation an object belongs to, and which ones need a reference fixed.
 local OP_TAG = "RoGitOp"
 local REF_TAG = "RoGitRef"
 -- Workspace attribute in main: the last merge of each branch, so the next merge only brings what changed after it.
 local MERGES_TAG = "RoGitMerges"
+-- Workspace attribute in a branch: the last update from main, so the next one only brings what changed after it.
+local UPDATE_TAG = "RoGitUpdate"
 
 local function recordMerge(branch: string, id: string)
 	local ok, record = pcall(HttpService.JSONDecode, HttpService, workspace:GetAttribute(MERGES_TAG) or "{}")
@@ -1123,8 +2008,7 @@ local function recordMerge(branch: string, id: string)
 	record[branch] = id
 	workspace:SetAttribute(MERGES_TAG, HttpService:JSONEncode(record))
 end
--- Workspace attribute in a branch: the last update from main, so the next one only brings what changed after it.
-local UPDATE_TAG = "RoGitUpdate"
+
 -- Properties a plugin can't set directly. They change through the mesh or union APIs instead.
 local MESH_DATA = {
 	MeshId = true, MeshContent = true, MeshData = true, InitialSize = true, PhysicalConfigData = true, PhysicsData = true,
@@ -1155,12 +2039,12 @@ end
 
 local function copyAttributes(from: Instance, to: Instance)
 	for key in to:GetAttributes() do
-		if key ~= TAG and from:GetAttribute(key) == nil then
+		if key ~= TAG and string.sub(key, 1, 4) ~= "RBX_" and from:GetAttribute(key) == nil then
 			to:SetAttribute(key, nil)
 		end
 	end
 	for key, value in from:GetAttributes() do
-		if key ~= TAG and key ~= OP_TAG and key ~= REF_TAG then
+		if key ~= TAG and key ~= OP_TAG and key ~= REF_TAG and string.sub(key, 1, 4) ~= "RBX_" then
 			to:SetAttribute(key, value)
 		end
 	end
@@ -1275,156 +2159,250 @@ local function applyOperation(op: any, templates: { [number]: Instance }, ids: {
 	end
 end
 
--- Applies the open merge (in main) or update (in a branch) as one undo step.
-local function applyMerge()
-	local merge = state.merge
-	if not merge or not merge.ready then
+-- Applies a plan's operations; conflicts apply only where `choices` says "use". Returns how many applied, how many
+-- were skipped by choice, and what went wrong. The caller wraps this in one undo step.
+local function runPlan(plan: any, choices: { [number]: string }): (number, number, { string })
+	local templates: { [number]: Instance } = {}
+	if plan.bundle ~= "" then
+		local data = EncodingService:Base64Decode(buffer.fromstring(plan.bundle))
+		for _, object in SerializationService:DeserializeInstancesAsync(data) do
+			local index = tonumber(object:GetAttribute(OP_TAG))
+			if index then
+				object:SetAttribute(OP_TAG, nil)
+				templates[index] = object
+			end
+		end
+	end
+	local ids = idMap()
+	local problems: { string } = {}
+	local applied, skipped = 0, 0
+	-- Removals go last, so moves and additions can still find everything they need.
+	local ordered = {}
+	for _, op in plan.operations do
+		if op.kind ~= "remove" then
+			table.insert(ordered, op)
+		end
+	end
+	for _, op in plan.operations do
+		if op.kind == "remove" then
+			table.insert(ordered, op)
+		end
+	end
+	for _, op in ordered do
+		if op.conflict and choices[op.conflict] ~= "use" then
+			skipped += 1
+			continue
+		end
+		local ok, err = pcall(applyOperation, op, templates, ids, problems)
+		if ok then
+			applied += 1
+		else
+			table.insert(problems, tostring(err))
+		end
+	end
+	return applied, skipped, problems
+end
+
+local VERBS = {
+	merge = { "Merge", "Merging…", "Merged" }, update = { "Pull", "Pulling…", "Pulled" },
+	revert = { "Revert", "Reverting…", "Reverted" }, restore = { "Restore", "Restoring…", "Restored" },
+}
+
+-- Applies the open merge (in main), update, revert or restore (in a branch) as one undo step.
+local function applyView()
+	local view = state.view
+	if not view or not view.ready then
 		return
 	end
-	local isUpdate = merge.kind == "update"
+	local kind = view.kind
+	local verbs = VERBS[kind]
+	state.view = nil
 	reviewWidget.Enabled = false
-	run(if isUpdate then "Updating " .. merge.branch .. " from main…" else "Merging " .. merge.branch .. " into main…", function()
-		local plan = merge.plan
-		local templates: { [number]: Instance } = {}
-		if plan.bundle ~= "" then
-			local data = EncodingService:Base64Decode(buffer.fromstring(plan.bundle))
-			for _, object in SerializationService:DeserializeInstancesAsync(data) do
-				local index = tonumber(object:GetAttribute(OP_TAG))
-				if index then
-					object:SetAttribute(OP_TAG, nil)
-					templates[index] = object
-				end
-			end
-		end
-		local ids = idMap()
-		local problems: { string } = {}
-		local applied, skipped = 0, 0
-		-- Removals go last, so moves and additions can still find everything they need.
-		local ordered = {}
-		for _, op in plan.operations do
-			if op.kind ~= "remove" then
-				table.insert(ordered, op)
-			end
-		end
-		for _, op in plan.operations do
-			if op.kind == "remove" then
-				table.insert(ordered, op)
-			end
-		end
-		local recording = if isUpdate
-			then ChangeHistoryService:TryBeginRecording("RoGitUpdate", "RoGit update from main")
-			else ChangeHistoryService:TryBeginRecording("RoGitMerge", "RoGit merge " .. merge.branch)
-		for _, op in ordered do
-			if op.conflict and merge.choices[op.conflict] ~= "use" then
-				skipped += 1
-				continue
-			end
-			local ok, err = pcall(applyOperation, op, templates, ids, problems)
-			if ok then
-				applied += 1
-			else
-				table.insert(problems, tostring(err))
-			end
-		end
+	run(verbs[2], function()
+		local recording = ChangeHistoryService:TryBeginRecording("RoGit" .. verbs[1], "RoGit " .. string.lower(verbs[1]) .. " " .. view.branch)
+		local applied, skipped, problems = runPlan(view.data, view.choices)
 		-- Recorded in the same undo step, so undoing it (or not saving) forgets it too. If something couldn't be
 		-- applied, the next merge or update starts from earlier and offers it again.
-		local recorded = #problems == 0 and merge.id ~= nil
-		if recorded and isUpdate then
-			workspace:SetAttribute(UPDATE_TAG, merge.id)
-		elseif recorded then
-			recordMerge(merge.branch, merge.id)
+		local clean = #problems == 0
+		if clean and kind == "merge" and view.id then
+			recordMerge(view.branch, view.id)
+		elseif clean and kind == "update" and view.id then
+			workspace:SetAttribute(UPDATE_TAG, view.id)
+		elseif clean and (kind == "revert" or kind == "restore") then
+			workspace:SetAttribute(UPDATE_TAG, if view.record and view.record ~= "" then view.record else nil)
 		end
 		if recording then
 			ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
 		end
-		local report = { name = merge.branch, applied = applied, skipped = skipped, failed = problems }
-		if isUpdate then
-			report.update = if recorded then merge.id else nil
+		local report: any = { name = view.branch, applied = applied, skipped = skipped, failed = problems }
+		if kind == "merge" then
+			report.merge = if clean then view.id else nil
+			request("POST", "/api/branches/merged", report)
+		elseif kind == "update" then
+			report.update = if clean then view.id else nil
 			request("POST", "/api/branches/updated", report)
 		else
-			report.merge = if recorded then merge.id else nil
-			request("POST", "/api/branches/merged", report)
+			report.kind = kind
+			request("POST", "/api/branches/restored", report)
 		end
-		state.merge = nil
-		local problemText = if #problems > 0 then string.format(", %d couldn't be applied (see the rogit serve terminal)", #problems) else ""
-		state.notice = if isUpdate
-			then string.format("Updated from main: %d change%s applied%s. Save the branch (Ctrl+S) to keep it; Ctrl+Z undoes the update.",
-				applied, if applied == 1 then "" else "s", problemText)
-			else string.format("Merged %s into main: %d change%s applied%s. Save main to keep it; Ctrl+Z undoes the merge.",
-				merge.branch, applied, if applied == 1 then "" else "s", problemText)
+		state.view = nil
+		local done = string.format("%s: %d change%s.", verbs[3], applied, if applied == 1 then "" else "s")
+		if not clean then
+			done ..= string.format(" %d couldn't be applied; see the rogit serve terminal.", #problems)
+		end
+		if kind == "merge" then
+			-- The graph shows the merge; only problems need a message.
+			if not clean then
+				state.problem = done
+			end
+		else
+			if kind == "update" then
+				step("Committing the pull…")
+				autoCommit("Pull from main")
+			elseif kind == "revert" then
+				step("Committing the revert…")
+				autoCommit("Revert to “" .. (view.message or "commit") .. "”")
+			end
+			if clean then
+				flash(done .. " Save with Ctrl+S.")
+			else
+				state.problem = done
+			end
+		end
 	end)
 	refresh()
 end
 
-startMerge = function(name: string)
-	if state.busy then
-		return
-	end
-	state.review = nil
-	run("Giving new objects an ID…", function()
-		tagObjects(state.rojo)
-		step("Copying main…")
-		local capture = newId(16)
-		local manifest = copyPlace(capture)
-		step("Comparing " .. name .. " with main…")
-		local reply = call("POST", "/api/branches/merge", { name = name, capture = capture, manifest = manifest })
-		state.merge = {
-			kind = "merge", branch = name, plan = reply.plan, source = reply.source, sourceTime = reply.sourceTime,
-			since = reply.since, sinceTime = reply.sinceTime, id = reply.merge, choices = {},
-		}
-	end)
-	reviewWidget.Enabled = state.merge ~= nil
-	render()
-end
-
--- In a branch: copy it, then wait for main (open in Studio) to send its copy, and show what the update brings.
-local function startUpdate()
+-- Puts uncommitted changes (`keys`) back the way the last commit had them, like VS Code's Discard Changes.
+discard = function(keys: { string })
 	local branch = state.branch
-	if not branch or state.busy then
+	if not branch or #keys == 0 then
 		return
 	end
-	state.review = nil
-	run("Giving new objects an ID…", function()
-		tagObjects(state.rojo)
-		step("Copying the branch…")
-		local capture = newId(16)
-		local manifest = copyPlace(capture)
-		call("POST", "/api/branches/update", { name = branch.name, capture = capture, manifest = manifest })
-		step("Waiting for main… Keep " .. (if state.game then (state.game :: Game).name else "main") .. " open in Studio.")
-		local path = "/api/branches/update?name=" .. HttpService:UrlEncode(branch.name)
-		while true do
-			task.wait(0.5)
-			local reply = call("GET", path)
-			if not reply.waiting then
-				state.merge = {
-					kind = "update", branch = branch.name, plan = reply.plan, since = reply.since, sinceTime = reply.sinceTime,
-					id = reply.update, choices = {},
-				}
-				break
-			elseif reply.offered and state.busy ~= "Main is sending a copy…" then
-				step("Main is sending a copy…")
+	run("Discarding…", function()
+		local capture, manifest = copy()
+		local reply = call("POST", "/api/branches/discard", { name = branch.name, capture = capture, manifest = manifest, keys = keys })
+		local recording = ChangeHistoryService:TryBeginRecording("RoGitDiscard", "RoGit discard changes")
+		local _, _, problems = runPlan(reply.plan, {})
+		if recording then
+			ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+		end
+		if #problems > 0 then
+			for _, problem in problems do
+				warn("RoGit discard: " .. problem)
 			end
+			state.problem = string.format("%d couldn't be put back; see the Output window.", #problems)
+		else
+			flash(string.format("Discarded %d change%s. Ctrl+Z brings %s back.", #keys, if #keys == 1 then "" else "s", if #keys == 1 then "it" else "them"))
 		end
 	end)
-	reviewWidget.Enabled = state.merge ~= nil
-	render()
 end
 
-mergeButton.Activated:Connect(applyMerge)
-cancelButton.Activated:Connect(function()
-	if state.merge then
-		request("POST", "/api/branches/cancel", { name = state.merge.branch, kind = state.merge.kind })
+applyButton.Activated:Connect(function()
+	local view = state.view
+	if not view then
+		return
+	elseif view.kind == "commit" then
+		startRevert(view.commit)
+	else
+		applyView()
 	end
-	state.merge = nil
-	reviewWidget.Enabled = false
+end)
+closeButton.Activated:Connect(function()
+	dropView()
 	render()
 end)
-reviewButton.Activated:Connect(runReview)
-updateButton.Activated:Connect(startUpdate)
-refreshButton.Activated:Connect(runReview)
-openReviewButton.Activated:Connect(function()
-	reviewWidget.Enabled = true
+
+-- A branch's changes stay current: after edits settle, RoGit copies the branch, which also autosaves it.
+local watch = { dirty = true, first = 0, last = 0, seconds = 0.5, copying = false }
+local tracked: { Instance } = {}
+for _, name in SERVICES do
+	local ok, service = pcall(game.GetService, game, name)
+	if ok and service then
+		table.insert(tracked, service)
+	end
+end
+
+-- Whether an object is in one of the saved services, remembered per object (dragging a model fires a lot).
+local relevance: { [Instance]: boolean } = setmetatable({}, { __mode = "k" }) :: any
+local function relevant(object: Instance): boolean
+	local known = relevance[object]
+	if known == nil then
+		known = false
+		for _, service in tracked do
+			if object:IsDescendantOf(service) then
+				known = true
+				break
+			end
+		end
+		relevance[object] = known
+	end
+	return known
+end
+
+-- Only edits to the place count: Studio changes plenty of its own things (outlines, panels) all the time.
+local function touched(object: Instance)
+	if object.ClassName == "Camera" or not relevant(object) then
+		return
+	end
+	if not watch.dirty then
+		watch.dirty, watch.first = true, os.clock()
+	end
+	watch.last = os.clock()
+end
+game.DescendantAdded:Connect(touched)
+game.DescendantRemoving:Connect(touched)
+-- Studio may not let plugins hear every property change. Then RoGit listens to what's selected, which is where
+-- nearly every edit happens (moving, scaling, the Properties panel), and checks the whole place now and then.
+local hearsEverything = pcall(function()
+	game.ItemChanged:Connect(touched)
 end)
+local selectionConnections: { RBXScriptConnection } = {}
+local function watchSelection()
+	for _, connection in selectionConnections do
+		connection:Disconnect()
+	end
+	table.clear(selectionConnections)
+	for _, object in Selection:Get() do
+		local objects = object:GetDescendants()
+		table.insert(objects, object)
+		for _, watched in objects do
+			if #selectionConnections >= 5000 then
+				return
+			end
+			table.insert(selectionConnections, watched.Changed:Connect(function()
+				touched(watched)
+			end))
+		end
+	end
+end
+if not hearsEverything then
+	Selection.SelectionChanged:Connect(watchSelection)
+	watchSelection()
+end
+local function changedByUndo()
+	watch.dirty, watch.last = true, os.clock()
+end
+ChangeHistoryService.OnUndo:Connect(changedByUndo)
+ChangeHistoryService.OnRedo:Connect(changedByUndo)
+
+local function refreshChanges()
+	local branch = state.branch :: Branch
+	watch.dirty, watch.copying = false, true
+	local started = os.clock()
+	local ok, reply = pcall(function()
+		local capture, manifest = copy()
+		return call("POST", "/api/branches/changes", { name = branch.name, capture = capture, manifest = manifest })
+	end)
+	watch.copying = false
+	watch.seconds = os.clock() - started
+	if ok then
+		applyChanges(reply)
+		render()
+	else
+		watch.dirty = true
+	end
+end
 
 render()
 task.spawn(function()
@@ -1433,5 +2411,29 @@ task.spawn(function()
 			refresh()
 		end
 		task.wait(POLL_SECONDS)
+	end
+end)
+task.spawn(function()
+	while true do
+		task.wait(0.25)
+		local branch = state.branch
+		local inBranch = branch ~= nil and branch.has_starting_point and not state.archived and state.connected
+		-- Bigger places take longer to copy, so wait a little longer for edits to settle.
+		local settle = math.clamp(watch.seconds / 2, 0.15, 3)
+		local due = watch.dirty and (os.clock() - watch.last >= settle or os.clock() - watch.first >= 30)
+		-- Without hearing every change, also check the whole place every so often (terrain, other plugins).
+		if not hearsEverything and os.clock() - watch.last >= math.max(15, watch.seconds * 20) then
+			due = true
+		end
+		if inBranch and due and not state.busy and not watch.copying then
+			local ok, failure = pcall(refreshChanges)
+			if not ok then
+				watch.copying = false
+				warn("RoGit couldn't refresh the changes: " .. tostring(failure))
+			end
+			if not hearsEverything then
+				watch.last = os.clock()
+			end
+		end
 	end
 end)

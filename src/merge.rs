@@ -39,11 +39,17 @@ pub enum Direction {
     Merge,
     /// Main into the branch.
     Update,
+    /// An earlier copy of the branch (a commit, or unsaved work) back into the branch.
+    Restore,
 }
 
 impl Direction {
     fn source(self) -> &'static str {
-        if self == Direction::Merge { "the branch" } else { "main" }
+        match self {
+            Direction::Merge => "the branch",
+            Direction::Update => "main",
+            Direction::Restore => "the copy",
+        }
     }
 
     fn target(self) -> &'static str {

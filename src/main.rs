@@ -1,10 +1,12 @@
 mod branches;
 mod diff;
+mod history;
 mod merge;
 mod place;
 mod project;
 mod roblox;
 mod server;
+mod stage;
 
 use std::path::PathBuf;
 use std::io::{self, IsTerminal};
