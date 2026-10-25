@@ -62,10 +62,11 @@ fn diff(name: Option<&str>, as_json: bool) -> Result<(), String> {
         }
         return Ok(());
     };
-    let start = branches.starting_point(name)?;
-    // Like a merge: the saved branch file, or the copy from the last review in Studio if that's newer.
+    // Like a merge: the saved branch file, or the copy from the last review in Studio if that's newer. Compared,
+    // like a review, with the last update from main or else the starting point.
     let (current, source, time) = branches.newest(name)?;
-    let review = diff::compare(&start, &current, &project.rojo_paths());
+    let (base, _, _) = branches.base(name, None, merge::last_update(&current).as_deref())?;
+    let review = diff::compare(&base, &current, &project.rojo_paths());
     if as_json {
         println!("{}", serde_json::to_string(&review).map_err(|e| e.to_string())?);
         return Ok(());
@@ -79,9 +80,9 @@ fn plan_merge(name: &str, main: &str) -> Result<(), String> {
     let project = project::Project::new(root.clone());
     let branches = branches::Branches::new(root.join(project::DATA_DIR));
     let main = place::read(std::path::Path::new(main))?;
-    let (base, _) = branches.merge_base(name, merge::last_merge(&main, name).as_deref())?;
     let (branch, _, _) = branches.newest(name)?;
-    let plan = merge::plan(&base, &branch, &main, &project.rojo_paths())?;
+    let (base, _, _) = branches.base(name, merge::last_merge(&main, name).as_deref(), merge::last_update(&branch).as_deref())?;
+    let plan = merge::plan(&base, &branch, &main, &project.rojo_paths(), merge::Direction::Merge)?;
     println!("{}", serde_json::to_string(&plan).map_err(|e| e.to_string())?);
     Ok(())
 }

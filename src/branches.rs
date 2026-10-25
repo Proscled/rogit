@@ -21,6 +21,32 @@ pub struct Branch {
     /// Unix time of the last merge into main.
     #[serde(default)]
     pub merged: Option<u64>,
+    /// Unix time of the last update from main.
+    #[serde(default)]
+    pub updated: Option<u64>,
+}
+
+/// Where a branch and main last met. Reviews, merges and updates compare against it.
+#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Since {
+    /// The branch's starting point.
+    Start,
+    /// The branch as it was last merged into main.
+    Merge,
+    /// The main the branch was last updated from.
+    Update,
+}
+
+/// A new ID for a merge (`m…`) or an update (`u…`). It carries its time, so the newest one can be found.
+pub fn new_id(kind: Since) -> String {
+    let prefix = if kind == Since::Update { 'u' } else { 'm' };
+    format!("{prefix}{:x}", SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default())
+}
+
+/// When a merge or update ID was made, in nanoseconds.
+fn id_time(id: &str) -> u128 {
+    id.get(1..).and_then(|hex| u128::from_str_radix(hex, 16).ok()).unwrap_or_default()
 }
 
 fn now() -> u64 {
@@ -115,7 +141,7 @@ impl Branches {
         let report = place::build(&upload, manifest, &self.file(name));
         let _ = fs::remove_dir_all(&upload);
         let report = report?;
-        self.save(&Branch { name: name.to_owned(), created: now(), has_starting_point: false, merged: None })?;
+        self.save(&Branch { name: name.to_owned(), created: now(), has_starting_point: false, merged: None, updated: None })?;
         Ok(report)
     }
 
@@ -170,38 +196,53 @@ impl Branches {
         }
     }
 
-    fn merge_copy(&self, name: &str, merge: &str) -> PathBuf {
-        self.dir().join(name).join("merges").join(format!("{merge}.rbxl"))
+    fn base_copy(&self, name: &str, id: &str) -> PathBuf {
+        self.dir().join(name).join("bases").join(format!("{id}.rbxl"))
     }
 
-    /// Keeps the branch as it was merged, so the next merge only brings what changed after it. Keeps the last few,
-    /// since main may still have an older merge (the newest one could be undone or never saved).
-    pub fn keep_merge(&self, name: &str, merge: &str, dom: &rbx_dom_weak::WeakDom) -> Result<(), String> {
-        let file = self.merge_copy(name, merge);
+    /// Keeps a place where the branch and main met: the branch as it was merged, or the main it was updated from.
+    /// The next review, merge or update then only shows what changed after it. Keeps the last few, since an older
+    /// one may still count (the newest could be undone or never saved).
+    pub fn keep_base(&self, name: &str, id: &str, dom: &rbx_dom_weak::WeakDom) -> Result<(), String> {
+        let file = self.base_copy(name, id);
         let dir = file.parent().unwrap();
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         place::write(dom, &file)?;
         let mut copies: Vec<(u64, PathBuf)> =
             fs::read_dir(dir).into_iter().flatten().flatten().map(|e| (modified(&e.path()).unwrap_or_default(), e.path())).collect();
         copies.sort_by(|a, b| b.0.cmp(&a.0));
-        for (_, old) in copies.into_iter().skip(5) {
+        for (_, old) in copies.into_iter().skip(6) {
             let _ = fs::remove_file(old);
         }
         Ok(())
     }
 
-    /// What a merge compares the branch with: the branch as it was last merged, if main still has that merge (its
-    /// record says `last`), or else its starting point. Returns the place and whether it's a merge.
-    pub fn merge_base(&self, name: &str, last: Option<&str>) -> Result<(rbx_dom_weak::WeakDom, bool), String> {
-        if let Some(file) = last.filter(|id| valid_capture(id)).map(|id| self.merge_copy(name, id)).filter(|f| f.exists()) {
-            return Ok((place::read(&file)?, true));
+    /// Where the branch and main last met that both still have: the newest of the merge main records (`merge`) and
+    /// the update the branch records (`update`), or else the starting point. Returns the place, which kind it is and
+    /// its Unix time.
+    pub fn base(&self, name: &str, merge: Option<&str>, update: Option<&str>) -> Result<(rbx_dom_weak::WeakDom, Since, u64), String> {
+        let newest = [merge.filter(|id| id.starts_with('m')), update.filter(|id| id.starts_with('u'))]
+            .into_iter()
+            .flatten()
+            .filter(|id| valid_capture(id) && self.base_copy(name, id).exists())
+            .max_by_key(|id| id_time(id));
+        if let Some(id) = newest {
+            let kind = if id.starts_with('u') { Since::Update } else { Since::Merge };
+            return Ok((place::read(&self.base_copy(name, id))?, kind, (id_time(id) / 1_000_000_000) as u64));
         }
-        Ok((self.starting_point(name)?, false))
+        let created = self.get(name).map(|b| b.created).unwrap_or_default();
+        Ok((self.starting_point(name)?, Since::Start, created))
     }
 
     pub fn mark_merged(&self, name: &str) -> Result<(), String> {
         let mut branch = self.get(name).ok_or_else(|| format!("There's no branch called {name}."))?;
         branch.merged = Some(now());
+        self.save(&branch)
+    }
+
+    pub fn mark_updated(&self, name: &str) -> Result<(), String> {
+        let mut branch = self.get(name).ok_or_else(|| format!("There's no branch called {name}."))?;
+        branch.updated = Some(now());
         self.save(&branch)
     }
 
@@ -256,6 +297,30 @@ mod tests {
         assert!(!valid_name("has space"));
         assert!(!valid_name("../escape"));
         assert!(!valid_name(&"x".repeat(41)));
+    }
+
+    #[test]
+    fn the_newest_meeting_point_both_sides_still_have_wins() {
+        let data = std::env::temp_dir().join(format!("rogit-bases-{}", std::process::id()));
+        let branches = Branches::new(data.clone());
+        let place = |name: &str| {
+            let mut dom = rbx_dom_weak::WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel"));
+            dom.insert(dom.root_ref(), rbx_dom_weak::InstanceBuilder::new("Workspace").with_name(name));
+            dom
+        };
+        let (merge, update) = (new_id(Since::Merge), new_id(Since::Update));
+        branches.keep_base("b", &merge, &place("merged")).unwrap();
+        branches.keep_base("b", &update, &place("updated")).unwrap();
+        let workspace = |dom: &rbx_dom_weak::WeakDom| dom.get_by_ref(dom.root().children()[0]).unwrap().name.clone();
+
+        let (dom, kind, _) = branches.base("b", Some(&merge), Some(&update)).unwrap();
+        assert_eq!((workspace(&dom), kind), ("updated".to_owned(), Since::Update));
+        // The branch's update was undone, so it no longer records it: the merge main still has counts.
+        let (dom, kind, _) = branches.base("b", Some(&merge), None).unwrap();
+        assert_eq!((workspace(&dom), kind), ("merged".to_owned(), Since::Merge));
+        // A record that names the wrong kind, or a copy that isn't there, doesn't count.
+        assert!(branches.base("b", Some(&update), None).is_err(), "falls back to the starting point, which b doesn't have");
+        fs::remove_dir_all(data).unwrap();
     }
 
     #[test]

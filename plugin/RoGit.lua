@@ -28,7 +28,7 @@ local SERVICES = {
 }
 
 type Game = { name: string, universe_id: number, main_place_id: number }
-type Branch = { name: string, created: number, has_starting_point: boolean }
+type Branch = { name: string, created: number, has_starting_point: boolean, merged: number?, updated: number? }
 type State = {
 	connected: boolean,
 	folder: string?,
@@ -436,10 +436,11 @@ local message = text(root, 3, 13, MEDIUM, Color.SubText)
 
 local initButton = button(root, 4, "Init", true, true)
 local reviewButton = button(root, 5, "Review changes", true, true)
-local openReviewButton = button(root, 6, "Open last review", false, true)
+local updateButton = button(root, 6, "Update from main", false, true)
+local openReviewButton = button(root, 7, "Open last review", false, true)
 
 -- New branch (main only).
-local newCard = card(root, 7)
+local newCard = card(root, 8)
 local newTitle = text(newCard, 1, 14, BOLD, Color.MainText)
 newTitle.Text = "New branch"
 local newHint = text(newCard, 2, 12, REGULAR, Color.DimmedText)
@@ -459,7 +460,7 @@ createButton.AutomaticSize = Enum.AutomaticSize.None
 createButton.Size = UDim2.new(0, 78, 1, 0)
 
 -- Branch list (main only).
-local branchesCard = card(root, 8)
+local branchesCard = card(root, 9)
 local branchesTitle = text(branchesCard, 1, 14, BOLD, Color.MainText)
 local branchRows = new("Frame", {
 	LayoutOrder = 2, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = branchesCard,
@@ -515,7 +516,27 @@ local function renderBranches()
 	end
 end
 
--- Review window (a branch's changes, or a merge into main) --------------------------------------------
+-- Review window (a branch's changes, a merge into main, or an update from main) ----------------------
+
+-- How a merge (the branch into main) and an update (main into the branch) are worded. "Keep" leaves this place as
+-- it is; "use" takes the incoming side.
+local WORDS = {
+	merge = {
+		keep = "Keep main", use = "Use branch", apply = "Merge into main", window = "RoGit · Merge",
+		remove = "Remove it from main?", restore = "Bring it back from the branch?",
+		nothing = "Nothing to merge: main already has everything from this branch.",
+		nothingSince = "Nothing new to merge: main has everything from this branch's last merge.",
+		undo = "Applies as one step. Ctrl+Z undoes the whole merge.",
+	},
+	update = {
+		keep = "Keep branch", use = "Use main", apply = "Update branch", window = "RoGit · Update",
+		remove = "Remove it from the branch?", restore = "Bring it back from main?",
+		nothing = "Nothing to update: the branch already has everything from main.",
+		nothingSince = "Nothing to update: the branch already has everything from main.",
+		undo = "Applies as one step. Ctrl+Z undoes the whole update.",
+	},
+}
+local SINCE = { start = "Since the branch started", merge = "Since the last merge", update = "Since the last update from main" }
 
 local MAX_REVIEW_ROWS = 400
 local STATUS = {
@@ -631,31 +652,32 @@ end
 
 local updateFooter: () -> ()
 
--- "Keep main" / "Use branch" for one conflict.
+-- "Keep main" / "Use branch" (or "Keep branch" / "Use main" in an update) for one conflict.
 local function choice(parent: Instance, id: number)
+	local words = WORDS[state.merge.kind]
 	local holder = new("Frame", {
 		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(0, 22),
 		AutomaticSize = Enum.AutomaticSize.X, BackgroundTransparency = 1, Parent = parent,
 	})
 	stack(holder, 4, true)
-	local keep = button(holder, 1, "Keep main", false)
-	local use = button(holder, 2, "Use branch", false)
+	local keep = button(holder, 1, words.keep, false)
+	local use = button(holder, 2, words.use, false)
 	for _, b in { keep, use } do
 		b.Size = UDim2.new(0, 0, 0, 22)
 		b.TextSize = 12
 	end
 	local function show()
 		local picked = state.merge and state.merge.choices[id]
-		setStyle(keep, picked == "main")
-		setStyle(use, picked == "branch")
+		setStyle(keep, picked == "keep")
+		setStyle(use, picked == "use")
 	end
 	keep.Activated:Connect(function()
-		state.merge.choices[id] = "main"
+		state.merge.choices[id] = "keep"
 		show()
 		updateFooter()
 	end)
 	use.Activated:Connect(function()
-		state.merge.choices[id] = "branch"
+		state.merge.choices[id] = "use"
 		show()
 		updateFooter()
 	end)
@@ -734,7 +756,7 @@ local function reviewRow(order: number, row: any)
 	end
 	if row.conflict then
 		local detail = detailLine(order + 99, indent + 36, {
-			name = "Choose", old = "", new = if row.status == "removed" then "Remove it from main?" else "Bring it back from the branch?",
+			name = "Choose", old = "", new = if row.status == "removed" then WORDS[state.merge.kind].remove else WORDS[state.merge.kind].restore,
 			conflict = row.conflict,
 		})
 		table.insert(details, detail)
@@ -787,13 +809,15 @@ updateFooter = function()
 			open += 1
 		end
 	end
+	local words = WORDS[merge.kind]
 	merge.ready = open == 0 and #merge.plan.operations > 0
+	mergeButton.Text = words.apply
 	mergeButton.BackgroundTransparency = if merge.ready then 0 else 0.6
 	mergeButton.AutoButtonColor = merge.ready
 	footerHint.Text = if #merge.plan.operations == 0
-		then "Nothing to merge: main already has everything from this branch."
+		then words.nothing
 		elseif open > 0 then string.format("Choose a side for %d conflict%s first.", open, if open == 1 then "" else "s")
-		else "Applies as one step. Ctrl+Z undoes the whole merge."
+		else words.undo
 end
 
 local shownReview: any = nil
@@ -817,14 +841,21 @@ local function renderReview()
 	local s = data.summary
 	if state.merge then
 		local merge = state.merge
-		reviewWidget.Title = "RoGit · Merge"
-		reviewTitle.Text = "Merge " .. escape(merge.branch) .. " into main"
-		reviewSubtitle.Text = string.format("%s · branch as %s %s · main as it is now",
-			if merge.since == "merge" then "Since the last merge" else "Since the branch started", merge.source, formatTime(merge.sourceTime))
+		reviewWidget.Title = WORDS[merge.kind].window
+		local since = (SINCE[merge.since] or SINCE.start) .. (if merge.since == "start" then "" else " " .. formatTime(merge.sinceTime))
+		if merge.kind == "update" then
+			reviewTitle.Text = "Update " .. escape(merge.branch) .. " from main"
+			reviewSubtitle.Text = since .. " · main and the branch as they are now"
+		else
+			reviewTitle.Text = "Merge " .. escape(merge.branch) .. " into main"
+			reviewSubtitle.Text = string.format("%s · branch as %s %s · main as it is now", since, merge.source, formatTime(merge.sourceTime))
+		end
 	else
 		reviewWidget.Title = "RoGit · Review"
 		reviewTitle.Text = "Changes in " .. escape(if state.branch then (state.branch :: Branch).name else "branch")
-		reviewSubtitle.Text = "Compared with how the branch started · " .. DateTime.now():FormatLocalTime("LT", "en-us")
+		reviewSubtitle.Text = (if data.since == "update"
+			then "Compared with main at the last update, " .. formatTime(data.sinceTime)
+			else "Compared with how the branch started") .. " · " .. DateTime.now():FormatLocalTime("LT", "en-us")
 	end
 	addedChip.Text, removedChip.Text, changedChip.Text = "+ " .. s.added .. " added", "− " .. s.removed .. " removed", "● " .. s.changed .. " changed"
 	addedChip.Visible, removedChip.Visible, changedChip.Visible = s.added > 0, s.removed > 0, s.changed > 0
@@ -835,9 +866,7 @@ local function renderReview()
 		local empty = text(reviewList, 1, 14, REGULAR, Color.SubText)
 		new("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingTop = UDim.new(0, 10), Parent = empty })
 		empty.Text = if state.merge
-			then (if state.merge.since == "merge"
-				then "Nothing new to merge: main has everything from this branch's last merge."
-				else "Nothing to merge: main already has everything from this branch.")
+			then (if state.merge.since == "start" then WORDS[state.merge.kind].nothing else WORDS[state.merge.kind].nothingSince)
 			else "No changes yet. Build something in this branch, then click Refresh."
 	end
 	for index, row in data.rows do
@@ -873,9 +902,10 @@ local function render()
 		local branch = state.branch :: Branch
 		mode = if branch.has_starting_point then "branch" else "other"
 		placeKind.Text, placeTitle.Text = "BRANCH", escape(branch.name)
-		placeDetail.Text = if branch.has_starting_point
-			then "Started from main " .. formatTime(branch.created) .. ". Save with Ctrl+S as you work."
-			else "Recording the starting point…"
+		placeDetail.Text = if not branch.has_starting_point
+			then "Recording the starting point…"
+			elseif branch.updated then "Updated from main " .. formatTime(branch.updated) .. ". Save with Ctrl+S as you work."
+			else "Started from main " .. formatTime(branch.created) .. ". Save with Ctrl+S as you work."
 	elseif g and isMain then
 		mode = "main"
 		placeKind.Text, placeTitle.Text = "MAIN", escape(g.name)
@@ -910,9 +940,11 @@ local function render()
 	newCard.Visible = mode == "main" and idle
 	branchesCard.Visible = mode == "main" and #state.branches > 0
 	reviewButton.Visible = mode == "branch" and idle
-	openReviewButton.Visible = idle and not reviewWidget.Enabled
-		and ((mode == "branch" and state.review ~= nil) or (mode == "main" and state.merge ~= nil))
-	openReviewButton.Text = if state.merge then "Open merge of " .. state.merge.branch else "Open last review"
+	updateButton.Visible = mode == "branch" and idle
+	openReviewButton.Visible = idle and not reviewWidget.Enabled and (state.review ~= nil or state.merge ~= nil) and (mode == "branch" or mode == "main")
+	openReviewButton.Text = if state.merge and state.merge.kind == "update" then "Open update from main"
+		elseif state.merge then "Open merge of " .. state.merge.branch
+		else "Open last review"
 	renderBranches()
 	renderReview()
 end
@@ -992,6 +1024,22 @@ local function refresh()
 		end)
 		recordingStart = false
 	end
+	-- A branch is waiting to be updated from main: send it a copy of main.
+	local copy = ok and reply.copy
+	if copy and not state.busy then
+		run("Sending a copy of main to " .. copy.branch .. "…", function()
+			local sent, failure = pcall(function()
+				tagObjects(state.rojo)
+				local manifest = copyPlace(copy.capture)
+				call("POST", "/api/main/copy", { capture = copy.capture, manifest = manifest })
+			end)
+			if not sent then
+				request("POST", "/api/main/copy", { capture = copy.capture, failed = tostring(failure) })
+				error(failure, 0)
+			end
+			state.notice = "Sent a copy of main to " .. copy.branch .. " so it can update."
+		end)
+	end
 end
 
 initButton.Activated:Connect(function()
@@ -1039,15 +1087,20 @@ local function runReview()
 	if not branch then
 		return
 	end
+	if state.merge then
+		request("POST", "/api/branches/cancel", { name = state.merge.branch, kind = state.merge.kind })
+		state.merge = nil
+	end
 	run("Giving new objects an ID…", function()
 		tagObjects(state.rojo)
 		step("Copying the branch…")
 		local started = os.clock()
 		local capture = newId(16)
 		local manifest = copyPlace(capture)
-		step("Comparing with the starting point…")
+		step("Comparing…")
 		local reply = call("POST", "/api/branches/review", { name = branch.name, capture = capture, manifest = manifest })
 		state.review = reply.review
+		state.review.since, state.review.sinceTime = reply.since, reply.sinceTime
 		state.notice = string.format("Reviewed in %.1f s.", os.clock() - started)
 	end)
 	reviewWidget.Enabled = state.review ~= nil
@@ -1070,6 +1123,8 @@ local function recordMerge(branch: string, id: string)
 	record[branch] = id
 	workspace:SetAttribute(MERGES_TAG, HttpService:JSONEncode(record))
 end
+-- Workspace attribute in a branch: the last update from main, so the next one only brings what changed after it.
+local UPDATE_TAG = "RoGitUpdate"
 -- Properties a plugin can't set directly. They change through the mesh or union APIs instead.
 local MESH_DATA = {
 	MeshId = true, MeshContent = true, MeshData = true, InitialSize = true, PhysicalConfigData = true, PhysicsData = true,
@@ -1122,7 +1177,7 @@ local function copyTags(from: Instance, to: Instance)
 	end
 end
 
--- Every tagged object in main, by RoGit ID.
+-- Every tagged object in this place, by RoGit ID.
 local function idMap(): { [string]: Instance }
 	local ids = {}
 	for _, name in SERVICES do
@@ -1141,7 +1196,7 @@ end
 
 local function applyOperation(op: any, templates: { [number]: Instance }, ids: { [string]: Instance }, problems: { string })
 	local function find(key: string): Instance
-		return findObject(key, ids) or error("Couldn't find " .. key .. " in main.", 0)
+		return findObject(key, ids) or error("Couldn't find " .. key .. " in this place.", 0)
 	end
 	if op.kind == "set" then
 		local target, template = find(op.target), templates[op.template]
@@ -1220,13 +1275,15 @@ local function applyOperation(op: any, templates: { [number]: Instance }, ids: {
 	end
 end
 
+-- Applies the open merge (in main) or update (in a branch) as one undo step.
 local function applyMerge()
 	local merge = state.merge
 	if not merge or not merge.ready then
 		return
 	end
+	local isUpdate = merge.kind == "update"
 	reviewWidget.Enabled = false
-	run("Merging " .. merge.branch .. " into main…", function()
+	run(if isUpdate then "Updating " .. merge.branch .. " from main…" else "Merging " .. merge.branch .. " into main…", function()
 		local plan = merge.plan
 		local templates: { [number]: Instance } = {}
 		if plan.bundle ~= "" then
@@ -1254,9 +1311,11 @@ local function applyMerge()
 				table.insert(ordered, op)
 			end
 		end
-		local recording = ChangeHistoryService:TryBeginRecording("RoGitMerge", "RoGit merge " .. merge.branch)
+		local recording = if isUpdate
+			then ChangeHistoryService:TryBeginRecording("RoGitUpdate", "RoGit update from main")
+			else ChangeHistoryService:TryBeginRecording("RoGitMerge", "RoGit merge " .. merge.branch)
 		for _, op in ordered do
-			if op.conflict and merge.choices[op.conflict] ~= "branch" then
+			if op.conflict and merge.choices[op.conflict] ~= "use" then
 				skipped += 1
 				continue
 			end
@@ -1267,22 +1326,32 @@ local function applyMerge()
 				table.insert(problems, tostring(err))
 			end
 		end
-		-- Recorded in the same undo step, so undoing the merge (or not saving main) forgets it too. If something
-		-- couldn't be applied, the next merge starts from earlier and offers it again.
+		-- Recorded in the same undo step, so undoing it (or not saving) forgets it too. If something couldn't be
+		-- applied, the next merge or update starts from earlier and offers it again.
 		local recorded = #problems == 0 and merge.id ~= nil
-		if recorded then
+		if recorded and isUpdate then
+			workspace:SetAttribute(UPDATE_TAG, merge.id)
+		elseif recorded then
 			recordMerge(merge.branch, merge.id)
 		end
 		if recording then
 			ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
 		end
-		request("POST", "/api/branches/merged", {
-			name = merge.branch, applied = applied, skipped = skipped, failed = problems, merge = if recorded then merge.id else nil,
-		})
+		local report = { name = merge.branch, applied = applied, skipped = skipped, failed = problems }
+		if isUpdate then
+			report.update = if recorded then merge.id else nil
+			request("POST", "/api/branches/updated", report)
+		else
+			report.merge = if recorded then merge.id else nil
+			request("POST", "/api/branches/merged", report)
+		end
 		state.merge = nil
-		state.notice = string.format("Merged %s into main: %d change%s applied%s. Save main to keep it; Ctrl+Z undoes the merge.",
-			merge.branch, applied, if applied == 1 then "" else "s",
-			if #problems > 0 then string.format(", %d couldn't be applied (see the rogit serve terminal)", #problems) else "")
+		local problemText = if #problems > 0 then string.format(", %d couldn't be applied (see the rogit serve terminal)", #problems) else ""
+		state.notice = if isUpdate
+			then string.format("Updated from main: %d change%s applied%s. Save the branch (Ctrl+S) to keep it; Ctrl+Z undoes the update.",
+				applied, if applied == 1 then "" else "s", problemText)
+			else string.format("Merged %s into main: %d change%s applied%s. Save main to keep it; Ctrl+Z undoes the merge.",
+				merge.branch, applied, if applied == 1 then "" else "s", problemText)
 	end)
 	refresh()
 end
@@ -1300,9 +1369,42 @@ startMerge = function(name: string)
 		step("Comparing " .. name .. " with main…")
 		local reply = call("POST", "/api/branches/merge", { name = name, capture = capture, manifest = manifest })
 		state.merge = {
-			branch = name, plan = reply.plan, source = reply.source, sourceTime = reply.sourceTime, since = reply.since, id = reply.merge,
-			choices = {},
+			kind = "merge", branch = name, plan = reply.plan, source = reply.source, sourceTime = reply.sourceTime,
+			since = reply.since, sinceTime = reply.sinceTime, id = reply.merge, choices = {},
 		}
+	end)
+	reviewWidget.Enabled = state.merge ~= nil
+	render()
+end
+
+-- In a branch: copy it, then wait for main (open in Studio) to send its copy, and show what the update brings.
+local function startUpdate()
+	local branch = state.branch
+	if not branch or state.busy then
+		return
+	end
+	state.review = nil
+	run("Giving new objects an ID…", function()
+		tagObjects(state.rojo)
+		step("Copying the branch…")
+		local capture = newId(16)
+		local manifest = copyPlace(capture)
+		call("POST", "/api/branches/update", { name = branch.name, capture = capture, manifest = manifest })
+		step("Waiting for main… Keep " .. (if state.game then (state.game :: Game).name else "main") .. " open in Studio.")
+		local path = "/api/branches/update?name=" .. HttpService:UrlEncode(branch.name)
+		while true do
+			task.wait(0.5)
+			local reply = call("GET", path)
+			if not reply.waiting then
+				state.merge = {
+					kind = "update", branch = branch.name, plan = reply.plan, since = reply.since, sinceTime = reply.sinceTime,
+					id = reply.update, choices = {},
+				}
+				break
+			elseif reply.offered and state.busy ~= "Main is sending a copy…" then
+				step("Main is sending a copy…")
+			end
+		end
 	end)
 	reviewWidget.Enabled = state.merge ~= nil
 	render()
@@ -1310,11 +1412,15 @@ end
 
 mergeButton.Activated:Connect(applyMerge)
 cancelButton.Activated:Connect(function()
+	if state.merge then
+		request("POST", "/api/branches/cancel", { name = state.merge.branch, kind = state.merge.kind })
+	end
 	state.merge = nil
 	reviewWidget.Enabled = false
 	render()
 end)
 reviewButton.Activated:Connect(runReview)
+updateButton.Activated:Connect(startUpdate)
 refreshButton.Activated:Connect(runReview)
 openReviewButton.Activated:Connect(function()
 	reviewWidget.Enabled = true

@@ -1,6 +1,7 @@
-//! Merge: what a branch changed since its starting point, applied to main as it is now (a three-way merge).
-//! The result is a list of operations for the plugin plus a bundle (an rbxm) holding the branch's versions of
-//! changed and new objects.
+//! Merge and update: what one side changed since the base (where the branch and main last met), applied to the
+//! other side as it is now (a three-way merge). A merge takes the branch into main; an update takes main into the
+//! branch. The result is a list of operations for the plugin plus a bundle (an rbxm) holding the source's versions
+//! of changed and new objects.
 
 use crate::diff::{self, Change, IGNORED, Index, Row, Status, Tree};
 use crate::project::RojoPaths;
@@ -13,13 +14,13 @@ use std::collections::{HashMap, HashSet};
 
 /// Attribute that links a bundle object to its operation.
 pub const OP_TAG: &str = "RoGitOp";
-/// Attribute that marks a bundle object whose reference must be pointed at an existing object in main.
+/// Attribute that marks a bundle object whose reference must be pointed at an existing object in the target.
 pub const REF_TAG: &str = "RoGitRef";
 
 #[derive(Serialize, Debug)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Op {
-    /// Copy these properties from the bundle template onto the object. `refs` point properties at objects in main
+    /// Copy these properties from the bundle template onto the object. `refs` point properties at objects in the target
     /// ("" means none).
     Set { target: String, properties: Vec<String>, template: usize, refs: Map<String, Value>, conflict: Option<usize> },
     /// Services can't travel in the bundle, so their settings come as plain values.
@@ -29,6 +30,31 @@ pub enum Op {
     /// Put the bundle template (a whole new object with everything inside) under `parent`.
     Add { parent: String, template: usize, fixups: Vec<Fixup>, conflict: Option<usize> },
     Remove { target: String, conflict: Option<usize> },
+}
+
+/// Which way the changes go.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Direction {
+    /// The branch into main.
+    Merge,
+    /// Main into the branch.
+    Update,
+}
+
+impl Direction {
+    fn source(self) -> &'static str {
+        if self == Direction::Merge { "the branch" } else { "main" }
+    }
+
+    fn target(self) -> &'static str {
+        if self == Direction::Merge { "main" } else { "the branch" }
+    }
+}
+
+/// "the branch" -> "The branch".
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 #[derive(Serialize, Debug)]
@@ -162,8 +188,9 @@ fn with_attribute(dom: &mut WeakDom, referent: Ref, key: &str, value: &str) {
 
 struct Builder<'a> {
     base: Place<'a>,
-    branch: Place<'a>,
-    main: Place<'a>,
+    source: Place<'a>,
+    target: Place<'a>,
+    direction: Direction,
     bundle: WeakDom,
     templates: usize,
     markers: usize,
@@ -176,26 +203,26 @@ struct Builder<'a> {
 impl Builder<'_> {
     fn conflict(&mut self, key: &str, what: String) -> usize {
         let id = self.conflicts.len() + 1;
-        self.conflicts.push(Conflict { id, path: self.main.path(key), what });
+        self.conflicts.push(Conflict { id, path: self.target.path(key), what });
         id
     }
 
-    /// Main's key for an object (what Studio finds it by), from the shared key.
-    fn main_key(&self, key: &str) -> Option<String> {
-        self.main.index.get(key).map(|e| e.own_key.clone())
+    /// The target's key for an object (what Studio finds it by), from the shared key.
+    fn target_key(&self, key: &str) -> Option<String> {
+        self.target.index.get(key).map(|e| e.own_key.clone())
     }
 
-    /// A reference property's target, as main's key ("" for none or for something main doesn't have).
+    /// A reference property's target, as the target's key ("" for none or for something it doesn't have).
     fn ref_target(&self, value: &Variant) -> Value {
         let Variant::Ref(r) = value else { return json!("") };
-        let target = self.branch.index.by_ref.get(r).and_then(|k| self.main_key(k));
+        let target = self.source.index.by_ref.get(r).and_then(|k| self.target_key(k));
         json!(target.unwrap_or_default())
     }
 
-    /// The branch's version of one object, without its children or references.
+    /// The source's version of one object, without its children or references.
     fn template(&mut self, key: &str) -> usize {
-        let entry = self.branch.index.get(key).unwrap();
-        let inst = self.branch.dom.get_by_ref(entry.referent).unwrap();
+        let entry = self.source.index.get(key).unwrap();
+        let inst = self.source.dom.get_by_ref(entry.referent).unwrap();
         let mut builder = InstanceBuilder::new(inst.class).with_name(inst.name.clone());
         for (name, value) in &inst.properties {
             if !matches!(value, Variant::Ref(_)) {
@@ -208,19 +235,19 @@ impl Builder<'_> {
         self.templates
     }
 
-    /// The branch's whole new object, with references to objects outside it recorded as fixups. Scripts are left
+    /// The source's whole new object, with references to objects outside it recorded as fixups. Scripts are left
     /// out (Rojo keeps scripts).
     fn subtree(&mut self, key: &str) -> (usize, Vec<Fixup>) {
-        let original = self.branch.index.get(key).unwrap().referent;
-        let copy = self.branch.dom.clone_into_external(original, &mut self.bundle);
+        let original = self.source.index.get(key).unwrap().referent;
+        let copy = self.source.dom.clone_into_external(original, &mut self.bundle);
         self.bundle.transfer_within(copy, self.bundle.root_ref());
         // Walk the original and the copy together (same shape) to find references that point outside.
-        let inside: HashSet<Ref> = self.branch.dom.descendants_of(original).map(|i| i.referent()).collect();
+        let inside: HashSet<Ref> = self.source.dom.descendants_of(original).map(|i| i.referent()).collect();
         let mut fixups = Vec::new();
         let mut scripts = Vec::new();
         let mut pairs = vec![(original, copy)];
         while let Some((from, to)) = pairs.pop() {
-            let source = self.branch.dom.get_by_ref(from).unwrap();
+            let source = self.source.dom.get_by_ref(from).unwrap();
             if diff::is_script(source) {
                 scripts.push(to);
                 continue;
@@ -253,55 +280,56 @@ impl Builder<'_> {
         (self.templates, fixups)
     }
 
-    /// Whether the branch changed this object at all (properties, name or parent) since it started.
-    fn branch_changed(&self, key: &str) -> bool {
+    /// Whether the source changed this object at all (properties, name or parent) since the base.
+    fn source_changed(&self, key: &str) -> bool {
         let parent = |place: &Place| place.index.get(key).and_then(|e| e.parent.clone());
-        if self.base.name(key) != self.branch.name(key) || parent(&self.base) != parent(&self.branch) {
+        if self.base.name(key) != self.source.name(key) || parent(&self.base) != parent(&self.source) {
             return true;
         }
-        property_names([&self.base, &self.branch, &self.branch], key).iter().any(|n| match (self.base.property(key, n), self.branch.property(key, n)) {
-            (Some(a), Some(b)) => !diff::same(a, b, (&self.base.index, &self.branch.index)),
+        property_names([&self.base, &self.source, &self.source], key).iter().any(|n| match (self.base.property(key, n), self.source.property(key, n)) {
+            (Some(a), Some(b)) => !diff::same(a, b, (&self.base.index, &self.source.index)),
             _ => false,
         })
     }
 
-    /// An object that exists in the starting point and in the branch.
+    /// An object that exists in the base and in the source.
     fn changed(&mut self, key: &str) {
-        let Some(target) = self.main_key(key) else {
-            if !self.branch_changed(key) {
-                return; // Main removed it and the branch didn't touch it: it stays removed.
+        let Some(target) = self.target_key(key) else {
+            if !self.source_changed(key) {
+                return; // The target removed it and the source didn't touch it: it stays removed.
             }
-            // Main removed what the branch changed: put the branch's version back only if asked.
-            let Some(parent) = self.branch.index.get(key).and_then(|e| e.parent.clone()).and_then(|p| self.main_key(&p)) else {
+            // The target removed what the source changed: put the source's version back only if asked.
+            let Some(parent) = self.source.index.get(key).and_then(|e| e.parent.clone()).and_then(|p| self.target_key(&p)) else {
                 return;
             };
-            let id = self.conflict(key, format!("{} was changed in the branch but removed in main.", self.branch.name(key)));
+            let (from, into) = (self.direction.source(), self.direction.target());
+            let id = self.conflict(key, format!("{} was changed in {from} but removed in {into}.", self.source.name(key)));
             let (template, fixups) = self.subtree(key);
             self.operations.push(Op::Add { parent, template, fixups, conflict: Some(id) });
             self.summary.changed += 1;
-            self.tree.add(self.branch.dom, &self.branch.index, key, Status::Changed, vec![]);
+            self.tree.add(self.source.dom, &self.source.index, key, Status::Changed, vec![]);
             self.tree.mark_conflict(key, id);
             return;
         };
         let is_service = key.starts_with("service:");
-        let class = self.main.class(key);
+        let class = self.target.class(key);
         let mut rows = Vec::new();
         let mut clean = Vec::new();
         let mut refs = Map::new();
         let mut settings = Map::new();
-        for name in property_names([&self.base, &self.branch, &self.main], key) {
+        for name in property_names([&self.base, &self.source, &self.target], key) {
             // Work out the change with borrowed values; only owned results leave this block.
-            let (label, mut change, main_changed, encoded, ref_target) = {
+            let (label, mut change, target_changed, encoded, ref_target) = {
                 let (Some(base), Some(theirs), Some(ours)) =
-                    (self.base.property(key, &name), self.branch.property(key, &name), self.main.property(key, &name))
+                    (self.base.property(key, &name), self.source.property(key, &name), self.target.property(key, &name))
                 else {
                     continue;
                 };
-                if diff::same(base, theirs, (&self.base.index, &self.branch.index)) {
+                if diff::same(base, theirs, (&self.base.index, &self.source.index)) {
                     continue;
                 }
-                let main_changed = !diff::same(base, ours, (&self.base.index, &self.main.index));
-                if main_changed && diff::same(ours, theirs, (&self.main.index, &self.branch.index)) {
+                let target_changed = !diff::same(base, ours, (&self.base.index, &self.target.index));
+                if target_changed && diff::same(ours, theirs, (&self.target.index, &self.source.index)) {
                     continue;
                 }
                 let encoded = if is_service { encode(theirs) } else { None };
@@ -312,18 +340,18 @@ impl Builder<'_> {
                 let label = diff::label(&name, rotated);
                 let change = Change::new(
                     label.clone(),
-                    diff::show(ours, &class, &name, &self.main.index, rotated),
-                    diff::show(theirs, &class, &name, &self.branch.index, rotated),
+                    diff::show(ours, &class, &name, &self.target.index, rotated),
+                    diff::show(theirs, &class, &name, &self.source.index, rotated),
                 );
                 let ref_target = matches!(theirs, Variant::Ref(_)).then(|| self.ref_target(theirs));
-                (label, change, main_changed, encoded, ref_target)
+                (label, change, target_changed, encoded, ref_target)
             };
-            if main_changed {
-                let id = self.conflict(key, format!("{label} was changed in both main and the branch."));
+            if target_changed {
+                let id = self.conflict(key, format!("{label} was changed on both sides."));
                 change.conflict = Some(id);
                 if let Some(value) = encoded {
                     let values = Map::from_iter([(name.clone(), value)]);
-                    self.operations.push(Op::Settings { service: self.main.name(key), values, conflict: Some(id) });
+                    self.operations.push(Op::Settings { service: self.target.name(key), values, conflict: Some(id) });
                 } else {
                     let template = self.template(key);
                     let (properties, refs) = match ref_target {
@@ -342,28 +370,28 @@ impl Builder<'_> {
             rows.push(change);
         }
         if !settings.is_empty() {
-            self.operations.push(Op::Settings { service: self.main.name(key), values: settings, conflict: None });
+            self.operations.push(Op::Settings { service: self.target.name(key), values: settings, conflict: None });
         }
         if !clean.is_empty() || !refs.is_empty() {
             let template = self.template(key);
             self.operations.push(Op::Set { target: target.clone(), properties: clean, template, refs, conflict: None });
         }
         // Name and parent, three-way like properties.
-        let (base_name, their_name, our_name) = (self.base.name(key), self.branch.name(key), self.main.name(key));
+        let (base_name, their_name, our_name) = (self.base.name(key), self.source.name(key), self.target.name(key));
         if base_name != their_name && our_name != their_name {
             let mut change = Change::new("Name", our_name.clone(), their_name.clone());
-            let conflict = (our_name != base_name).then(|| self.conflict(key, "Its name was changed in both main and the branch.".into()));
+            let conflict = (our_name != base_name).then(|| self.conflict(key, "Its name was changed on both sides.".into()));
             change.conflict = conflict;
             self.operations.push(Op::Rename { target: target.clone(), name: their_name, conflict });
             rows.insert(0, change);
         }
         let parent = |place: &Place| place.index.get(key).and_then(|e| e.parent.clone());
-        let (base_parent, their_parent, our_parent) = (parent(&self.base), parent(&self.branch), parent(&self.main));
+        let (base_parent, their_parent, our_parent) = (parent(&self.base), parent(&self.source), parent(&self.target));
         if base_parent != their_parent && our_parent != their_parent {
-            if let Some(new_parent) = their_parent.as_deref().and_then(|p| self.main_key(p)) {
+            if let Some(new_parent) = their_parent.as_deref().and_then(|p| self.target_key(p)) {
                 let mut change =
-                    Change::new("Parent", our_parent.as_deref().map(|p| self.main.path(p)).unwrap_or_default(), self.branch.path(their_parent.as_deref().unwrap()));
-                let conflict = (our_parent != base_parent).then(|| self.conflict(key, "It was moved in both main and the branch.".into()));
+                    Change::new("Parent", our_parent.as_deref().map(|p| self.target.path(p)).unwrap_or_default(), self.source.path(their_parent.as_deref().unwrap()));
+                let conflict = (our_parent != base_parent).then(|| self.conflict(key, "It was moved on both sides.".into()));
                 change.conflict = conflict;
                 self.operations.push(Op::Move { target: target.clone(), parent: new_parent, conflict });
                 rows.insert(0, change);
@@ -371,46 +399,47 @@ impl Builder<'_> {
         }
         if !rows.is_empty() {
             self.summary.changed += 1;
-            self.tree.add(self.main.dom, &self.main.index, key, Status::Changed, rows);
+            self.tree.add(self.target.dom, &self.target.index, key, Status::Changed, rows);
         }
     }
 
     fn added(&mut self, key: &str) {
-        if self.main_key(key).is_some() {
-            return; // Main has it already, from an earlier merge of this branch.
+        if self.target_key(key).is_some() {
+            return; // The target has it already, for example from an earlier merge of this branch.
         }
-        let entry = self.branch.index.get(key).unwrap();
-        let Some(parent) = entry.parent.clone().and_then(|p| self.main_key(&p)) else {
-            return; // Its parent is gone from main; nothing to add it to.
+        let entry = self.source.index.get(key).unwrap();
+        let Some(parent) = entry.parent.clone().and_then(|p| self.target_key(&p)) else {
+            return; // Its parent is gone from the target; nothing to add it to.
         };
-        let inside = self.branch.inside(key).len();
+        let inside = self.source.inside(key).len();
         let (template, fixups) = self.subtree(key);
         self.operations.push(Op::Add { parent, template, fixups, conflict: None });
         self.summary.added += 1;
         let contents = if inside > 0 { vec![Change::new("Contains", "", format!("{inside} objects"))] } else { vec![] };
-        self.tree.add(self.branch.dom, &self.branch.index, key, Status::Added, contents);
+        self.tree.add(self.source.dom, &self.source.index, key, Status::Added, contents);
     }
 
     fn removed(&mut self, key: &str) {
-        let Some(target) = self.main_key(key) else { return };
-        // If main changed the object (or anything in it) since the branch started, removing it needs a choice.
+        let Some(target) = self.target_key(key) else { return };
+        // If the target changed the object (or anything in it) since the base, removing it needs a choice.
         let mut keys = vec![key.to_owned()];
-        keys.extend(self.main.inside(key));
-        let main_changed = keys.iter().any(|k| match self.base.index.get(k) {
+        keys.extend(self.target.inside(key));
+        let target_changed = keys.iter().any(|k| match self.base.index.get(k) {
             None => true,
             Some(_) => {
-                let names = property_names([&self.base, &self.main, &self.main], k);
-                names.iter().any(|n| match (self.base.property(k, n), self.main.property(k, n)) {
-                    (Some(a), Some(b)) => !diff::same(a, b, (&self.base.index, &self.main.index)),
+                let names = property_names([&self.base, &self.target, &self.target], k);
+                names.iter().any(|n| match (self.base.property(k, n), self.target.property(k, n)) {
+                    (Some(a), Some(b)) => !diff::same(a, b, (&self.base.index, &self.target.index)),
                     _ => false,
                 })
             }
         });
-        let conflict = main_changed.then(|| self.conflict(key, format!("The branch removed {}, but main changed it.", self.main.name(key))));
+        let (from, into) = (capitalized(self.direction.source()), self.direction.target());
+        let conflict = target_changed.then(|| self.conflict(key, format!("{from} removed {}, but {into} changed it.", self.target.name(key))));
         self.operations.push(Op::Remove { target, conflict });
         self.summary.removed += 1;
         let inside = keys.len() - 1;
-        let scripts = self.main.scripts_inside(key);
+        let scripts = self.target.scripts_inside(key);
         let mut contents = Vec::new();
         if inside > 0 {
             contents.push(Change::new("Contains", "", format!("{inside} objects")));
@@ -418,7 +447,7 @@ impl Builder<'_> {
         if scripts > 0 {
             contents.push(Change::new("Scripts", "", format!("{scripts} inside will be removed with it")));
         }
-        self.tree.add(self.main.dom, &self.main.index, key, Status::Removed, contents);
+        self.tree.add(self.target.dom, &self.target.index, key, Status::Removed, contents);
         if let Some(id) = conflict {
             self.tree.mark_conflict(key, id);
         }
@@ -428,28 +457,38 @@ impl Builder<'_> {
 /// The last merge of `branch` that main still has, from main's merge record. The plugin writes the record in the
 /// same undo step as the merge, so it's gone if the merge was undone or main wasn't saved.
 pub fn last_merge(main: &WeakDom, branch: &str) -> Option<String> {
-    let workspace = main.root().children().iter().filter_map(|r| main.get_by_ref(*r)).find(|i| i.class == "Workspace")?;
-    let Some(Variant::Attributes(attributes)) = workspace.properties.get(&"Attributes".into()) else { return None };
-    let record = match attributes.get(diff::MERGES)? {
-        Variant::String(s) => s.clone(),
-        Variant::BinaryString(b) => String::from_utf8_lossy(b.as_ref()).into_owned(),
-        _ => return None,
-    };
-    let record: Value = serde_json::from_str(&record).ok()?;
+    let record: Value = serde_json::from_str(&workspace_attribute(main, diff::MERGES)?).ok()?;
     record.get(branch)?.as_str().map(str::to_owned)
 }
 
-/// Plans merging `branch` (compared with `start`, its starting point or what was merged last time) into `main`.
-pub fn plan(start: &WeakDom, branch: &WeakDom, main: &WeakDom, rojo: &RojoPaths) -> Result<Plan, String> {
-    let base_index = diff::index(start, rojo);
-    let mut branch_index = diff::index(branch, rojo);
-    diff::adopt_new_ids(start, &base_index, branch, &mut branch_index);
-    let mut main_index = diff::index(main, rojo);
-    diff::adopt_new_ids(start, &base_index, main, &mut main_index);
+/// The last update from main that the branch still has, from the branch's update record (written the same way).
+pub fn last_update(branch: &WeakDom) -> Option<String> {
+    workspace_attribute(branch, diff::UPDATE)
+}
+
+fn workspace_attribute(dom: &WeakDom, name: &str) -> Option<String> {
+    let workspace = dom.root().children().iter().filter_map(|r| dom.get_by_ref(*r)).find(|i| i.class == "Workspace")?;
+    let Some(Variant::Attributes(attributes)) = workspace.properties.get(&"Attributes".into()) else { return None };
+    match attributes.get(name)? {
+        Variant::String(s) => Some(s.clone()),
+        Variant::BinaryString(b) => Some(String::from_utf8_lossy(b.as_ref()).into_owned()),
+        _ => None,
+    }
+}
+
+/// Plans bringing what `source` changed since `base` into `target`: the branch into main for a merge, main into the
+/// branch for an update.
+pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, rojo: &RojoPaths, direction: Direction) -> Result<Plan, String> {
+    let base_index = diff::index(base, rojo);
+    let mut source_index = diff::index(source, rojo);
+    diff::adopt_new_ids(base, &base_index, source, &mut source_index);
+    let mut target_index = diff::index(target, rojo);
+    diff::adopt_new_ids(base, &base_index, target, &mut target_index);
     let mut b = Builder {
-        base: Place { dom: start, index: base_index },
-        branch: Place { dom: branch, index: branch_index },
-        main: Place { dom: main, index: main_index },
+        base: Place { dom: base, index: base_index },
+        source: Place { dom: source, index: source_index },
+        target: Place { dom: target, index: target_index },
+        direction,
         bundle: WeakDom::new(InstanceBuilder::new("Folder")),
         templates: 0,
         markers: 0,
@@ -469,15 +508,15 @@ pub fn plan(start: &WeakDom, branch: &WeakDom, main: &WeakDom, rojo: &RojoPaths)
         true
     };
     let added: HashSet<String> =
-        b.branch.index.entries.iter().filter(|e| b.base.index.get(&e.key).is_none()).map(|e| e.key.clone()).collect();
+        b.source.index.entries.iter().filter(|e| b.base.index.get(&e.key).is_none()).map(|e| e.key.clone()).collect();
     let removed: HashSet<String> =
-        b.base.index.entries.iter().filter(|e| b.branch.index.get(&e.key).is_none()).map(|e| e.key.clone()).collect();
-    let changed: Vec<String> = b.branch.index.entries.iter().filter(|e| !added.contains(&e.key)).map(|e| e.key.clone()).collect();
+        b.base.index.entries.iter().filter(|e| b.source.index.get(&e.key).is_none()).map(|e| e.key.clone()).collect();
+    let changed: Vec<String> = b.source.index.entries.iter().filter(|e| !added.contains(&e.key)).map(|e| e.key.clone()).collect();
     for key in changed {
         b.changed(&key);
     }
     let added_top: Vec<String> =
-        b.branch.index.entries.iter().filter(|e| added.contains(&e.key) && top(&b.branch.index, &added, &e.key)).map(|e| e.key.clone()).collect();
+        b.source.index.entries.iter().filter(|e| added.contains(&e.key) && top(&b.source.index, &added, &e.key)).map(|e| e.key.clone()).collect();
     for key in added_top {
         b.added(&key);
     }
@@ -486,13 +525,28 @@ pub fn plan(start: &WeakDom, branch: &WeakDom, main: &WeakDom, rojo: &RojoPaths)
     for key in removed_top {
         b.removed(&key);
     }
-    b.summary.conflicts = b.conflicts.len();
     let tops = b.bundle.root().children().to_vec();
     let mut bytes = Vec::new();
     if !tops.is_empty() {
         rbx_binary::to_writer(&mut bytes, &b.bundle, &tops).map_err(|e| format!("Couldn't pack the merge: {e}"))?;
     }
-    let (rows, truncated) = b.tree.rows();
+    let (rows, truncated, joined) = b.tree.rows();
+    // Conflicts folded into a moved model's row are decided with the model's move.
+    for op in &mut b.operations {
+        let conflict = match op {
+            Op::Set { conflict, .. }
+            | Op::Settings { conflict, .. }
+            | Op::Rename { conflict, .. }
+            | Op::Move { conflict, .. }
+            | Op::Add { conflict, .. }
+            | Op::Remove { conflict, .. } => conflict,
+        };
+        if let Some(model) = conflict.and_then(|id| joined.get(&id)) {
+            *conflict = Some(*model);
+        }
+    }
+    b.conflicts.retain(|c| !joined.contains_key(&c.id));
+    b.summary.conflicts = b.conflicts.len();
     // A moved model counts once, like in a review.
     b.summary.changed = rows.iter().filter(|r| r.status == Status::Changed).count();
     Ok(Plan {
@@ -551,7 +605,7 @@ mod tests {
         let mut main = place();
         set(&mut main, "Tower", "Size", Variant::Vector3(Vector3::new(9.0, 9.0, 9.0)));
 
-        let plan = plan(&start, &branch, &main, &RojoPaths::default()).unwrap();
+        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
         assert_eq!(plan.summary, Summary { added: 1, removed: 1, changed: 1, conflicts: 0, scripts_left_out: 1 });
         assert!(plan.operations.iter().any(|op| matches!(op, Op::Set { target, properties, .. } if target == "gate" && properties == &["Color"])));
         assert!(plan.operations.iter().any(|op| matches!(op, Op::Remove { target, conflict: None } if target == "shed")));
@@ -575,7 +629,7 @@ mod tests {
         set(&mut main, "Roof", "Size", Variant::Vector3(Vector3::new(8.0, 1.0, 8.0)));
         remove(&mut branch, "Shed");
 
-        let plan = plan(&start, &branch, &main, &RojoPaths::default()).unwrap();
+        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
         assert_eq!(plan.summary.conflicts, 2);
         let gate = plan.rows.iter().find(|r| r.name == "Gate").unwrap();
         assert_eq!(gate.changes[0].old, "0, 0, 255");
@@ -593,7 +647,7 @@ mod tests {
         for dom in [&mut branch, &mut main] {
             set(dom, "Gate", "Color", Variant::Color3(Color3::new(1.0, 0.0, 0.0)));
         }
-        let plan = plan(&start, &branch, &main, &RojoPaths::default()).unwrap();
+        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
         assert_eq!(plan.summary, Summary::default());
         assert!(plan.operations.is_empty());
     }
@@ -621,17 +675,64 @@ mod tests {
 
         assert_eq!(last_merge(&main, "test-1").as_deref(), Some("m1"));
         assert_eq!(last_merge(&main, "other"), None);
-        let again = plan(&merged, &branch, &main, &RojoPaths::default()).unwrap();
+        let again = plan(&merged, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
         assert_eq!(again.summary, Summary { changed: 1, ..Summary::default() });
         assert!(matches!(&again.operations[..], [Op::Set { target, conflict: None, .. }] if target == "gate"));
         // Measured from the starting point instead, the gate would look changed on both sides.
-        let from_start = plan(&place(), &branch, &main, &RojoPaths::default()).unwrap();
+        let from_start = plan(&place(), &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
         assert_eq!(from_start.summary.conflicts, 1);
     }
 
     #[test]
+    fn an_update_brings_main_changes_into_the_branch() {
+        let start = place();
+        let mut main = place();
+        set(&mut main, "Gate", "Color", Variant::Color3(Color3::new(0.0, 0.0, 1.0)));
+        set(&mut main, "Roof", "Size", Variant::Vector3(Vector3::new(8.0, 1.0, 8.0)));
+        remove(&mut main, "Shed");
+        let mut branch = place();
+        set(&mut branch, "Tower", "Size", Variant::Vector3(Vector3::new(9.0, 9.0, 9.0)));
+        set(&mut branch, "Roof", "Size", Variant::Vector3(Vector3::new(6.0, 1.0, 6.0)));
+
+        let plan = plan(&start, &main, &branch, &RojoPaths::default(), Direction::Update).unwrap();
+        assert!(plan.operations.iter().any(|op| matches!(op, Op::Set { target, conflict: None, .. } if target == "gate")));
+        // The branch's own work stays.
+        assert!(!plan.operations.iter().any(|op| matches!(op, Op::Set { target, .. } if target == "tower")));
+        // Main removed the shed the branch worked on: that's the branch's call.
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].what, "Main removed Shed, but the branch changed it.");
+    }
+
+    #[test]
+    fn a_model_moved_on_both_sides_is_one_conflict() {
+        use rbx_dom_weak::types::{CFrame, Matrix3};
+        let at = |x: f32, z: f32| CFrame::new(Vector3::new(x, 0.0, z), Matrix3::identity());
+        let placed = |shed: CFrame, roof: CFrame| {
+            let mut dom = place();
+            set(&mut dom, "Shed", "WorldPivotData", Variant::OptionalCFrame(Some(shed)));
+            set(&mut dom, "Roof", "CFrame", Variant::CFrame(roof));
+            dom
+        };
+        let start = placed(at(0.0, 0.0), at(0.0, 0.0));
+        let branch = placed(at(10.0, 0.0), at(10.0, 0.0));
+        let main = placed(at(0.0, 5.0), at(0.0, 5.0));
+
+        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
+        assert_eq!(plan.conflicts.len(), 1, "one choice for the whole move");
+        let id = plan.conflicts[0].id;
+        let conflicts: Vec<Option<usize>> = plan.operations.iter().map(|op| match op {
+            Op::Set { conflict, .. } => *conflict,
+            _ => None,
+        }).collect();
+        assert_eq!(conflicts, vec![Some(id), Some(id)], "the roof follows the shed's choice");
+        let shed = plan.rows.iter().find(|r| r.name == "Shed").unwrap();
+        assert!(shed.changes.iter().any(|c| c.name == "Moved with it"));
+        assert!(!plan.rows.iter().any(|r| r.name == "Roof"));
+    }
+
+    #[test]
     fn an_object_main_already_has_is_not_added_twice() {
-        let plan = plan(&place(), &first_round(), &first_round(), &RojoPaths::default()).unwrap();
+        let plan = plan(&place(), &first_round(), &first_round(), &RojoPaths::default(), Direction::Merge).unwrap();
         assert!(!plan.operations.iter().any(|op| matches!(op, Op::Add { .. })));
     }
 }

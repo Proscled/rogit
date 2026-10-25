@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 pub const TAG: &str = "RoGitId";
 /// Workspace attribute in main that records the last merge of each branch.
 pub const MERGES: &str = "RoGitMerges";
+/// Workspace attribute in a branch that records the last update from main.
+pub const UPDATE: &str = "RoGitUpdate";
 const MAX_ROWS: usize = 2000;
 /// Services whose contents are saved in place files. Matches the plugin's list.
 pub(crate) const SERVICES: [&str; 18] = [
@@ -226,7 +228,7 @@ fn close_cframe(a: &CFrame, b: &CFrame) -> bool {
 
 /// RoGit's own attributes, which never count as changes.
 fn own_attribute(name: &str) -> bool {
-    name == TAG || name == MERGES
+    name == TAG || name == MERGES || name == UPDATE
 }
 
 /// Equal, allowing for rounding in saved numbers. References compare by what they point at.
@@ -409,12 +411,16 @@ impl Tree {
     }
 
     /// Rows in Explorer order. An object that only moved because its model moved is folded into the model's row
-    /// ("Moved with it: N objects") instead of getting a row of its own.
-    pub fn rows(mut self) -> (Vec<Row>, usize) {
+    /// ("Moved with it: N objects") instead of getting a row of its own. If the model's move is a conflict, the folded
+    /// objects' conflicts become part of it (one choice for the whole move); the result maps each folded conflict to
+    /// the model's. A folded object's conflict with nothing to join keeps its own row.
+    pub fn rows(mut self) -> (Vec<Row>, usize, HashMap<usize, usize>) {
         let spatial = |changes: &[Change]| !changes.is_empty() && changes.iter().all(|c| SPATIAL.contains(&c.name.as_str()));
+        let move_conflict = |changes: &[Change]| changes.iter().find(|c| SPATIAL.contains(&c.name.as_str())).and_then(|c| c.conflict);
         let mut rows: Vec<Row> = Vec::new();
         let mut truncated = 0;
         let mut moved_with: HashMap<usize, usize> = HashMap::new();
+        let mut joined: HashMap<usize, usize> = HashMap::new();
         let mut roots = std::mem::take(&mut self.roots);
         self.sort(&mut roots);
         // Each entry: key, depth, and the row of the nearest shown ancestor that moved.
@@ -424,7 +430,13 @@ impl Tree {
             let mut children = std::mem::take(&mut node.children);
             self.sort(&mut children);
             if let Some(owner) = mover {
-                if node.status == Status::Changed && node.conflict.is_none() && spatial(&node.changes) {
+                let owner_conflict = move_conflict(&rows[owner].changes);
+                let conflicts: Vec<usize> = node.changes.iter().filter_map(|c| c.conflict).collect();
+                let can_join = conflicts.is_empty() || owner_conflict.is_some();
+                if node.status == Status::Changed && node.conflict.is_none() && spatial(&node.changes) && can_join {
+                    for conflict in conflicts {
+                        joined.insert(conflict, owner_conflict.unwrap());
+                    }
                     *moved_with.entry(owner).or_default() += 1;
                     stack.extend(children.into_iter().rev().map(|k| (k, depth, Some(owner))));
                     continue;
@@ -447,7 +459,7 @@ impl Tree {
         for (row, count) in moved_with {
             rows[row].changes.push(Change::new("Moved with it", "", format!("{count} objects")));
         }
-        (rows, truncated)
+        (rows, truncated, joined)
     }
 
     fn sort(&self, keys: &mut [String]) {
@@ -550,7 +562,7 @@ pub fn compare(start: &WeakDom, current: &WeakDom, rojo: &RojoPaths) -> Review {
         summary.removed += 1;
         tree.add(start, &old, &entry.key, Status::Removed, contents(&entry.key));
     }
-    let (rows, truncated) = tree.rows();
+    let (rows, truncated, _) = tree.rows();
     summary.changed = rows.iter().filter(|r| r.status == Status::Changed).count();
     Review { summary, rows, truncated }
 }
