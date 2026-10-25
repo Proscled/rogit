@@ -121,12 +121,15 @@ impl Index {
     }
 }
 
+/// The Attributes property's name, made once: making a property name takes a global lock.
+static ATTRIBUTES: std::sync::LazyLock<rbx_dom_weak::Ustr> = std::sync::LazyLock::new(|| rbx_dom_weak::ustr("Attributes"));
+
 pub(crate) fn is_script(inst: &Instance) -> bool {
     matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript")
 }
 
 fn tag(inst: &Instance) -> Option<String> {
-    inst.properties.iter().find(|(k, _)| k.as_str() == "Attributes").and_then(|(_, v)| match v {
+    inst.properties.get(&*ATTRIBUTES).and_then(|v| match v {
         // Place files store attribute text as raw bytes, so the ID usually arrives as a BinaryString.
         Variant::Attributes(attributes) => match attributes.get(TAG) {
             Some(Variant::String(id)) if !id.is_empty() => Some(id.clone()),
@@ -348,15 +351,23 @@ fn changes(start: (&WeakDom, &Index, Ref), current: (&WeakDom, &Index, Ref)) -> 
         out.push(Change::new("Name", old.name.clone(), new.name.clone()));
     }
     let class = new.class.as_str();
-    let mut names: Vec<&str> = new.properties.keys().map(|k| k.as_str()).filter(|k| !IGNORED.contains(k)).collect();
-    names.sort_unstable();
-    for name in names {
-        let Some((_, before)) = old.properties.iter().find(|(k, _)| k.as_str() == name) else { continue };
-        let (_, after) = new.properties.iter().find(|(k, _)| k.as_str() == name).unwrap();
-        if !same(before, after, (start.1, current.1)) {
-            let rotated = rotation_differs(before, after);
-            out.push(Change::new(label(name, rotated), show(before, class, name, start.1, rotated), show(after, class, name, current.1, rotated)));
+    // Looked up by name (not searched), since big places have millions of properties.
+    let mut changed: Vec<(&str, &Variant, &Variant)> = Vec::new();
+    for (key, after) in &new.properties {
+        let name = key.as_str();
+        if IGNORED.contains(&name) {
+            continue;
         }
+        if let Some(before) = old.properties.get(key) {
+            if !same(before, after, (start.1, current.1)) {
+                changed.push((name, before, after));
+            }
+        }
+    }
+    changed.sort_unstable_by_key(|(name, _, _)| *name);
+    for (name, before, after) in changed {
+        let rotated = rotation_differs(before, after);
+        out.push(Change::new(label(name, rotated), show(before, class, name, start.1, rotated), show(after, class, name, current.1, rotated)));
     }
     out
 }
@@ -589,7 +600,11 @@ pub(crate) fn adopt_new_ids(start: &WeakDom, old: &Index, current: &WeakDom, new
 
 /// Everything that changed between the starting point and the branch now.
 pub fn compare(start: &WeakDom, current: &WeakDom, rojo: &RojoPaths) -> Review {
-    let old = index(start, rojo);
+    compare_with(start, &index(start, rojo), current, rojo)
+}
+
+/// Like `compare`, with the starting point's index made once and kept (a big place takes a while to index).
+pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom, rojo: &RojoPaths) -> Review {
     let mut new = index(current, rojo);
     adopt_new_ids(start, &old, current, &mut new);
     let mut tree = Tree::default();
@@ -821,5 +836,30 @@ mod tests {
         let review = compare(&place(0.5, "Tower", true, false), &place(0.5, "Tower", true, false), &RojoPaths::default());
         assert_eq!(review.summary, Summary::default());
         assert!(review.rows.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// Times a review of a big place against itself: `ROGIT_BENCH_PLACE=<file.rbxl> cargo test --release -- --ignored`.
+    #[test]
+    #[ignore]
+    fn compare_a_big_place() {
+        let Ok(path) = std::env::var("ROGIT_BENCH_PLACE") else { return };
+        let started = std::time::Instant::now();
+        let start = crate::place::read(std::path::Path::new(&path)).unwrap();
+        let current = crate::place::read(std::path::Path::new(&path)).unwrap();
+        let read = started.elapsed();
+        let started = std::time::Instant::now();
+        let index_only = index(&start, &RojoPaths::default()).entries.len();
+        let indexed = started.elapsed();
+        let started = std::time::Instant::now();
+        let review = compare(&start, &current, &RojoPaths::default());
+        println!(
+            "{} objects tracked: read both {:?}, index one {:?}, compare {:?} ({} rows)",
+            index_only, read, indexed, started.elapsed(), review.rows.len()
+        );
     }
 }

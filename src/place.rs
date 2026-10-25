@@ -75,7 +75,7 @@ fn to_variant(kind: VariantType, encoded: &Value) -> Option<Variant> {
     })
 }
 
-fn setting(class: &str, name: &str, encoded: &Value) -> Option<Variant> {
+pub(crate) fn setting(class: &str, name: &str, encoded: &Value) -> Option<Variant> {
     match property_type(class, name)? {
         DataType::Enum(_) => Some(Variant::Enum(Enum::from_u32(encoded["v"].as_u64()? as u32))),
         DataType::Value(kind) => to_variant(kind, encoded),
@@ -83,7 +83,7 @@ fn setting(class: &str, name: &str, encoded: &Value) -> Option<Variant> {
     }
 }
 
-fn attribute(encoded: &Value) -> Option<Variant> {
+pub(crate) fn attribute(encoded: &Value) -> Option<Variant> {
     let kind = match encoded["t"].as_str()? {
         "boolean" => VariantType::Bool,
         "number" => VariantType::Float64,

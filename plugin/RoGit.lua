@@ -244,8 +244,20 @@ local function sendParts(capture: string, service: string, text: string, uploads
 	end
 end
 
--- Copies every saved service (its children in Roblox's binary format, plus its settings) to rogit serve.
-local function copyPlace(capture: string): any
+-- Lists an object and everything inside it as "id|Class", in the order copies keep them (depth first), using
+-- Studio's session ID for each object. rogit serve uses these to tell later changes apart.
+local function walkIds(object: Instance, out: { string })
+	table.insert(out, object:GetDebugId(0) .. "|" .. object.ClassName)
+	for _, child in object:GetChildren() do
+		if child.Archivable then
+			walkIds(child, out)
+		end
+	end
+end
+
+-- Copies every saved service (its children in Roblox's binary format, plus its settings) to rogit serve, with every
+-- object's ID when `withIds` is set.
+local function copyPlace(capture: string, withIds: boolean?): any
 	local services = {}
 	local uploads: { pending: number, failure: string? } = { pending = 0, failure = nil }
 	for _, name in SERVICES do
@@ -270,7 +282,14 @@ local function copyPlace(capture: string): any
 		for key, value in service:GetAttributes() do
 			attributes[key] = encode(value)
 		end
-		table.insert(services, { name = service.Name, className = service.ClassName, settings = serviceSettings(service), attributes = attributes })
+		local entry: any = { name = service.Name, className = service.ClassName, settings = serviceSettings(service), attributes = attributes }
+		if withIds then
+			entry.ids = {}
+			for _, child in children do
+				walkIds(child, entry.ids)
+			end
+		end
+		table.insert(services, entry)
 	end
 	while uploads.pending > 0 do
 		task.wait()
@@ -648,6 +667,7 @@ local viewCommit: (any, string) -> ()
 local startRevert: (any) -> ()
 local selectObject: (string) -> ()
 local discard: ({ string }) -> ()
+local flushChanges: () -> boolean
 local setStaged: ({ string }) -> ()
 
 local shownBranches = ""
@@ -1733,10 +1753,24 @@ local function uncommitted(): number
 end
 
 -- Commits everything in the branch as it is now, for a pull or a revert (like git's own commits for those).
+-- Sends a request about the branch as it is in Studio: from rogit serve's copy (kept current, so this is quick), or
+-- with a full copy when it has none.
+local function callWithBranch(path: string, body: any): any
+	if flushChanges() then
+		body.live = true
+		local reply = call("POST", path, body)
+		if not reply.full then
+			return reply
+		end
+		body.live = nil
+	end
+	body.capture, body.manifest = copy()
+	return call("POST", path, body)
+end
+
 local function autoCommit(message: string)
 	local branch = state.branch :: Branch
-	local capture, manifest = copy()
-	local ok, reply = request("POST", "/api/branches/commit", { name = branch.name, capture = capture, manifest = manifest, message = message, auto = true })
+	local ok, reply = pcall(callWithBranch, "/api/branches/commit", { name = branch.name, message = message, auto = true })
 	if ok then
 		state.commits = reply.commits
 		applyChanges(reply)
@@ -1752,8 +1786,7 @@ local function commitBranch(): boolean
 	local messageText = string.gsub(commitBox.Text, "^%s*(.-)%s*$", "%1")
 	local done = false
 	run("Committing…", function()
-		local capture, manifest = copy()
-		local reply = call("POST", "/api/branches/commit", { name = branch.name, capture = capture, manifest = manifest, message = messageText })
+		local reply = callWithBranch("/api/branches/commit", { name = branch.name, message = messageText })
 		state.commits = reply.commits
 		applyChanges(reply)
 		commitBox.Text = ""
@@ -2280,8 +2313,7 @@ discard = function(keys: { string })
 		return
 	end
 	run("Discarding…", function()
-		local capture, manifest = copy()
-		local reply = call("POST", "/api/branches/discard", { name = branch.name, capture = capture, manifest = manifest, keys = keys })
+		local reply = callWithBranch("/api/branches/discard", { name = branch.name, keys = keys })
 		local recording = ChangeHistoryService:TryBeginRecording("RoGitDiscard", "RoGit discard changes")
 		local _, _, problems = runPlan(reply.plan, {})
 		if recording then
@@ -2313,24 +2345,38 @@ closeButton.Activated:Connect(function()
 	render()
 end)
 
--- A branch's changes stay current: after edits settle, RoGit copies the branch, which also autosaves it.
-local watch = { dirty = true, first = 0, last = 0, seconds = 0.5, copying = false }
+-- A branch's changes stay current. RoGit copies the whole branch once, then sends only the objects that change
+-- (Studio's session IDs say which is which), so this stays quick in big places. rogit serve's copy is also the
+-- autosave.
+local watch = { dirty = true, first = 0, last = 0, seconds = 0.5, sending = false, lastFull = 0 }
+local pending = {
+	-- rogit serve has no copy yet (or lost track): send a full one.
+	full = true,
+	-- Changed or added objects.
+	objects = {} :: { [Instance]: boolean },
+	-- Removed objects, with their IDs.
+	removed = {} :: { [Instance]: string },
+	-- Services whose own settings changed.
+	services = {} :: { [Instance]: boolean },
+}
 local tracked: { Instance } = {}
+local trackedSet: { [Instance]: boolean } = {}
 for _, name in SERVICES do
 	local ok, service = pcall(game.GetService, game, name)
 	if ok and service then
 		table.insert(tracked, service)
+		trackedSet[service] = true
 	end
 end
 
--- Whether an object is in one of the saved services, remembered per object (dragging a model fires a lot).
+-- Whether an object is a saved service or in one, remembered per object (dragging a model fires a lot).
 local relevance: { [Instance]: boolean } = setmetatable({}, { __mode = "k" }) :: any
 local function relevant(object: Instance): boolean
 	local known = relevance[object]
 	if known == nil then
-		known = false
+		known = trackedSet[object] == true
 		for _, service in tracked do
-			if object:IsDescendantOf(service) then
+			if known or object:IsDescendantOf(service) then
 				known = true
 				break
 			end
@@ -2340,20 +2386,55 @@ local function relevant(object: Instance): boolean
 	return known
 end
 
--- Only edits to the place count: Studio changes plenty of its own things (outlines, panels) all the time.
-local function touched(object: Instance)
-	if object.ClassName == "Camera" or not relevant(object) then
-		return
-	end
+local function noteEdit()
 	if not watch.dirty then
 		watch.dirty, watch.first = true, os.clock()
 	end
 	watch.last = os.clock()
 end
-game.DescendantAdded:Connect(touched)
-game.DescendantRemoving:Connect(touched)
+
+-- Only edits to the place count: Studio changes plenty of its own things (outlines, panels) all the time. Script
+-- sources are Rojo's, so their edits don't count, but adding or removing a script changes its parent (a Folder with a
+-- script inside isn't tracked).
+local function touched(object: Instance)
+	if object.ClassName == "Camera" or object:IsA("LuaSourceContainer") or not relevant(object) then
+		return
+	end
+	if trackedSet[object] then
+		pending.services[object] = true
+	else
+		pending.objects[object] = true
+	end
+	noteEdit()
+end
+local function added(object: Instance)
+	if object:IsA("LuaSourceContainer") then
+		if object.Parent then
+			touched(object.Parent)
+		end
+		return
+	end
+	touched(object)
+end
+local function removing(object: Instance)
+	if object:IsA("LuaSourceContainer") then
+		if object.Parent then
+			touched(object.Parent)
+		end
+		return
+	end
+	if object.ClassName == "Camera" or trackedSet[object] or not relevant(object) then
+		return
+	end
+	pending.removed[object] = object:GetDebugId(0)
+	pending.objects[object] = nil
+	relevance[object] = nil
+	noteEdit()
+end
+game.DescendantAdded:Connect(added)
+game.DescendantRemoving:Connect(removing)
 -- Studio may not let plugins hear every property change. Then RoGit listens to what's selected, which is where
--- nearly every edit happens (moving, scaling, the Properties panel), and checks the whole place now and then.
+-- nearly every edit happens (moving, scaling, the Properties panel), and copies the whole place now and then.
 local hearsEverything = pcall(function()
 	game.ItemChanged:Connect(touched)
 end)
@@ -2381,27 +2462,211 @@ if not hearsEverything then
 	watchSelection()
 end
 local function changedByUndo()
-	watch.dirty, watch.last = true, os.clock()
+	if not hearsEverything then
+		pending.full = true
+	end
+	noteEdit()
 end
 ChangeHistoryService.OnUndo:Connect(changedByUndo)
 ChangeHistoryService.OnRedo:Connect(changedByUndo)
 
-local function refreshChanges()
-	local branch = state.branch :: Branch
-	watch.dirty, watch.copying = false, true
-	local started = os.clock()
-	local ok, reply = pcall(function()
-		local capture, manifest = copy()
-		return call("POST", "/api/branches/changes", { name = branch.name, capture = capture, manifest = manifest })
-	end)
-	watch.copying = false
-	watch.seconds = os.clock() - started
-	if ok then
-		applyChanges(reply)
-		render()
-	else
-		watch.dirty = true
+-- Attributes and tags don't fire change events. They're edited on the selection (Properties, Tag Editor), so RoGit
+-- looks at the selected objects a few times a second.
+local marks: { [Instance]: string } = {}
+local function markOf(object: Instance): string
+	local parts = {}
+	for key, value in object:GetAttributes() do
+		table.insert(parts, key .. "=" .. tostring(value))
 	end
+	table.sort(parts)
+	local tags = object:GetTags()
+	table.sort(tags)
+	return table.concat(parts, ";") .. "|" .. table.concat(tags, ",")
+end
+local function checkSelection()
+	local seen = {}
+	for i, object in Selection:Get() do
+		if i > 200 then
+			break
+		end
+		local mark = markOf(object)
+		if marks[object] and marks[object] ~= mark then
+			touched(object)
+		end
+		seen[object] = mark
+	end
+	marks = seen
+end
+
+-- Terrain voxels don't fire change events either; the number of filled cells is cheap to check.
+local terrainCells = workspace.Terrain:CountCells()
+local function checkTerrain()
+	local cells = workspace.Terrain:CountCells()
+	if cells ~= terrainCells then
+		terrainCells = cells
+		touched(workspace.Terrain)
+	end
+end
+
+-- Whether an object is in the copies: in a saved service, and saved itself (copies skip what isn't Archivable).
+local function inPlace(object: Instance): boolean
+	local current: Instance? = object
+	while current and not trackedSet[current] do
+		if not current.Archivable then
+			return false
+		end
+		current = current.Parent
+	end
+	return current ~= nil and current ~= object
+end
+
+-- Reference properties. A copy of just one object loses its references to others; RoGit sends them along.
+local REF_NAMES = {
+	PrimaryPart = true, Part0 = true, Part1 = true, Attachment0 = true, Attachment1 = true, Value = true, Adornee = true,
+	SoundGroup = true, CameraSubject = true,
+}
+local refNames: { [string]: { string } } = {}
+local function refsOf(class: string): { string }
+	local known = refNames[class]
+	if not known then
+		known = {}
+		local ok, infos = pcall(ReflectionService.GetPropertiesOfClass, ReflectionService, class)
+		if ok then
+			for _, info in infos do
+				if REF_NAMES[info.Name] then
+					table.insert(known, info.Name)
+				end
+			end
+		end
+		refNames[class] = known
+	end
+	return known
+end
+
+local function serviceOf(object: Instance): Instance
+	local current = object
+	while current.Parent and current.Parent ~= game do
+		current = current.Parent
+	end
+	return current
+end
+
+-- Sends what changed since last time: a full copy when rogit serve has none, otherwise just the changed objects.
+-- Returns whether rogit serve's copy is current afterwards.
+local function sendChanges(): boolean
+	local branch = state.branch :: Branch
+	if pending.full then
+		pending.full = false
+		table.clear(pending.objects)
+		table.clear(pending.removed)
+		table.clear(pending.services)
+		local capture = newId(16)
+		local manifest = copyPlace(capture, true)
+		local reply = call("POST", "/api/branches/changes", { name = branch.name, capture = capture, manifest = manifest })
+		watch.lastFull = os.clock()
+		-- If the IDs don't line up with the copy, every refresh stays a full copy.
+		pending.full = not reply.live
+		applyChanges(reply)
+		return not pending.full
+	end
+	local objects, removed, services = pending.objects, pending.removed, pending.services
+	pending.objects, pending.removed, pending.services = {}, {}, {}
+	-- The changed objects that aren't inside another changed one (that one brings them along).
+	local tops = {}
+	for object in objects do
+		if inPlace(object) then
+			local covered = false
+			local ancestor = object.Parent
+			while ancestor and not trackedSet[ancestor] do
+				if objects[ancestor] then
+					covered = true
+					break
+				end
+				ancestor = ancestor.Parent
+			end
+			if not covered then
+				table.insert(tops, object)
+			end
+		end
+	end
+	local upserts, refs = {}, {}
+	for _, top in tops do
+		local ids = {}
+		walkIds(top, ids)
+		local parent = top.Parent :: Instance
+		table.insert(upserts, {
+			id = top:GetDebugId(0), parent = if trackedSet[parent] then "service:" .. parent.Name else parent:GetDebugId(0), ids = ids,
+		})
+		local service = serviceOf(top)
+		local inside = top:GetDescendants()
+		table.insert(inside, top)
+		for _, object in inside do
+			for _, property in refsOf(object.ClassName) do
+				local ok, target = pcall(function()
+					return (object :: any)[property]
+				end)
+				if ok and typeof(target) == "Instance" and target ~= top and not target:IsDescendantOf(top) and target:IsDescendantOf(service) then
+					table.insert(refs, { id = object:GetDebugId(0), property = property, target = target:GetDebugId(0) })
+				end
+			end
+		end
+	end
+	local removes = {}
+	for object, id in removed do
+		if not object:IsDescendantOf(game) then
+			table.insert(removes, id)
+		end
+	end
+	local settings = {}
+	for service in services do
+		local attributes = {}
+		for key, value in service:GetAttributes() do
+			attributes[key] = encode(value)
+		end
+		table.insert(settings, { name = service.Name, className = service.ClassName, settings = serviceSettings(service), attributes = attributes })
+	end
+	if #upserts == 0 and #removes == 0 and #settings == 0 then
+		return true
+	end
+	local capture = nil
+	if #upserts > 0 then
+		capture = newId(16)
+		local data = SerializationService:SerializeInstancesAsync(tops)
+		local uploads: { pending: number, failure: string? } = { pending = 0, failure = nil }
+		sendParts(capture, "Patch", buffer.tostring(EncodingService:Base64Encode(data)), uploads)
+		while uploads.pending > 0 do
+			task.wait()
+		end
+		if uploads.failure then
+			error(uploads.failure, 0)
+		end
+	end
+	local reply = call("POST", "/api/branches/patch", {
+		name = branch.name, capture = capture, upserts = upserts, removes = removes, services = settings, refs = refs,
+	})
+	if reply.full then
+		pending.full = true
+		return false
+	end
+	applyChanges(reply)
+	return true
+end
+
+-- Sends anything not sent yet, and the terrain (which can change unseen), so rogit serve's copy is exact. Returns
+-- whether it is; if not, the caller sends a full copy.
+flushChanges = function(): boolean
+	while watch.sending do
+		task.wait()
+	end
+	if pending.full or state.branch == nil then
+		return false
+	end
+	pending.objects[workspace.Terrain] = true
+	watch.sending = true
+	local ok, current = pcall(sendChanges)
+	watch.sending = false
+	watch.dirty = false
+	return ok and current
 end
 
 render()
@@ -2414,25 +2679,44 @@ task.spawn(function()
 	end
 end)
 task.spawn(function()
+	local ticks = 0
 	while true do
-		task.wait(0.25)
+		task.wait(0.1)
+		ticks += 1
 		local branch = state.branch
 		local inBranch = branch ~= nil and branch.has_starting_point and not state.archived and state.connected
-		-- Bigger places take longer to copy, so wait a little longer for edits to settle.
-		local settle = math.clamp(watch.seconds / 2, 0.15, 3)
+		if not inBranch then
+			pending.full = true
+			continue
+		end
+		if ticks % 4 == 0 then
+			checkSelection()
+			checkTerrain()
+		end
+		-- Every 10 minutes, when nobody's editing, a full copy makes sure nothing was missed.
+		if os.clock() - watch.lastFull > 600 and os.clock() - watch.last > 30 then
+			pending.full = true
+			noteEdit()
+		end
+		-- Bigger places take longer to send, so wait a little longer for edits to settle.
+		local settle = math.clamp(watch.seconds / 2, 0.1, 3)
 		local due = watch.dirty and (os.clock() - watch.last >= settle or os.clock() - watch.first >= 30)
-		-- Without hearing every change, also check the whole place every so often (terrain, other plugins).
-		if not hearsEverything and os.clock() - watch.last >= math.max(15, watch.seconds * 20) then
+		-- Without hearing every change, copy the whole place every so often too.
+		if not hearsEverything and os.clock() - watch.lastFull >= math.max(15, watch.seconds * 20) then
+			pending.full = true
 			due = true
 		end
-		if inBranch and due and not state.busy and not watch.copying then
-			local ok, failure = pcall(refreshChanges)
-			if not ok then
-				watch.copying = false
+		if due and not state.busy and not watch.sending then
+			watch.dirty, watch.sending = false, true
+			local started = os.clock()
+			local ok, failure = pcall(sendChanges)
+			watch.sending = false
+			watch.seconds = os.clock() - started
+			if ok then
+				render()
+			else
+				watch.dirty = true
 				warn("RoGit couldn't refresh the changes: " .. tostring(failure))
-			end
-			if not hearsEverything then
-				watch.last = os.clock()
 			end
 		end
 	end

@@ -3,6 +3,7 @@
 use crate::branches::{self, Branches, Commit, Since};
 use crate::diff;
 use crate::history::{Event, History};
+use crate::live::Live;
 use crate::merge::{self, Direction};
 use crate::project::{DATA_DIR, Game, Project};
 use crate::roblox::Roblox;
@@ -35,8 +36,20 @@ struct State {
     /// Whether a branch's unsaved copy differs from its saved file, by (file time, copy time).
     unsaved: HashMap<String, ((u64, u64), bool)>,
     /// What each branch's changes are measured from (its last commit, or where it last met main), kept in memory
-    /// between refreshes: which one it is, the place, and its description.
-    committed: HashMap<String, (String, WeakDom, Value)>,
+    /// between refreshes.
+    committed: HashMap<String, Committed>,
+    /// Each open branch as it is in Studio, kept current by the plugin's patches.
+    live: HashMap<String, Live>,
+}
+
+/// A branch's last commit (or where it last met main), indexed once.
+struct Committed {
+    /// The commit's ID, or the base it stands for.
+    which: String,
+    dom: WeakDom,
+    index: diff::Index,
+    /// What it is, for the plugin: `{ kind, message?, time }`.
+    since: Value,
 }
 
 /// A branch's update from main. Main's plugin sees the request when it next checks in and sends a copy of main.
@@ -65,7 +78,7 @@ pub fn serve(project: Project, port: u16) -> Result<(), String> {
     let mut state = State {
         project, branches, history, roblox: Roblox::new(), seen_places: HashSet::new(), planned: HashMap::new(),
         updates: HashMap::new(), restores: HashMap::new(), sessions: HashMap::new(), unsaved: HashMap::new(),
-        committed: HashMap::new(),
+        committed: HashMap::new(), live: HashMap::new(),
     };
     println!("RoGit {} is serving {} on http://{address}", env!("CARGO_PKG_VERSION"), state.project.folder_name());
     match state.project.config() {
@@ -106,6 +119,7 @@ fn handle(state: &mut State, mut request: Request) {
         (Method::Get, "/api/history/rows") => history_rows(state, query),
         (Method::Post, "/api/branches/commit") => commit(state, &body),
         (Method::Post, "/api/branches/changes") => changes(state, &body),
+        (Method::Post, "/api/branches/patch") => patch(state, &body),
         (Method::Post, "/api/branches/stage") => stage(state, &body),
         (Method::Post, "/api/branches/commit/view") => view_commit(state, &body),
         (Method::Post, "/api/branches/revert") => plan_revert(state, &body),
@@ -586,6 +600,7 @@ fn archive(state: &mut State, body: &str) -> Reply {
     state.updates.remove(&name);
     state.restores.remove(&name);
     state.committed.remove(&name);
+    state.live.remove(&name);
     let closed = state.branches.archive(&name).map_err(|e| (500, e))?;
     println!("Archived {name}{}", if closed > 0 { " (closed it in Studio)" } else { "" });
     let event = Event { id: branches::new_id(Since::Merge), kind: "archive".into(), branch: name, time: unix_now(), summary: None, has_rows: false, message: None };
@@ -598,18 +613,39 @@ fn history_rows(state: &mut State, query: &str) -> Reply {
 }
 
 /// What the branch's uncommitted changes are measured from: its last commit, or (before the first commit) where it
-/// last met main. Returns the place and a description for the plugin.
-fn committed(state: &State, name: &str, live: &WeakDom) -> Result<(WeakDom, Value), (u16, String)> {
+/// last met main (`record` is the branch's update record). Returns the place and a description for the plugin.
+fn committed(state: &State, name: &str, record: Option<&str>) -> Result<(WeakDom, Value), (u16, String)> {
     match state.branches.commits(name).first() {
         Some(last) => {
             let dom = state.branches.commit_place(name, &last.id).map_err(|e| (500, e))?;
             Ok((dom, json!({ "kind": "commit", "message": last.message, "time": last.time })))
         }
         None => {
-            let (dom, since, time) = state.branches.base(name, None, merge::last_update(live).as_deref()).map_err(|e| (409, e))?;
+            let (dom, since, time) = state.branches.base(name, None, record).map_err(|e| (409, e))?;
             Ok((dom, json!({ "kind": since, "time": time })))
         }
     }
+}
+
+/// Makes sure what the branch's changes are measured from is in memory and indexed: refreshes come often, and a big
+/// place takes a while to read and index.
+fn load_committed(state: &mut State, name: &str, record: Option<String>) -> Result<(), (u16, String)> {
+    let which = match state.branches.commits(name).first() {
+        Some(last) => last.id.clone(),
+        None => format!("base:{}", record.clone().unwrap_or_default()),
+    };
+    if state.committed.get(name).is_none_or(|c| c.which != which) {
+        let (dom, since) = committed(state, name, record.as_deref())?;
+        let index = diff::index(&dom, &state.project.rojo_paths());
+        state.committed.insert(name.to_owned(), Committed { which, dom, index, since });
+    }
+    Ok(())
+}
+
+/// The changes in `current` since what `load_committed` loaded.
+fn uncommitted(state: &State, name: &str, current: &WeakDom) -> diff::Review {
+    let base = &state.committed[name];
+    diff::compare_with(&base.dom, &base.index, current, &state.project.rojo_paths())
 }
 
 /// The staged keys that are still among the changes.
@@ -618,25 +654,67 @@ fn staged_now(state: &State, name: &str, review: &diff::Review) -> Vec<String> {
     state.branches.staged(name).into_iter().filter(|k| keys.contains(k.as_str())).collect()
 }
 
-/// The branch as it is in Studio right now (`capture`): kept as its autosave copy, and compared with its last commit.
+/// The reply with a branch's changes; `saved` is when its autosave copy was written, if it just was.
+fn changes_reply(state: &State, name: &str, review: diff::Review, saved: Option<u64>) -> Value {
+    let staged = staged_now(state, name, &review);
+    json!({ "changes": review, "staged": staged, "since": state.committed[name].since, "time": saved })
+}
+
+/// A full copy of the branch as it is in Studio (`capture`): kept as its autosave copy and in memory, and compared
+/// with its last commit. After this, edits arrive as patches with just the objects that changed.
 fn changes(state: &mut State, body: &str) -> Reply {
     let (name, capture, manifest) = capture_request(body)?;
     existing(state, &name)?;
-    let live = state.branches.keep_latest(&name, &capture, &manifest).map_err(|e| (500, e))?;
-    // Refreshes come often, so the place they're measured from stays in memory until it changes.
-    let which = match state.branches.commits(&name).first() {
-        Some(last) => last.id.clone(),
-        None => format!("base:{}", merge::last_update(&live).unwrap_or_default()),
+    let dom = state.branches.keep_latest(&name, &capture, &manifest).map_err(|e| (500, e))?;
+    load_committed(state, &name, merge::last_update(&dom))?;
+    let live = Live::new(dom, &manifest);
+    let identified = live.identified;
+    let review = uncommitted(state, &name, &live.dom);
+    state.live.insert(name.clone(), live);
+    let mut reply = changes_reply(state, &name, review, Some(unix_now()));
+    reply["live"] = json!(identified);
+    Ok(reply)
+}
+
+/// Just what changed in Studio since the last copy (see `Live::patch`); the changed objects are uploaded under
+/// `capture` as `Patch`. Replies like `changes`, or with `full: true` when the plugin should send a full copy.
+fn patch(state: &mut State, body: &str) -> Reply {
+    let request = json_body(body)?;
+    let name = request["name"].as_str().unwrap_or_default().to_owned();
+    existing(state, &name)?;
+    let list = |key: &str| request[key].as_array().cloned().unwrap_or_default();
+    let data = match request["capture"].as_str().filter(|c| branches::valid_capture(c)) {
+        Some(capture) => {
+            let upload = state.branches.upload_dir(capture);
+            let dom = std::fs::read(upload.join("Patch.rbxm")).ok().and_then(|bytes| rbx_binary::from_reader(&bytes[..]).ok());
+            let _ = std::fs::remove_dir_all(&upload);
+            match dom {
+                Some(dom) => Some(dom),
+                None => return Ok(json!({ "full": true })),
+            }
+        }
+        None => None,
     };
-    if state.committed.get(&name).is_none_or(|(cached, _, _)| *cached != which) {
-        let (dom, since) = committed(state, &name, &live)?;
-        state.committed.insert(name.clone(), (which, dom, since));
+    let removes: Vec<String> = list("removes").iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
+    let Some(live) = state.live.get_mut(&name) else { return Ok(json!({ "full": true })) };
+    if !live.patch(&list("upserts"), data, &removes, &list("services"), &list("refs")) {
+        state.live.remove(&name);
+        return Ok(json!({ "full": true }));
     }
-    let (_, base, since) = &state.committed[&name];
-    let review = diff::compare(base, &live, &state.project.rojo_paths());
-    let since = since.clone();
-    let staged = staged_now(state, &name, &review);
-    Ok(json!({ "changes": review, "staged": staged, "since": since, "time": unix_now() }))
+    // The copy in memory is also the autosave; it's written out now and then.
+    let mut saved = None;
+    if live.changed && live.saved.elapsed() > Duration::from_secs(30) {
+        live.saved = Instant::now();
+        live.changed = false;
+        match state.branches.save_latest(&name, &live.dom) {
+            Ok(()) => saved = Some(unix_now()),
+            Err(e) => println!("Couldn't autosave {name}: {e}"),
+        }
+    }
+    let record = merge::last_update(&state.live[&name].dom);
+    load_committed(state, &name, record)?;
+    let review = uncommitted(state, &name, &state.live[&name].dom);
+    Ok(changes_reply(state, &name, review, saved))
 }
 
 fn stage(state: &mut State, body: &str) -> Reply {
@@ -648,52 +726,69 @@ fn stage(state: &mut State, body: &str) -> Reply {
     Ok(json!({ "staged": keys }))
 }
 
-/// Commits the branch as it is in Studio right now (`capture`), like `git commit`: only the staged changes when some
-/// are staged, otherwise all of them. `auto` commits everything (after a pull or a revert).
+/// The branch as it is in Studio, for a commit or a discard: the copy kept in memory (`live: true`), or a full copy
+/// uploaded under `capture`. Returns an owned copy, or None when there's no copy in memory (then the plugin sends one).
+fn current_copy(state: &State, body: &str, request: &Value, name: &str) -> Result<Option<WeakDom>, (u16, String)> {
+    if request["live"].as_bool().unwrap_or(false) {
+        return match state.live.get(name) {
+            Some(live) => live.copy().map(Some).map_err(|e| (500, e)),
+            None => Ok(None),
+        };
+    }
+    let (_, capture, manifest) = capture_request(body)?;
+    let upload = state.branches.upload_dir(&capture);
+    let dom = crate::place::assemble(&upload, &manifest);
+    let _ = std::fs::remove_dir_all(&upload);
+    dom.map(|(dom, _)| Some(dom)).map_err(|e| (500, e))
+}
+
+/// Commits the branch as it is in Studio, like `git commit`: only the staged changes when some are staged, otherwise
+/// all of them. `auto` commits everything (after a pull or a revert).
 fn commit(state: &mut State, body: &str) -> Reply {
     let started = Instant::now();
-    let (name, capture, manifest) = capture_request(body)?;
-    existing(state, &name)?;
     let request = json_body(body)?;
+    let name = request["name"].as_str().unwrap_or_default().to_owned();
+    existing(state, &name)?;
     let message = request["message"].as_str().unwrap_or("").trim().chars().take(100).collect::<String>();
     let auto = request["auto"].as_bool().unwrap_or(false);
-    let upload = state.branches.upload_dir(&capture);
-    let result = (|| {
-        let live = crate::place::assemble(&upload, &manifest).map_err(|e| (500, e))?.0;
-        let (previous, _) = committed(state, &name, &live)?;
-        let rojo = state.project.rojo_paths();
-        let all = diff::compare(&previous, &live, &rojo);
-        let staged: HashSet<String> = if auto { HashSet::new() } else { staged_now(state, &name, &all).into_iter().collect() };
-        let snapshot = if staged.is_empty() {
-            crate::place::assemble(&upload, &manifest).map_err(|e| (500, e))?.0
-        } else {
-            let copy = crate::place::assemble(&upload, &manifest).map_err(|e| (500, e))?.0;
-            crate::stage::partial(&previous, copy, &all.rows, &staged, &rojo)
+    let Some(current) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
+    load_committed(state, &name, merge::last_update(&current))?;
+    let rojo = state.project.rojo_paths();
+    let all = uncommitted(state, &name, &current);
+    let staged: HashSet<String> = if auto { HashSet::new() } else { staged_now(state, &name, &all).into_iter().collect() };
+    let (snapshot, summary, left) = if staged.is_empty() {
+        let summary = all.summary.clone();
+        let left = diff::Review { summary: diff::Summary::default(), rows: vec![], truncated: 0 };
+        (current, summary, left)
+    } else {
+        let previous = &state.committed[&name].dom;
+        let copy = crate::live::copy_of(&current).map_err(|e| (500, e))?;
+        let snapshot = crate::stage::partial(previous, copy, &all.rows, &staged, &rojo);
+        let summary = diff::compare_with(previous, &state.committed[&name].index, &snapshot, &rojo).summary;
+        let left = diff::compare(&snapshot, &current, &rojo);
+        (snapshot, summary, left)
+    };
+    if summary == diff::Summary::default() {
+        return Err((409, "Nothing to commit.".to_owned()));
+    }
+    let count = state.branches.commits(&name).len();
+    let message = if message.is_empty() { format!("Commit {}", count + 1) } else { message };
+    let id = format!("c{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let commit = Commit { id, message, time: unix_now(), summary, auto };
+    state.branches.add_commit(&name, &snapshot, &commit).map_err(|e| (500, e))?;
+    state.branches.set_staged(&name, &[]).map_err(|e| (500, e))?;
+    if !auto {
+        let event = Event {
+            id: commit.id.clone(), kind: "commit".into(), branch: name.clone(), time: commit.time,
+            summary: serde_json::to_value(&commit.summary).ok(), has_rows: false, message: Some(commit.message.clone()),
         };
-        let summary = diff::compare(&previous, &snapshot, &rojo).summary;
-        if summary == diff::Summary::default() {
-            return Err((409, "Nothing to commit.".to_owned()));
-        }
-        let count = state.branches.commits(&name).len();
-        let message = if message.is_empty() { format!("Commit {}", count + 1) } else { message };
-        let id = format!("c{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
-        let commit = Commit { id, message, time: unix_now(), summary, auto };
-        state.branches.add_commit(&name, &snapshot, &commit).map_err(|e| (500, e))?;
-        state.branches.set_staged(&name, &[]).map_err(|e| (500, e))?;
-        if !auto {
-            let event = Event {
-                id: commit.id.clone(), kind: "commit".into(), branch: name.clone(), time: commit.time,
-                summary: serde_json::to_value(&commit.summary).ok(), has_rows: false, message: Some(commit.message.clone()),
-            };
-            let _ = state.history.add(event, None);
-        }
-        let left = diff::compare(&snapshot, &live, &rojo);
-        Ok((commit, left))
-    })();
-    let _ = std::fs::remove_dir_all(&upload);
-    let (commit, left) = result?;
-    println!("Committed {name}: \"{}\" ({} ms)", commit.message, started.elapsed().as_millis());
+        let _ = state.history.add(event, None);
+    }
+    // The new commit is what changes are measured from now; keep it in memory instead of reading it back.
     let since = json!({ "kind": "commit", "message": commit.message, "time": commit.time });
+    let index = diff::index(&snapshot, &rojo);
+    state.committed.insert(name.clone(), Committed { which: commit.id.clone(), dom: snapshot, index, since: since.clone() });
+    println!("Committed {name}: \"{}\" ({} ms)", commit.message, started.elapsed().as_millis());
     Ok(json!({ "commit": commit, "commits": state.branches.commits(&name), "changes": left, "staged": [], "since": since }))
 }
 
@@ -762,25 +857,21 @@ fn plan_revert(state: &mut State, body: &str) -> Reply {
 /// Plans discarding some uncommitted changes (`keys`), like VS Code's Discard Changes: the branch as it is in Studio
 /// (`capture`), with those changes put back the way its last commit had them. Nothing goes in the history.
 fn plan_discard(state: &mut State, body: &str) -> Reply {
-    let (name, capture, manifest) = capture_request(body)?;
+    let request = json_body(body)?;
+    let name = request["name"].as_str().unwrap_or_default().to_owned();
     existing(state, &name)?;
     let discard: HashSet<String> =
-        json_body(body)?["keys"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(str::to_owned)).collect();
-    let upload = state.branches.upload_dir(&capture);
-    let result = (|| {
-        let current = crate::place::assemble(&upload, &manifest).map_err(|e| (500, e))?.0;
-        let (previous, _) = committed(state, &name, &current)?;
-        let rojo = state.project.rojo_paths();
-        let rows = diff::compare(&previous, &current, &rojo).rows;
-        let keep: HashSet<String> =
-            rows.iter().filter(|r| r.status != diff::Status::Context && !discard.contains(&r.key)).map(|r| r.key.clone()).collect();
-        let copy = crate::place::assemble(&upload, &manifest).map_err(|e| (500, e))?.0;
-        let wanted = crate::stage::partial(&previous, copy, &rows, &keep, &rojo);
-        let plan = merge::plan(&current, &wanted, &current, &rojo, Direction::Restore).map_err(|e| (500, e))?;
-        Ok(json!({ "plan": plan }))
-    })();
-    let _ = std::fs::remove_dir_all(&upload);
-    result
+        request["keys"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(str::to_owned)).collect();
+    let Some(current) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
+    load_committed(state, &name, merge::last_update(&current))?;
+    let rojo = state.project.rojo_paths();
+    let rows = uncommitted(state, &name, &current).rows;
+    let keep: HashSet<String> =
+        rows.iter().filter(|r| r.status != diff::Status::Context && !discard.contains(&r.key)).map(|r| r.key.clone()).collect();
+    let copy = crate::live::copy_of(&current).map_err(|e| (500, e))?;
+    let wanted = crate::stage::partial(&state.committed[&name].dom, copy, &rows, &keep, &rojo);
+    let plan = merge::plan(&current, &wanted, &current, &rojo, Direction::Restore).map_err(|e| (500, e))?;
+    Ok(json!({ "plan": plan }))
 }
 
 /// Plans bringing back unsaved work (the newest copy RoGit made) into the branch as it is in Studio (`capture`).

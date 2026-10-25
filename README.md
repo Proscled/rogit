@@ -37,8 +37,9 @@ Or from source: `cargo install --path .` in this folder.
 
 **In a branch**, the panel works like VS Code's Source Control:
 
-- **Changes** lists everything not committed yet, and updates within about half a second of an edit. Click one to
-  see what changed and select it in Studio.
+- **Changes** lists everything not committed yet, and updates within about a quarter of a second of an edit, even
+  in big places: after one full copy, RoGit only sends the objects that change. Click one to see what changed and
+  select it in Studio.
 - **+** stages a change and **−** unstages it. **Commit** commits the staged changes, or all of them when none are
   staged. Pulls and reverts end with a commit of their own.
 - **Discard** (on a change while the mouse is over it, or **Discard all**) puts changes back the way the last

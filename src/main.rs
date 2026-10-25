@@ -1,6 +1,7 @@
 mod branches;
 mod diff;
 mod history;
+mod live;
 mod merge;
 mod place;
 mod project;

@@ -107,7 +107,7 @@ impl Place<'_> {
     fn property(&self, key: &str, name: &str) -> Option<&Variant> {
         let entry = self.index.get(key)?;
         let inst = self.dom.get_by_ref(entry.referent)?;
-        inst.properties.iter().find(|(k, _)| k.as_str() == name).map(|(_, v)| v)
+        inst.properties.get(&name.into())
     }
 
     fn name(&self, key: &str) -> String {

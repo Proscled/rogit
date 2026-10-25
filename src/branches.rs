@@ -223,18 +223,31 @@ impl Branches {
         place::assemble(&target, manifest).map(|(dom, _)| dom)
     }
 
-    /// The branch's newest content: its saved file, or the copy RoGit made last (an autosave or review) if that's
-    /// newer (it includes edits made before saving). Returns the place, where it came from, and when.
+    /// Writes the copy `rogit serve` keeps in memory (kept current by the plugin) as the branch's autosave.
+    pub fn save_latest(&self, name: &str, dom: &rbx_dom_weak::WeakDom) -> Result<(), String> {
+        place::write(dom, &self.dir().join(name).join("latest.rbxl"))
+    }
+
+    /// When RoGit last kept a copy of the branch from Studio: a full copy (`latest/`) or its copy in memory written
+    /// out (`latest.rbxl`), whichever is newer. Returns the time and whether it's the written-out one.
+    fn latest_time(&self, name: &str) -> Option<(u64, bool)> {
+        let dir = modified(&self.dir().join(name).join("latest").join("manifest.json"));
+        let file = modified(&self.dir().join(name).join("latest.rbxl"));
+        match (dir, file) {
+            (Some(d), Some(f)) if f >= d => Some((f, true)),
+            (_, Some(f)) if dir.is_none() => Some((f, true)),
+            (Some(d), _) => Some((d, false)),
+            _ => None,
+        }
+    }
+
+    /// The branch's newest content: its saved file, or the copy RoGit kept last (it includes edits made before
+    /// saving) if that's newer. Returns the place, where it came from, and when.
     pub fn newest(&self, name: &str) -> Result<(rbx_dom_weak::WeakDom, &'static str, u64), String> {
         let file = self.file(name);
-        let latest = self.dir().join(name).join("latest");
         let file_time = modified(&file).unwrap_or_default();
-        match modified(&latest.join("manifest.json")) {
-            Some(review_time) if review_time > file_time => {
-                let manifest: Value = serde_json::from_slice(&fs::read(latest.join("manifest.json")).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-                Ok((place::assemble(&latest, &manifest)?.0, "autosaved", review_time))
-            }
+        match self.latest_time(name) {
+            Some((copy_time, _)) if copy_time > file_time => Ok((self.latest_place(name)?, "autosaved", copy_time)),
             _ => Ok((place::read(&file)?, "saved", file_time)),
         }
     }
@@ -333,13 +346,17 @@ impl Branches {
     /// When the newest copy RoGit has from Studio (an autosave or a review) was made, if it's newer than the saved
     /// branch file and hasn't been dismissed: unsaved work, for example after Studio closed unexpectedly.
     pub fn unsaved_copy(&self, name: &str) -> Option<u64> {
-        let latest = self.dir().join(name).join("latest");
-        let copy = modified(&latest.join("manifest.json"))?;
+        let (copy, _) = self.latest_time(name)?;
         let saved = modified(&self.file(name)).unwrap_or_default();
-        (copy > saved + 2 && !latest.join("dismissed").exists()).then_some(copy)
+        let dismissed = modified(&self.dir().join(name).join("dismissed")).unwrap_or_default();
+        (copy > saved + 2 && copy > dismissed).then_some(copy)
     }
 
     pub fn latest_place(&self, name: &str) -> Result<rbx_dom_weak::WeakDom, String> {
+        let (_, written_out) = self.latest_time(name).ok_or("RoGit has no copy of this branch yet.")?;
+        if written_out {
+            return place::read(&self.dir().join(name).join("latest.rbxl"));
+        }
         let latest = self.dir().join(name).join("latest");
         let manifest: Value = serde_json::from_slice(&fs::read(latest.join("manifest.json")).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -348,7 +365,7 @@ impl Branches {
 
     /// Stops offering the unsaved copy (until a newer one is made).
     pub fn dismiss_unsaved(&self, name: &str) -> Result<(), String> {
-        fs::write(self.dir().join(name).join("latest").join("dismissed"), b"").map_err(|e| e.to_string())
+        fs::write(self.dir().join(name).join("dismissed"), b"").map_err(|e| e.to_string())
     }
 
     pub fn mark_updated(&self, name: &str) -> Result<(), String> {
