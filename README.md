@@ -20,6 +20,7 @@ Or from source: `cargo install --path .` in this folder.
 ## Set up
 
 1. Run `rogit serve` in your project folder (next to `default.project.json`), for example in VS Code's terminal.
+   Working on several games? Run it in each one's folder; the plugin finds the right one for the place you open.
 2. Open your game's start place in Studio and open the RoGit panel (Plugins → RoGit).
 3. Click **Init**. RoGit writes `rogit.toml` (commit it), creates `.rogit/` (kept out of Git), and gives every
    object a small hidden ID attribute so it can follow it between branches. Save the place afterwards.

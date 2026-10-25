@@ -28,8 +28,8 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
-        ["serve"] => serve(server::DEFAULT_PORT),
-        ["serve", "--port", port] => port.parse().map_err(|_| format!("Invalid port: {port}")).and_then(serve),
+        ["serve"] => serve(None),
+        ["serve", "--port", port] => port.parse().map_err(|_| format!("Invalid port: {port}")).and_then(|port| serve(Some(port))),
         ["plugin", "install"] => install_plugin(),
         ["diff"] => diff(None, false),
         ["diff", name] => diff(Some(name), false),
@@ -46,7 +46,7 @@ fn main() {
     }
 }
 
-fn serve(port: u16) -> Result<(), String> {
+fn serve(port: Option<u16>) -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("Couldn't read the current folder: {e}"))?;
     server::serve(project::Project::new(root), port)
 }
@@ -152,4 +152,116 @@ fn install_plugin() -> Result<(), String> {
     fs::write(&target, PLUGIN).map_err(|e| format!("Couldn't write {}: {e}", target.display()))?;
     println!("Installed the RoGit plugin to {}. Studio picks it up automatically.", target.display());
     Ok(())
+}
+
+/// Checks on the Studio plugin's source, for mistakes Studio only reports when it loads the plugin.
+#[cfg(test)]
+mod plugin_checks {
+    use super::PLUGIN;
+    use std::collections::HashMap;
+
+    /// A line without its comment and without what's inside its string literals.
+    fn code(line: &str) -> String {
+        let mut out = String::new();
+        let mut quote: Option<char> = None;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match quote {
+                Some(q) if c == '\\' => {
+                    chars.next();
+                    let _ = q;
+                }
+                Some(q) if c == q => {
+                    quote = None;
+                    out.push(c);
+                }
+                Some(_) => {}
+                None if c == '"' || c == '\'' => {
+                    quote = Some(c);
+                    out.push(c);
+                }
+                None if c == '-' && chars.peek() == Some(&'-') => break,
+                None => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Names declared by top-level `local` lines, with their line numbers.
+    fn top_level_locals() -> Vec<(String, usize)> {
+        let mut names = Vec::new();
+        for (number, line) in PLUGIN.lines().enumerate() {
+            let Some(rest) = line.strip_prefix("local ") else { continue };
+            let rest = rest.strip_prefix("function ").unwrap_or(rest);
+            let declared = rest.split(['=', '(', ':']).next().unwrap_or_default();
+            for name in declared.split(',') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    names.push((name.to_owned(), number));
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn stays_within_luaus_local_limit() {
+        // Luau allows 200 locals in one scope; past that the plugin doesn't load at all. Sections that keep their
+        // locals to themselves live in `do` blocks or functions.
+        let count = top_level_locals().len();
+        assert!(count <= 185, "the plugin has {count} top-level locals; move a section into a do block");
+    }
+
+    /// Every name bound anywhere (inner locals, function parameters, loop variables) and the first line it's bound on.
+    fn bindings() -> HashMap<String, usize> {
+        let mut first = HashMap::new();
+        for (number, line) in PLUGIN.lines().enumerate() {
+            let line = code(line);
+            let mut bind = |names: &str| {
+                for name in names.split(',') {
+                    let name = name.split(':').next().unwrap_or_default().trim();
+                    if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        first.entry(name.to_owned()).or_insert(number);
+                    }
+                }
+            };
+            for (i, _) in line.match_indices("local ") {
+                let rest = &line[i + 6..];
+                let rest = rest.strip_prefix("function ").unwrap_or(rest);
+                bind(rest.split(['=', '(']).next().unwrap_or_default());
+            }
+            if let Some(i) = line.find("function") {
+                if let (Some(open), Some(close)) = (line[i..].find('('), line[i..].find(')')) {
+                    bind(&line[i + open + 1..i + close]);
+                }
+            }
+            if let Some(rest) = line.trim_start().strip_prefix("for ") {
+                bind(rest.split([' ', '=']).take_while(|w| *w != "in").collect::<Vec<_>>().join(",").as_str());
+            }
+        }
+        first
+    }
+
+    #[test]
+    fn uses_no_top_level_name_before_declaring_it() {
+        // Using a local before its declaration reads a global of the same name instead (nil), silently.
+        let declared: HashMap<String, usize> =
+            top_level_locals().into_iter().fold(HashMap::new(), |mut first, (name, line)| {
+                first.entry(name).or_insert(line);
+                first
+            });
+        let bound = bindings();
+        for (number, line) in PLUGIN.lines().enumerate() {
+            let line = code(line);
+            let words = line.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == ':'));
+            for word in words {
+                // `a.b` and `a:b` use `a`; what comes after the dot is a field.
+                let name = word.split(['.', ':']).next().unwrap_or_default();
+                let Some(&at) = declared.get(name) else { continue };
+                // A parameter or inner local of the same name bound earlier is a different variable.
+                let shadowed = bound.get(name).is_some_and(|&b| b < at && b <= number);
+                assert!(number >= at || shadowed, "line {}: `{name}` is used before its declaration on line {}", number + 1, at + 1);
+            }
+        }
+    }
 }

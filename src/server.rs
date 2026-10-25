@@ -14,7 +14,9 @@ use rbx_dom_weak::WeakDom;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-pub const DEFAULT_PORT: u16 = 34875;
+/// The ports rogit serve uses: the first free one, so several projects can be served at once. The plugin looks
+/// through them for the project its place belongs to.
+pub const PORTS: std::ops::RangeInclusive<u16> = 34875..=34879;
 
 type Reply = Result<Value, (u16, String)>;
 
@@ -73,9 +75,20 @@ struct Update {
 const MAIN_PICKUP: Duration = Duration::from_secs(30);
 const MAIN_COPY: Duration = Duration::from_secs(180);
 
-pub fn serve(project: Project, port: u16) -> Result<(), String> {
+/// Serves `project` on `port`, or on the first free port of `PORTS`.
+pub fn serve(project: Project, port: Option<u16>) -> Result<(), String> {
+    let ports: Vec<u16> = match port {
+        Some(port) => vec![port],
+        None => PORTS.collect(),
+    };
+    let found = ports.iter().find_map(|port| Server::http(format!("127.0.0.1:{port}")).ok().map(|server| (*port, server)));
+    let Some((port, server)) = found else {
+        return Err(match port {
+            Some(port) => format!("Couldn't listen on port {port}; something else is using it."),
+            None => format!("Ports {} to {} are all in use; is rogit serve already running five times?", PORTS.start(), PORTS.end()),
+        });
+    };
     let address = format!("127.0.0.1:{port}");
-    let server = Server::http(&address).map_err(|e| format!("Couldn't listen on {address}: {e}"))?;
     let branches = Branches::new(project.root.join(DATA_DIR));
     let history = History::new(project.root.join(DATA_DIR));
     let mut state = State {
