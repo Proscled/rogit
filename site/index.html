@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RoGit: branches for Roblox places</title>
+<meta name="description" content="Build in a branch, see exactly what changed, and merge it back into your Roblox game. Git for everything Rojo doesn't sync. Free, open source, macOS and Windows.">
+<meta property="og:title" content="RoGit: branches for Roblox places">
+<meta property="og:description" content="Build in a branch, see exactly what changed, and merge it back into your game.">
+<meta property="og:image" content="https://__SITE__/merge-window.jpg">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233467ff'/%3E%3Cpath d='M11 8v16M11 13c0 4 10 2 10 7' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='8' r='2.6' fill='white'/%3E%3Ccircle cx='11' cy='24' r='2.6' fill='white'/%3E%3Ccircle cx='21' cy='21' r='2.6' fill='white'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #0f1013;
+    --bg-glow: rgba(52, 103, 255, 0.16);
+    --surface: #17191e;
+    --raised: #1f2229;
+    --line: #2a2d35;
+    --text: #e9eaee;
+    --muted: #a0a4ae;
+    --faint: #6f7480;
+    --accent: #3467ff;
+    --accent-text: #8aa7ff;
+    --on-accent: #fff;
+    --added: #45c06a;
+    --changed: #e9a93b;
+    --removed: #f0605a;
+    --code-bg: #0b0c0f;
+    --shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.06);
+    --sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f7f9;
+      --bg-glow: rgba(52, 103, 255, 0.10);
+      --surface: #ffffff;
+      --raised: #f0f1f4;
+      --line: #e1e3e8;
+      --text: #15171c;
+      --muted: #545a66;
+      --faint: #858b97;
+      --accent: #2c5cf0;
+      --accent-text: #2c5cf0;
+      --added: #1f8f45;
+      --changed: #b7790e;
+      --removed: #d43d37;
+      --code-bg: #15171c;
+      --shadow: 0 30px 70px -25px rgba(20, 25, 40, 0.35), 0 0 0 1px rgba(20, 25, 40, 0.08);
+      color-scheme: light;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html { scroll-behavior: smooth; scroll-padding-top: 72px; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 var(--sans);
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  a { color: var(--accent-text); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: 0.9em; }
+  :not(pre) > code:not(.cmd code) {
+    background: var(--raised);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0.1em 0.4em;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+  /* Header */
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: saturate(160%) blur(12px);
+    -webkit-backdrop-filter: saturate(160%) blur(12px);
+    border-bottom: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+  }
+  header .wrap { display: flex; align-items: center; height: 60px; gap: 28px; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 650; font-size: 17px; letter-spacing: -0.01em; }
+  .brand:hover { text-decoration: none; }
+  .brand svg { width: 26px; height: 26px; }
+  nav { display: flex; gap: 22px; margin-left: auto; font-size: 14.5px; }
+  nav a { color: var(--muted); }
+  nav a:hover { color: var(--text); text-decoration: none; }
+
+  /* Hero */
+  .hero { position: relative; padding: 72px 0 88px; }
+  .hero::before {
+    content: ""; position: absolute; inset: -60px 0 0; z-index: -1; pointer-events: none;
+    background: radial-gradient(50% 60% at 50% 15%, var(--bg-glow), transparent 70%);
+  }
+  .hero .wrap { text-align: center; }
+  .hero .lead, .hero .install { margin-left: auto; margin-right: auto; }
+  .eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--muted); margin-bottom: 18px; }
+  .eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--added); box-shadow: 0 0 0 3px color-mix(in srgb, var(--added) 25%, transparent); }
+  h1 { font-size: clamp(40px, 6.6vw, 72px); line-height: 1.04; letter-spacing: -0.035em; margin: 0 0 20px; font-weight: 700; text-wrap: balance; }
+  .lead { font-size: 19px; color: var(--muted); margin: 0 0 36px; max-width: 32em; text-wrap: balance; }
+
+  /* Install box */
+  .install { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 6px; width: 100%; max-width: 640px; text-align: left; box-shadow: var(--shadow); }
+  .tabs { display: flex; gap: 4px; padding: 2px 2px 6px; }
+  .tabs button {
+    font: 500 14px var(--sans); color: var(--muted); background: none; border: 0; border-radius: 8px;
+    padding: 7px 12px; cursor: pointer;
+  }
+  .tabs button:hover { color: var(--text); }
+  .tabs button[aria-selected="true"] { background: var(--raised); color: var(--text); }
+  .tabs .version { margin-left: auto; align-self: center; font: 500 12.5px var(--mono); color: var(--faint); padding-right: 8px; }
+  .cmd {
+    display: flex; align-items: center; gap: 8px; background: var(--code-bg); color: #e9eaee;
+    border-radius: 10px; padding: 6px 6px 6px 16px; min-width: 0;
+  }
+  .cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; padding: 8px 0; font-size: 14px; line-height: 1.5; }
+  .cmd code::before { content: "$ "; color: #6f7480; }
+  .cmd.ps code::before { content: "> "; }
+  .copy {
+    flex: none; font: 500 13px var(--sans); color: #c9ccd3; background: #23262d; border: 1px solid #30343c;
+    border-radius: 7px; padding: 6px 11px; cursor: pointer;
+  }
+  .copy:hover { color: #fff; background: #2b2f37; }
+  .copy.done { color: var(--added); }
+  .install .note { font-size: 13.5px; color: var(--faint); margin: 10px 10px 6px; }
+  .hero .more { margin-top: 18px; font-size: 14.5px; color: var(--faint); }
+
+  /* Screenshots */
+  .shot { border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; background: #1b1d22; }
+  .shot img { display: block; width: 100%; height: auto; }
+
+  /* Sections */
+  section { padding: 88px 0; border-top: 1px solid var(--line); }
+  .kicker { font: 500 13px var(--mono); color: var(--accent-text); text-transform: uppercase; letter-spacing: 0.08em; margin: 0 0 12px; }
+  h2 { font-size: clamp(28px, 3.4vw, 38px); line-height: 1.12; letter-spacing: -0.025em; margin: 0 0 16px; font-weight: 650; text-wrap: balance; }
+  h3 { font-size: 18px; margin: 0 0 6px; letter-spacing: -0.01em; font-weight: 600; }
+  .intro { color: var(--muted); font-size: 17.5px; max-width: 40em; margin: 0 0 44px; }
+
+  /* Steps */
+  .steps { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; counter-reset: step; }
+  .steps li { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 22px; counter-increment: step; }
+  .steps li::before {
+    content: counter(step); display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px;
+    background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 14px; margin-bottom: 16px;
+  }
+  .steps p { margin: 0; color: var(--muted); font-size: 15px; }
+  .steps .cmd { margin-top: 14px; padding: 4px 12px; }
+  .steps .cmd code { font-size: 13px; }
+
+  /* Feature rows */
+  .feature { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 64px; align-items: center; }
+  .feature + .feature { margin-top: 96px; }
+  .feature.flip .shot { order: -1; }
+  .feature .shot.narrow { max-width: 380px; justify-self: center; }
+  .points { list-style: none; padding: 0; margin: 24px 0 0; display: grid; gap: 14px; }
+  .points li { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 10px; color: var(--muted); }
+  .points b { color: var(--text); font-weight: 600; }
+  .points li::before { content: ""; width: 8px; height: 8px; margin: 9px 0 0 6px; border-radius: 2px; background: var(--mark, var(--accent)); }
+  .points li:nth-child(4n+1) { --mark: var(--added); }
+  .points li:nth-child(4n+2) { --mark: var(--changed); }
+  .points li:nth-child(4n+3) { --mark: var(--accent); }
+  .points li:nth-child(4n+4) { --mark: var(--removed); }
+
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 96px; }
+  .grid div { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+  .grid p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  /* Install options */
+  .options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  .options > div { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 24px; min-width: 0; }
+  .options p { color: var(--muted); font-size: 15px; margin: 0 0 14px; }
+  .options .cmd + .cmd { margin-top: 8px; }
+  .options .cmd code { font-size: 13px; }
+  .options .small { font-size: 14px; color: var(--faint); margin: 14px 0 0; }
+  .tag { font: 500 11.5px var(--mono); color: var(--added); border: 1px solid color-mix(in srgb, var(--added) 45%, transparent); border-radius: 999px; padding: 2px 8px; margin-left: 8px; vertical-align: 2px; }
+
+  /* Help */
+  .faq { max-width: 780px; }
+  details { border-bottom: 1px solid var(--line); }
+  summary { cursor: pointer; list-style: none; padding: 18px 0; font-weight: 550; display: flex; gap: 12px; align-items: baseline; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "+"; font-family: var(--mono); color: var(--faint); width: 14px; flex: none; }
+  details[open] summary::before { content: "\2212"; }
+  details > div { padding: 0 0 20px 26px; color: var(--muted); }
+  details > div p { margin: 0 0 10px; }
+  details .cmd { margin: 10px 0; }
+  details .cmd code { font-size: 13px; }
+
+  footer { border-top: 1px solid var(--line); padding: 36px 0 48px; color: var(--faint); font-size: 14px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; align-items: center; }
+  footer nav { margin-left: auto; }
+
+  @media (max-width: 900px) {
+    .feature { grid-template-columns: minmax(0, 1fr); gap: 44px; }
+    .feature.flip .shot { order: 0; }
+    .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 640px) {
+    .wrap { padding: 0 16px; }
+    header nav a:not(.gh) { display: none; }
+    .hero { padding: 44px 0 64px; }
+    .lead { font-size: 17px; }
+    section { padding: 64px 0; }
+    .steps, .grid, .options { grid-template-columns: minmax(0, 1fr); }
+    .feature + .feature, .grid { margin-top: 64px; }
+    footer nav { margin-left: 0; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="brand" href="#">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#3467ff"/><path d="M11 8v16M11 13c0 4 10 2 10 7" stroke="#fff" stroke-width="2.6" fill="none" stroke-linecap="round"/><circle cx="11" cy="8" r="2.6" fill="#fff"/><circle cx="11" cy="24" r="2.6" fill="#fff"/><circle cx="21" cy="21" r="2.6" fill="#fff"/></svg>
+      RoGit
+    </a>
+    <nav>
+      <a href="#start">Quick start</a>
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#help">Help</a>
+      <a class="gh" href="https://github.com/__REPO__">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="hero">
+    <div class="wrap">
+      <div>
+        <div class="eyebrow"><span class="dot"></span>For Roblox Studio and Rojo · macOS and Windows</div>
+        <h1>Branches for your Roblox places</h1>
+        <p class="lead">Build a new map, lobby or UI in a branch, see exactly what changed, and merge it back into your game. Git for everything Rojo doesn't sync.</p>
+
+        <div class="install" id="get">
+          <div class="tabs" role="tablist" aria-label="Your computer">
+            <button role="tab" id="tab-mac" aria-controls="cmd-mac" aria-selected="true" data-os="mac">macOS</button>
+            <button role="tab" id="tab-win" aria-controls="cmd-win" aria-selected="false" data-os="win">Windows</button>
+            <span class="version" id="version"></span>
+          </div>
+          <div class="cmd" id="cmd-mac" role="tabpanel" aria-labelledby="tab-mac">
+            <code>curl -fsSL https://__SITE__/install.sh | sh</code>
+            <button class="copy" type="button">Copy</button>
+          </div>
+          <div class="cmd ps" id="cmd-win" role="tabpanel" aria-labelledby="tab-win" hidden>
+            <code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code>
+            <button class="copy" type="button">Copy</button>
+          </div>
+          <p class="note" id="note-mac">Paste it in Terminal or VS Code's terminal. It installs rogit, adds it to your PATH and installs the Studio plugin.</p>
+          <p class="note" id="note-win" hidden>Paste it in PowerShell or VS Code's terminal. It installs rogit, adds it to your PATH and installs the Studio plugin.</p>
+        </div>
+        <p class="more">Run it again to update. <a href="#install">Other ways to install</a></p>
+      </div>
+    </div>
+  </div>
+
+  <section id="start">
+    <div class="wrap">
+      <p class="kicker">Quick start</p>
+      <h2>From install to your first branch</h2>
+      <p class="intro">RoGit has two parts, like Rojo: the <code>rogit</code> command, which keeps your branches in your project folder, and the Studio plugin, where you use them.</p>
+      <ol class="steps">
+        <li>
+          <h3>Install</h3>
+          <p>Run the install command above. Open a new terminal afterwards so it finds <code>rogit</code>.</p>
+        </li>
+        <li>
+          <h3>Serve your project</h3>
+          <p>In your game's project folder, next to <code>default.project.json</code>:</p>
+          <div class="cmd"><code>rogit serve</code></div>
+        </li>
+        <li>
+          <h3>Init in Studio</h3>
+          <p>Open your game's start place, then <b>Plugins → RoGit</b> and click <b>Init</b>. Save the place afterwards.</p>
+        </li>
+        <li>
+          <h3>Make a branch</h3>
+          <p>Type a name under <b>New branch</b>. RoGit copies main and opens the branch in its own window.</p>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="wrap">
+      <div class="feature">
+        <div>
+          <p class="kicker">In a branch</p>
+          <h2>Source Control for your map</h2>
+          <p class="intro" style="margin-bottom:0">The panel works like VS Code's Source Control, for parts, models, UI, lighting and terrain.</p>
+          <ul class="points">
+            <li><span><b>Changes as you build.</b> Every edit shows up within a moment, even in places with 100,000 objects.</span></li>
+            <li><span><b>Stage, commit, discard.</b> Commit some changes and keep working on the rest. Discard puts things back, and Ctrl+Z undoes that too.</span></li>
+            <li><span><b>Pull from main.</b> Bring your game's newer changes into the branch whenever you like.</span></li>
+            <li><span><b>Autosave.</b> If Studio closes before you save, the branch offers your unsaved work back.</span></li>
+          </ul>
+        </div>
+        <div class="shot narrow">
+          <img src="branch-panel.jpg" width="463" height="752" loading="lazy" alt="The RoGit panel in a branch: a commit box, Pull from main, eight changes such as Lighting and Baseplate marked modified, added or deleted, and a graph of the branch's history.">
+        </div>
+      </div>
+
+      <div class="feature flip">
+        <div>
+          <p class="kicker">In main</p>
+          <h2>Merges you can read</h2>
+          <p class="intro" style="margin-bottom:0">Before anything changes in your game, RoGit shows what the branch did, laid out like the Explorer.</p>
+          <ul class="points">
+            <li><span><b>Exact changes.</b> Old and new values side by side, colors included.</span></li>
+            <li><span><b>Moves fold up.</b> A model moved with 579 parts is one line, not 579.</span></li>
+            <li><span><b>Conflicts.</b> Something changed in both? Pick <i>Keep main</i> or <i>Use branch</i>, one by one or for all.</span></li>
+            <li><span><b>One undo step.</b> The whole merge undoes with a single Ctrl+Z.</span></li>
+          </ul>
+        </div>
+        <div class="shot">
+          <img src="merge-window.jpg" width="844" height="672" loading="lazy" alt="The merge window for test-1 into main: 1 added, 1 removed, 5 changed, 1 conflict. Baseplate's color changes from grey to red, Classic House moved with 579 objects and has Keep main and Use branch buttons, and Lighting's ClockTime changes from 14.5 to 18.">
+        </div>
+      </div>
+
+      <div class="grid">
+        <div><h3>Stays on your computer</h3><p>Branches are .rbxl files in your project's <code>.rogit</code> folder. No account, API key or cloud.</p></div>
+        <div><h3>Scripts stay with Rojo</h3><p>RoGit skips scripts and everything your project file syncs, so it never fights Rojo.</p></div>
+        <div><h3>Fast in big games</h3><p>After one copy of the place, only the objects you change are sent.</p></div>
+        <div><h3>Terrain, meshes, unions</h3><p>Terrain voxels, material colors, MeshParts and unions merge like everything else.</p></div>
+        <div><h3>A graph of it all</h3><p>Every branch, commit, merge and pull in one graph. Click one to see what it changed.</p></div>
+        <div><h3>Several games</h3><p>Run <code>rogit serve</code> in each game's folder. The plugin finds the right one.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="wrap">
+      <p class="kicker">Install</p>
+      <h2>Ways to install</h2>
+      <p class="intro">Every way ends the same: the <code>rogit</code> command on your PATH and the plugin in Studio's plugins folder.</p>
+      <div class="options">
+        <div>
+          <h3>Installer <span class="tag">recommended</span></h3>
+          <p>Puts rogit in <code>~/.rogit/bin</code> on macOS or <code>%LOCALAPPDATA%\rogit\bin</code> on Windows, adds that folder to your PATH and installs the plugin.</p>
+          <div class="cmd"><code>curl -fsSL https://__SITE__/install.sh | sh</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd ps"><code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code><button class="copy" type="button">Copy</button></div>
+          <p class="small">For a specific version, set <code>ROGIT_VERSION=v0.1.0</code> first.</p>
+        </div>
+        <div>
+          <h3>Rokit</h3>
+          <p>If your project already uses <a href="https://github.com/rojo-rbx/rokit">Rokit</a> for Rojo, add rogit next to it. The version is pinned in <code>rokit.toml</code> for your whole team.</p>
+          <div class="cmd"><code>rokit add __REPO__</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd"><code>rogit plugin install</code><button class="copy" type="button">Copy</button></div>
+        </div>
+        <div>
+          <h3>Download</h3>
+          <p>Get the zip for your computer from the <a href="https://github.com/__REPO__/releases/latest">latest release</a>, put <code>rogit</code> somewhere on your PATH, and run <code>rogit plugin install</code>.</p>
+          <p class="small">On macOS, a file downloaded with a browser is blocked until you run <code>xattr -d com.apple.quarantine rogit</code>. The installer doesn't need this.</p>
+        </div>
+        <div>
+          <h3>From source</h3>
+          <p>With <a href="https://rustup.rs">Rust</a> installed:</p>
+          <div class="cmd"><code>cargo install --locked --git https://github.com/__REPO__</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd"><code>rogit plugin install</code><button class="copy" type="button">Copy</button></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="help">
+    <div class="wrap">
+      <p class="kicker">Help</p>
+      <h2>Common questions</h2>
+      <div class="faq">
+        <details>
+          <summary>The terminal says rogit isn't found or isn't recognized</summary>
+          <div><p>Terminals only read your PATH when they start. Open a new one. On Windows, quit VS Code completely and open it again, because its terminals inherit VS Code's PATH.</p></div>
+        </details>
+        <details>
+          <summary>The panel keeps saying it's looking for RoGit</summary>
+          <div><p>The plugin talks to <code>rogit serve</code>. Run it in your game's project folder and leave that terminal open while you work.</p></div>
+        </details>
+        <details>
+          <summary>The panel says "Other game"</summary>
+          <div><p>The <code>rogit serve</code> that's running belongs to a different game. Run <code>rogit serve</code> in this game's project folder too; both can run at once.</p></div>
+        </details>
+        <details>
+          <summary>Windows says running scripts is disabled</summary>
+          <div><p>Use the full install command, starting with <code>powershell -ExecutionPolicy Bypass</code>. It allows the installer for that one run and changes no settings.</p></div>
+        </details>
+        <details>
+          <summary>How do I update?</summary>
+          <div><p>Run the install command again. It replaces rogit and the plugin, and works while <code>rogit serve</code> is running; restart <code>rogit serve</code> afterwards.</p></div>
+        </details>
+        <details>
+          <summary>How do I uninstall?</summary>
+          <div>
+            <p>On macOS, delete rogit and the plugin, then remove the line <code>. "$HOME/.rogit/env"</code> from <code>~/.zshenv</code> (and <code>~/.bash_profile</code> or <code>~/.bashrc</code> if it's there):</p>
+            <div class="cmd"><code>rm -rf ~/.rogit ~/Documents/Roblox/Plugins/RoGit.lua</code><button class="copy" type="button">Copy</button></div>
+            <p>On Windows, delete <code>%LOCALAPPDATA%\rogit</code> and <code>%LOCALAPPDATA%\Roblox\Plugins\RoGit.lua</code>, then remove the rogit folder from Path in <b>Edit environment variables for your account</b>.</p>
+            <p>Your branches stay in each project's <code>.rogit</code> folder until you delete it.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>RoGit is free and open source under the MPL-2.0. It isn't made by or affiliated with Roblox.</span>
+    <nav>
+      <a href="https://github.com/__REPO__">GitHub</a>
+      <a href="https://github.com/__REPO__/releases">Releases</a>
+      <a href="https://github.com/__REPO__/issues">Report a problem</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+  // Show the command for this computer.
+  const tabs = document.querySelectorAll('.tabs [role="tab"]');
+  function choose(os) {
+    for (const tab of tabs) {
+      const on = tab.dataset.os === os;
+      tab.setAttribute('aria-selected', on);
+      document.getElementById('cmd-' + tab.dataset.os).hidden = !on;
+      document.getElementById('note-' + tab.dataset.os).hidden = !on;
+    }
+  }
+  tabs.forEach(tab => tab.addEventListener('click', () => choose(tab.dataset.os)));
+  const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent;
+  choose(/win/i.test(platform) ? 'win' : 'mac');
+
+  // Copy buttons.
+  document.querySelectorAll('.copy').forEach(button => button.addEventListener('click', async () => {
+    const code = button.parentElement.querySelector('code');
+    try {
+      await navigator.clipboard.writeText(code.textContent);
+    } catch {
+      const range = document.createRange();
+      range.selectNodeContents(code);
+      getSelection().removeAllRanges();
+      getSelection().addRange(range);
+      return;
+    }
+    button.textContent = 'Copied';
+    button.classList.add('done');
+    setTimeout(() => { button.textContent = 'Copy'; button.classList.remove('done'); }, 1600);
+  }));
+
+  // The latest version, next to the install command.
+  fetch('https://api.github.com/repos/__REPO__/releases/latest')
+    .then(response => response.ok ? response.json() : null)
+    .then(release => {
+      if (!release || !release.tag_name) return;
+      const link = document.createElement('a');
+      link.href = release.html_url;
+      link.textContent = release.tag_name;
+      link.style.color = 'inherit';
+      document.getElementById('version').append(link);
+    })
+    .catch(() => {});
+</script>
+</body>
+</html>

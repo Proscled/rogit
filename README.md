@@ -8,14 +8,22 @@ Windows. Everything stays on your computer; there's no account, API key or cloud
 
 ## Install
 
-With [Rokit](https://github.com/rojo-rbx/rokit), in your project folder:
+On macOS, in Terminal:
 
 ```sh
-rokit add <github-user>/rogit
-rogit plugin install
+curl -fsSL https://<github-user>.github.io/rogit/install.sh | sh
 ```
 
-Or from source: `cargo install --path .` in this folder.
+On Windows, in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://<github-user>.github.io/rogit/install.ps1 | iex"
+```
+
+The installer puts `rogit` in `~/.rogit/bin` (macOS) or `%LOCALAPPDATA%\rogit\bin` (Windows), adds that folder to
+your PATH and installs the Studio plugin. Run it again to update. The
+[install page](https://<github-user>.github.io/rogit/#install) also covers Rokit, plain downloads and building from
+source.
 
 ## Set up
 

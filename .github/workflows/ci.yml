@@ -25,3 +25,47 @@ jobs:
           curl -sSL -o stylua.zip https://github.com/JohnnyMorganz/StyLua/releases/download/v2.5.2/stylua-linux-x86_64.zip
           unzip -q stylua.zip
           ./stylua --syntax luau - < plugin/RoGit.lua > /dev/null
+
+  # Runs the installers from site/ against the build from this commit: a stand-in download hands them a fresh zip.
+  installers:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Install on macOS
+        if: runner.os == 'macOS'
+        run: |
+          (cd target/release && zip -q "$RUNNER_TEMP/rogit.zip" rogit)
+          mkdir -p "$RUNNER_TEMP/fake"
+          printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\ncp "$RUNNER_TEMP/rogit.zip" "$out"\n' > "$RUNNER_TEMP/fake/curl"
+          chmod +x "$RUNNER_TEMP/fake/curl"
+          PATH="$RUNNER_TEMP/fake:$PATH" sh site/install.sh
+          PATH="$RUNNER_TEMP/fake:$PATH" sh site/install.sh
+          test "$(grep -c rogit/env ~/.zshenv)" = 1
+          zsh -c 'rogit --version'
+          test -f ~/Documents/Roblox/Plugins/RoGit.lua
+      - name: Install on Windows
+        if: runner.os == 'Windows'
+        # Windows PowerShell 5.1, which the one-line install command uses.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Compress-Archive -Path target\release\rogit.exe -DestinationPath "$env:RUNNER_TEMP\rogit.zip"
+          function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing) Copy-Item "$env:RUNNER_TEMP\rogit.zip" $OutFile }
+          Get-Content site\install.ps1 -Raw | Invoke-Expression
+          $bin = "$env:LOCALAPPDATA\rogit\bin"
+          # Update while rogit serve has rogit.exe open.
+          $serve = Start-Process "$bin\rogit.exe" -ArgumentList serve -WorkingDirectory $env:RUNNER_TEMP -PassThru
+          Start-Sleep -Seconds 2
+          Get-Content site\install.ps1 -Raw | Invoke-Expression
+          Stop-Process -Id $serve.Id
+          $key = Get-Item HKCU:\Environment
+          if ($key.GetValueKind('Path') -ne 'ExpandString') { throw 'PATH is no longer an expandable string.' }
+          $path = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';'
+          if (@($path | Where-Object { $_ -eq $bin }).Count -ne 1) { throw "rogit's folder should be on PATH once: $path" }
+          & "$bin\rogit.exe" --version
+          if (-not (Test-Path "$env:LOCALAPPDATA\Roblox\Plugins\RoGit.lua")) { throw "The plugin wasn't installed." }

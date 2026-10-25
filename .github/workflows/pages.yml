@@ -1,0 +1,40 @@
+# Publishes site/ (the install page and the install scripts) to GitHub Pages, with this repository's names filled
+# in. In the repository's Settings → Pages, set Source to "GitHub Actions" once.
+name: Site
+
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pages
+        uses: actions/configure-pages@v5
+      - name: Fill in this repository's names
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          mkdir _site && cp -R site/. _site/
+          sed -i -e "s|__REPO__|$GITHUB_REPOSITORY|g" -e "s|__SITE__|${BASE_URL#https://}|g" _site/*.html _site/*.sh _site/*.ps1
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
