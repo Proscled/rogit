@@ -1671,7 +1671,7 @@ local function servesThisPlace(reply: any): boolean
 	return reply.branch ~= nil or reply.archived ~= nil or (g ~= nil and g.universe_id == game.GameId)
 end
 
--- Looks through the ports for the rogit serve this place belongs to (or any, if none is). Returns its reply.
+-- Looks through the ports for the rogit serve this place belongs to (or the best other one). Returns its reply.
 local lastSearch = 0
 local function findServer(): (boolean, any)
 	lastSearch = os.clock()
@@ -1693,10 +1693,17 @@ local function findServer(): (boolean, any)
 	while waiting > 0 do
 		task.wait()
 	end
+	-- This place's own project fits best, then one not set up yet (Init makes it this game's), then any other.
+	local function fit(reply: any): number
+		if servesThisPlace(reply) then
+			return 2
+		end
+		return if reply.project and reply.project.game == nil then 1 else 0
+	end
 	local best = nil
 	for i = 1, #PORTS do
 		local candidate = found[i]
-		if candidate and (best == nil or (servesThisPlace(candidate.reply) and not servesThisPlace(best.reply))) then
+		if candidate and (best == nil or fit(candidate.reply) > fit(best.reply)) then
 			best = candidate
 		end
 	end
