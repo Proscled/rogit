@@ -1,10 +1,13 @@
 mod branches;
+mod diff;
 mod place;
 mod project;
 mod roblox;
 mod server;
 
 use std::path::PathBuf;
+use std::io::{self, IsTerminal};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
 const PLUGIN: &str = include_str!("../plugin/RoGit.lua");
@@ -13,6 +16,7 @@ const HELP: &str = "RoGit: branches for your Roblox places' assets.
 
 Usage:
   rogit serve [--port <port>]   Serve this project folder to the RoGit Studio plugin
+  rogit diff [<branch>] [--json] Show what a branch changed (from its saved file), or list branches
   rogit plugin install          Install the RoGit plugin into Roblox Studio
   rogit --version               Show the version";
 
@@ -23,6 +27,9 @@ fn main() {
         ["serve"] => serve(server::DEFAULT_PORT),
         ["serve", "--port", port] => port.parse().map_err(|_| format!("Invalid port: {port}")).and_then(serve),
         ["plugin", "install"] => install_plugin(),
+        ["diff"] => diff(None, false),
+        ["diff", name] => diff(Some(name), false),
+        ["diff", name, "--json"] => diff(Some(name), true),
         ["--version" | "-V"] => Ok(println!("rogit {}", env!("CARGO_PKG_VERSION"))),
         [] | ["help" | "--help" | "-h"] => Ok(println!("{HELP}")),
         _ => Err(format!("Unknown command.\n\n{HELP}")),
@@ -36,6 +43,78 @@ fn main() {
 fn serve(port: u16) -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("Couldn't read the current folder: {e}"))?;
     server::serve(project::Project::new(root), port)
+}
+
+fn diff(name: Option<&str>, as_json: bool) -> Result<(), String> {
+    let root = env::current_dir().map_err(|e| format!("Couldn't read the current folder: {e}"))?;
+    let project = project::Project::new(root.clone());
+    let branches = branches::Branches::new(root.join(project::DATA_DIR));
+    let Some(name) = name else {
+        let list = branches.list();
+        if list.is_empty() {
+            println!("No branches yet. Make one with New branch in the RoGit panel in main.");
+        }
+        for branch in list {
+            println!("{}  (made {})", branch.name, ago(branch.created));
+        }
+        return Ok(());
+    };
+    let start = branches.starting_point(name)?;
+    let file = branches.file(name);
+    let current = place::read(&file)?;
+    let review = diff::compare(&start, &current, &project.rojo_paths());
+    if as_json {
+        println!("{}", serde_json::to_string(&review).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    let saved = fs::metadata(&file).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok());
+    print_review(name, &review, saved.map(|d| d.as_secs()));
+    Ok(())
+}
+
+fn ago(unix: u64) -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(unix);
+    match now.saturating_sub(unix) {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86400 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86400),
+    }
+}
+
+fn print_review(name: &str, review: &diff::Review, saved: Option<u64>) {
+    let color = io::stdout().is_terminal();
+    let paint = |code: &str, text: &str| if color { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_owned() };
+    let s = &review.summary;
+    println!(
+        "{}: {} added, {} removed, {} changed{}",
+        paint("1", name), s.added, s.removed, s.changed,
+        saved.map(|t| format!(" (branch file saved {})", ago(t))).unwrap_or_default()
+    );
+    if review.rows.is_empty() {
+        println!("No changes since the branch started. Save the branch in Studio (Ctrl+S) to include recent edits.");
+    }
+    for row in &review.rows {
+        let indent = "  ".repeat(row.depth);
+        let (mark, code) = match row.status {
+            diff::Status::Added => ("+", "32"),
+            diff::Status::Removed => ("-", "31"),
+            diff::Status::Changed => ("~", "33"),
+            diff::Status::Context => (" ", "2"),
+        };
+        println!("{indent}{} {} {}", paint(code, mark), row.name, paint("2", &format!("({})", row.class)));
+        for change in &row.changes {
+            let line = if change.old.is_empty() {
+                format!("{}: {}", change.name, change.new)
+            } else {
+                format!("{}: {} → {}", change.name, change.old, change.new)
+            };
+            println!("{indent}    {}", paint("2", &line));
+        }
+    }
+    if review.truncated > 0 {
+        println!("…and {} more rows.", review.truncated);
+    }
 }
 
 fn plugins_folder() -> Result<PathBuf, String> {

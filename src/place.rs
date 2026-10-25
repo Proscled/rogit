@@ -17,7 +17,7 @@ pub struct BuildReport {
     pub settings_skipped: usize,
 }
 
-fn property_type(class: &str, property: &str) -> Option<DataType<'static>> {
+pub fn property_type(class: &str, property: &str) -> Option<DataType<'static>> {
     let db = rbx_reflection_database::get().ok()?;
     let mut current = db.classes.get(class);
     while let Some(descriptor) = current {
@@ -102,6 +102,22 @@ fn attribute(encoded: &Value) -> Option<Variant> {
 
 /// Writes a place file from the copy in `dir` (one `<Service>.rbxm` per service) and its manifest.
 pub fn build(dir: &Path, manifest: &Value, out: &Path) -> Result<BuildReport, String> {
+    let (dom, settings_skipped) = assemble(dir, manifest)?;
+    let objects = dom.descendants().count() - 1;
+    let services = dom.root().children().to_vec();
+    let file = fs::File::create(out).map_err(|e| format!("Couldn't create {}: {e}", out.display()))?;
+    rbx_binary::to_writer(BufWriter::new(file), &dom, &services).map_err(|e| format!("Couldn't write the place file: {e}"))?;
+    Ok(BuildReport { objects, settings_skipped })
+}
+
+/// Reads a place file, for example a branch saved in Studio.
+pub fn read(path: &Path) -> Result<WeakDom, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Couldn't read {}: {e}", path.display()))?;
+    rbx_binary::from_reader(&bytes[..]).map_err(|e| format!("Couldn't read {}: {e}", path.display()))
+}
+
+/// Puts a copy back together as a place in memory. Returns it with the number of settings it couldn't use.
+pub fn assemble(dir: &Path, manifest: &Value) -> Result<(WeakDom, usize), String> {
     let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
     let root = dom.root_ref();
     let mut settings_skipped = 0;
@@ -137,11 +153,7 @@ pub fn build(dir: &Path, manifest: &Value, out: &Path) -> Result<BuildReport, St
             children.transfer(child, &mut dom, service_ref);
         }
     }
-    let objects = dom.descendants().count() - 1;
-    let services = dom.root().children().to_vec();
-    let file = fs::File::create(out).map_err(|e| format!("Couldn't create {}: {e}", out.display()))?;
-    rbx_binary::to_writer(BufWriter::new(file), &dom, &services).map_err(|e| format!("Couldn't write the place file: {e}"))?;
-    Ok(BuildReport { objects, settings_skipped })
+    Ok((dom, settings_skipped))
 }
 
 #[cfg(test)]

@@ -116,8 +116,32 @@ impl Branches {
         let _ = fs::remove_dir_all(&target);
         fs::rename(self.upload_dir(capture), &target).map_err(|e| format!("Couldn't keep the starting point: {e}"))?;
         fs::write(target.join("manifest.json"), manifest.to_string()).map_err(|e| e.to_string())?;
+        // Studio changes some things when it opens a file (its lighting upgrade, for example). Rewrite the
+        // branch file from the starting point, so it matches it until you save the branch yourself.
+        place::build(&target, manifest, &self.file(name))?;
         branch.has_starting_point = true;
         self.save(&branch)
+    }
+
+    /// The branch as it was when it first opened, put back together in memory.
+    pub fn starting_point(&self, name: &str) -> Result<rbx_dom_weak::WeakDom, String> {
+        let branch = self.get(name).ok_or_else(|| format!("There's no branch called {name}."))?;
+        if !branch.has_starting_point {
+            return Err(format!("{name} has no starting point yet. Open it in Studio once first."));
+        }
+        let dir = self.dir().join(name).join("start");
+        let manifest: Value = serde_json::from_slice(&fs::read(dir.join("manifest.json")).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        place::assemble(&dir, &manifest).map(|(dom, _)| dom)
+    }
+
+    /// Keeps the newest copy of the branch from Studio (it includes unsaved edits).
+    pub fn keep_latest(&self, name: &str, capture: &str, manifest: &Value) -> Result<rbx_dom_weak::WeakDom, String> {
+        let target = self.dir().join(name).join("latest");
+        let _ = fs::remove_dir_all(&target);
+        fs::rename(self.upload_dir(capture), &target).map_err(|e| format!("Couldn't keep the copy: {e}"))?;
+        fs::write(target.join("manifest.json"), manifest.to_string()).map_err(|e| e.to_string())?;
+        place::assemble(&target, manifest).map(|(dom, _)| dom)
     }
 
     pub fn open(&self, name: &str) -> Result<(), String> {

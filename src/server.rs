@@ -1,6 +1,7 @@
 //! `rogit serve`: the local server the Studio plugin talks to, like `rojo serve`.
 
 use crate::branches::{self, Branches};
+use crate::diff;
 use crate::project::{DATA_DIR, Game, Project};
 use crate::roblox::Roblox;
 use base64::Engine;
@@ -51,6 +52,7 @@ fn handle(state: &mut State, mut request: Request) {
         (Method::Post, "/api/branches") => create_branch(state, &body),
         (Method::Post, "/api/branches/start") => starting_point(state, &body),
         (Method::Post, "/api/branches/open") => open_branch(state, &body),
+        (Method::Post, "/api/branches/review") => review_branch(state, &body),
         _ => Err((404, "Not found.".to_owned())),
     };
     let (code, value) = match result {
@@ -217,6 +219,21 @@ fn starting_point(state: &mut State, body: &str) -> Reply {
     state.branches.set_starting_point(&name, &capture, &manifest).map_err(|e| (409, e))?;
     println!("Recorded the starting point of {name}");
     Ok(json!({ "branch": state.branches.get(&name) }))
+}
+
+/// Compares the branch as it is in Studio right now with its starting point.
+fn review_branch(state: &mut State, body: &str) -> Reply {
+    let started = Instant::now();
+    let (name, capture, manifest) = capture_request(body)?;
+    let start = state.branches.starting_point(&name).map_err(|e| (409, e))?;
+    let current = state.branches.keep_latest(&name, &capture, &manifest).map_err(|e| (500, e))?;
+    let review = diff::compare(&start, &current, &state.project.rojo_paths());
+    let s = &review.summary;
+    println!(
+        "Reviewed {name}: {} added, {} removed, {} changed ({} ms)",
+        s.added, s.removed, s.changed, started.elapsed().as_millis()
+    );
+    Ok(json!({ "review": review }))
 }
 
 fn open_branch(state: &mut State, body: &str) -> Reply {
