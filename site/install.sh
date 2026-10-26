@@ -1,19 +1,17 @@
 #!/bin/sh
-# Installs RoGit on macOS: downloads the latest release into ~/.rogit/bin, puts that folder on your PATH, installs the
-# RoGit Studio plugin, and starts RoGit in the background (and from now on whenever you log in). Run it again to
-# update.
+# Installs RoGit on macOS: downloads the newest release and runs `rogit self-install`, which puts RoGit in
+# ~/.rogit/bin, adds that folder to your PATH, installs the RoGit Studio plugin, and starts RoGit in the background
+# (and from then on whenever you log in).
 #
 #   curl -fsSL https://__SITE__/install.sh | sh
 #
-# ROGIT_VERSION=v0.2.0 installs that release instead of the latest. ROGIT_NO_AUTOSTART=1 leaves starting RoGit to you
+# ROGIT_VERSION=v0.3.3 installs that release instead of the newest. ROGIT_NO_AUTOSTART=1 leaves starting RoGit to you
 # (rogit serve).
 
 set -eu
 
 repo="${ROGIT_REPO:-__REPO__}"
 version="${ROGIT_VERSION:-latest}"
-home="$HOME/.rogit"
-bin="$home/bin"
 
 fail() {
     printf 'rogit: %s\n' "$*" >&2
@@ -29,8 +27,8 @@ case "$(uname -m)" in
         ;;
     *) fail "unsupported processor: $(uname -m)" ;;
 esac
-command -v curl >/dev/null || fail "curl is needed to download rogit."
-command -v unzip >/dev/null || fail "unzip is needed to unpack rogit."
+command -v curl >/dev/null || fail "curl is needed to download RoGit."
+command -v unzip >/dev/null || fail "unzip is needed to unpack RoGit."
 
 asset="rogit-macos-$arch.zip"
 if [ "$version" = latest ]; then
@@ -39,9 +37,7 @@ else
     url="https://github.com/$repo/releases/download/$version/$asset"
 fi
 
-mkdir -p "$bin"
-# Unpacked next to the old copy, so the move below is a rename: a running `rogit serve` keeps its copy.
-tmp="$(mktemp -d "$home/download.XXXXXX")"
+tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 printf 'Downloading %s...\n' "$asset"
@@ -50,58 +46,4 @@ curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp/rogit.zip" "$url" ||
 unzip -q -o "$tmp/rogit.zip" -d "$tmp" || fail "couldn't unpack $asset."
 [ -f "$tmp/rogit" ] || fail "$asset doesn't contain rogit."
 chmod +x "$tmp/rogit"
-mv -f "$tmp/rogit" "$bin/rogit"
-
-# PATH: one small file that shells load, so a reinstall never adds the line twice.
-cat >"$home/env" <<'EOF'
-# Added by the rogit installer: puts rogit on your PATH.
-case ":$PATH:" in
-    *":$HOME/.rogit/bin:"*) ;;
-    *) export PATH="$HOME/.rogit/bin:$PATH" ;;
-esac
-EOF
-line='. "$HOME/.rogit/env"'
-changed=""
-add_line() {
-    if [ -f "$1" ] && grep -qF "$line" "$1"; then return; fi
-    printf '\n%s\n' "$line" >>"$1"
-    changed="$changed ~${1#"$HOME"}"
-}
-# zsh, the default on macOS, reads .zshenv in every shell, VS Code's terminal included.
-add_line "${ZDOTDIR:-$HOME}/.zshenv"
-# bash login shells read only the first of these that exists.
-if [ -f "$HOME/.bash_profile" ]; then
-    add_line "$HOME/.bash_profile"
-elif [ -f "$HOME/.bash_login" ]; then
-    add_line "$HOME/.bash_login"
-elif [ -f "$HOME/.profile" ]; then
-    add_line "$HOME/.profile"
-elif [ "${SHELL##*/}" = bash ]; then
-    add_line "$HOME/.bash_profile"
-fi
-[ -f "$HOME/.bashrc" ] && add_line "$HOME/.bashrc"
-if [ -d "$HOME/.config/fish" ] || [ "${SHELL##*/}" = fish ]; then
-    mkdir -p "$HOME/.config/fish/conf.d"
-    cat >"$HOME/.config/fish/conf.d/rogit.fish" <<'EOF'
-# Added by the rogit installer: puts rogit on your PATH.
-contains -- $HOME/.rogit/bin $PATH; or set -gx PATH $HOME/.rogit/bin $PATH
-EOF
-fi
-
-"$bin/rogit" plugin install
-
-# From now on RoGit runs in the background whenever you're logged in; this also restarts it after an update.
-started=""
-if [ -z "${ROGIT_NO_AUTOSTART:-}" ]; then
-    "$bin/rogit" autostart && started=1
-fi
-
-printf '\n%s is installed in ~/.rogit/bin.\n' "$("$bin/rogit" --version)"
-[ -n "$changed" ] && printf 'Added it to your PATH in%s.\n' "$changed"
-found="$(command -v rogit 2>/dev/null || true)"
-if [ -n "$found" ] && [ "$found" != "$bin/rogit" ]; then
-    printf '\nNote: there is also a rogit at %s. If `rogit --version` in a new terminal shows another version, remove that one.\n' "$found"
-fi
-[ -z "$started" ] && printf '\nStart RoGit with: rogit serve\n'
-printf '\nNext, in Roblox Studio: open your game'"'"'s start place, then Plugins > RoGit, and click Init.\n'
-printf 'Later, rogit update updates RoGit and rogit uninstall removes it.\n\n'
+"$tmp/rogit" self-install

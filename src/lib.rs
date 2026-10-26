@@ -13,6 +13,8 @@ mod roblox;
 mod server;
 mod setup;
 mod stage;
+#[cfg(windows)]
+mod windows;
 
 use std::io::{self, IsTerminal};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +30,7 @@ Usage:
   rogit diff [<branch>] [--json] Show what a branch changed, or list every game's branches
   rogit update                   Update RoGit and its plugin to the newest version
   rogit uninstall                Remove RoGit and its plugin (your branches stay)
+  rogit self-install             Install RoGit from where it was unpacked (the installers run this)
   rogit plugin install           Install the RoGit plugin into Roblox Studio
   rogit --version                Show the version";
 
@@ -43,6 +46,7 @@ pub fn cli() {
         ["plugin", "install"] => setup::install_plugin(),
         ["update"] => setup::update(),
         ["uninstall"] => setup::uninstall(),
+        ["self-install"] => setup::self_install(),
         ["diff"] => diff(None, false),
         ["diff", name] => diff(Some(name), false),
         ["diff", name, "--json"] => diff(Some(name), true),

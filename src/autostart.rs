@@ -1,5 +1,5 @@
 //! Running `rogit serve` in the background whenever you're logged in, so nobody has to keep a terminal open: a
-//! LaunchAgent on macOS, and on Windows a Run entry for `rogit-background.exe`, which opens no window.
+//! LaunchAgent on macOS, and on Windows a login entry for `rogit-background.exe`, which opens no window.
 
 use crate::project;
 use std::path::Path;
@@ -7,12 +7,15 @@ use std::process::Command;
 use std::{env, fs, thread, time::Duration};
 
 const LABEL: &str = "com.rogit.serve";
-const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// Starts RoGit now (replacing one already running, so an update takes effect) and whenever you log in.
 pub fn on() -> Result<(), String> {
-    let exe = env::current_exe().map_err(|e| format!("Couldn't find rogit itself: {e}"))?;
-    if cfg!(windows) { windows_on(&exe) } else { mac_on(&exe) }
+    enable(&env::current_exe().map_err(|e| format!("Couldn't find rogit itself: {e}"))?)
+}
+
+/// Like `on`, for the copy of rogit at `exe` (the installed one, when the installer runs this from elsewhere).
+pub fn enable(exe: &Path) -> Result<(), String> {
+    if cfg!(windows) { windows_on(exe) } else { mac_on(exe) }
 }
 
 /// Stops starting RoGit when you log in. One that's running keeps running until you log out.
@@ -25,7 +28,7 @@ pub fn off() -> Result<(), String> {
 /// Like `off`, without a word. On macOS this also stops the one running in the background.
 pub fn disable() -> Result<(), String> {
     if cfg!(windows) {
-        let _ = Command::new("reg").args(["delete", RUN_KEY, "/v", "RoGit", "/f"]).output();
+        login_entry(None)?;
         // Versions before 0.3.2 started RoGit with this script.
         let _ = fs::remove_file(project::home()?.join("start.vbs"));
     } else {
@@ -33,6 +36,35 @@ pub fn disable() -> Result<(), String> {
         let _ = Command::new("launchctl").args(["bootout", &format!("{}/{LABEL}", gui_domain()?)]).output();
         let _ = fs::remove_file(plist);
     }
+    Ok(())
+}
+
+/// Asks the RoGit that's running to stop (it writes its autosaves first) and waits for it. Versions before 0.3.3
+/// can't be asked; on Windows those are stopped by name.
+pub fn stop_running() {
+    if let Some((port, _)) = crate::server::running() {
+        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(5))).build().into();
+        let _ = agent.post(&format!("http://127.0.0.1:{port}/api/quit")).send_empty();
+        for _ in 0..30 {
+            if crate::server::running().is_none() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    if cfg!(windows) && crate::server::running().is_some() {
+        let _ = Command::new("taskkill").args(["/F", "/IM", "rogit-background.exe"]).output();
+        let _ = Command::new("taskkill").args(["/F", "/IM", "rogit.exe", "/FI", &format!("PID ne {}", std::process::id())]).output();
+    }
+}
+
+#[cfg(windows)]
+fn login_entry(program: Option<&Path>) -> Result<(), String> {
+    crate::windows::set_login_entry(program.map(|p| p.display().to_string()).as_deref())
+}
+
+#[cfg(not(windows))]
+fn login_entry(_: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
@@ -91,23 +123,13 @@ fn mac_on(exe: &Path) -> Result<(), String> {
     unreachable!()
 }
 
-/// Stops the RoGit running in the background on Windows (and one started by hand), but not this one.
-pub fn stop_running() {
-    let _ = Command::new("taskkill").args(["/F", "/IM", "rogit-background.exe"]).output();
-    let _ = Command::new("taskkill").args(["/F", "/IM", "rogit.exe", "/FI", &format!("PID ne {}", std::process::id())]).output();
-}
-
 fn windows_on(exe: &Path) -> Result<(), String> {
     // RoGit built as a Windows program, which opens no console window at every login. It comes with rogit.exe.
     let background = exe.with_file_name("rogit-background.exe");
     if !background.exists() {
         return Err(format!("{} is missing. Install RoGit again.", background.display()));
     }
-    let run = format!("\"{}\"", background.display());
-    let added = Command::new("reg").args(["add", RUN_KEY, "/v", "RoGit", "/t", "REG_SZ", "/d", &run, "/f"]).output().map_err(|e| e.to_string())?;
-    if !added.status.success() {
-        return Err(format!("Couldn't set RoGit to start when you log in: {}", String::from_utf8_lossy(&added.stderr).trim()));
-    }
+    login_entry(Some(&background))?;
     // Versions before 0.3.2 started RoGit with this script.
     let _ = fs::remove_file(project::home()?.join("start.vbs"));
     // Replace whichever RoGit is running (an older version, after an update) with this one.

@@ -250,7 +250,7 @@
             <span class="version" id="version"></span>
           </div>
           <div class="cmd ps" id="cmd-win" role="tabpanel" aria-labelledby="tab-win" data-only="win">
-            <code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code>
+            <code>irm https://__SITE__/install.ps1 | iex</code>
             <button class="copy" type="button">Copy</button>
           </div>
           <div class="cmd" id="cmd-mac" role="tabpanel" aria-labelledby="tab-mac" data-only="mac" hidden>
@@ -347,8 +347,8 @@
         <div>
           <h3>Installer <span class="tag">recommended</span></h3>
           <p>Paste this in PowerShell (search for it in the Start menu). It puts RoGit in <code>%LOCALAPPDATA%\rogit\bin</code>, installs the plugin, and starts RoGit whenever you log in.</p>
-          <div class="cmd ps"><code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code><button class="copy" type="button">Copy</button></div>
-          <p class="small">For a specific version, run <code>$env:ROGIT_VERSION = "v0.3.0"</code> first.</p>
+          <div class="cmd ps"><code>irm https://__SITE__/install.ps1 | iex</code><button class="copy" type="button">Copy</button></div>
+          <p class="small">For a specific version, run <code>$env:ROGIT_VERSION = "v0.3.3"</code> first.</p>
         </div>
         <div>
           <h3>Update and uninstall</h3>
@@ -377,7 +377,7 @@
           <h3>Installer <span class="tag">recommended</span></h3>
           <p>Paste this in Terminal (in Applications → Utilities). It puts RoGit in <code>~/.rogit/bin</code>, installs the plugin, and starts RoGit whenever you log in.</p>
           <div class="cmd"><code>curl -fsSL https://__SITE__/install.sh | sh</code><button class="copy" type="button">Copy</button></div>
-          <p class="small">For a specific version, put <code>ROGIT_VERSION=v0.3.0</code> before <code>sh</code>.</p>
+          <p class="small">For a specific version, put <code>ROGIT_VERSION=v0.3.3</code> before <code>sh</code>.</p>
         </div>
         <div>
           <h3>Update and uninstall</h3>
@@ -432,10 +432,6 @@
         <details>
           <summary>Windows or my antivirus warns about RoGit</summary>
           <div><p>RoGit is new and not signed yet, so Windows treats it as an unknown program. It's open source, and GitHub builds every release from the code in <a href="https://github.com/__REPO__">its repository</a>. If Windows shows "Windows protected your PC", click <b>More info</b> and then <b>Run anyway</b>. If your antivirus removed it, you can report it as a false positive to your antivirus.</p></div>
-        </details>
-        <details>
-          <summary>Windows says running scripts is disabled</summary>
-          <div><p>Use the full install command, starting with <code>powershell -ExecutionPolicy Bypass</code>. It allows the installer for that one run and changes no settings.</p></div>
         </details>
         <details>
           <summary>How do I update?</summary>

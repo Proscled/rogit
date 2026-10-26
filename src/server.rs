@@ -158,16 +158,16 @@ pub fn serve(port: Option<u16>) -> Result<(), String> {
         match server.recv_timeout(Duration::from_millis(500)) {
             Ok(Some(request)) => {
                 handle(&mut games, request);
-                games.games.values_mut().for_each(|state| autosave(state, false));
+                games.games.values_mut().for_each(|state| autosave(state, Duration::from_secs(60)));
             }
-            Ok(None) => games.games.values_mut().for_each(|state| autosave(state, true)),
+            Ok(None) => games.games.values_mut().for_each(|state| autosave(state, Duration::from_secs(10))),
             Err(e) => return Err(format!("The server stopped: {e}")),
         }
     }
 }
 
 /// A RoGit already running on this computer: its port and version.
-fn running() -> Option<(u16, String)> {
+pub(crate) fn running() -> Option<(u16, String)> {
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_millis(500))).build().into();
     PORTS.into_iter().find_map(|port| {
         let text = agent.get(&format!("http://127.0.0.1:{port}/api/rogit")).call().ok()?.body_mut().read_to_string().ok()?;
@@ -193,11 +193,10 @@ fn latest() -> Option<String> {
     LATEST.lock().ok().and_then(|latest| latest.clone())
 }
 
-/// Writes each open branch's copy in memory to disk as its autosave. A big place takes a fifth of a second to write,
-/// so this waits until nothing else is going on (`idle`), at most every 10 seconds; during nonstop activity, it still
-/// writes at least once a minute.
-fn autosave(state: &mut State, idle: bool) {
-    let every = Duration::from_secs(if idle { 10 } else { 60 });
+/// Writes each open branch's copy in memory to disk as its autosave, when it's older than `every`. A big place takes a
+/// fifth of a second to write, so the server does this when nothing else is going on, at most every 10 seconds; during
+/// nonstop activity, at least once a minute.
+fn autosave(state: &mut State, every: Duration) {
     for (name, live) in state.live.iter_mut() {
         // Unsaved work from before waits to be restored; the autosave mustn't replace it.
         if !live.changed || live.saved.elapsed() < every || state.recovering.contains(name) {
@@ -218,6 +217,13 @@ fn handle(games: &mut Games, mut request: Request) {
     let _ = request.as_reader().read_to_string(&mut body);
     let url = request.url().to_owned();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
+    // Stopping, for an update or an uninstall: the autosaves are written first.
+    if path == "/api/quit" && *request.method() == Method::Post {
+        games.games.values_mut().for_each(|state| autosave(state, Duration::ZERO));
+        let _ = request.respond(Response::from_string("{\"quitting\":true}"));
+        println!("Stopping, as asked.");
+        std::process::exit(0);
+    }
     // The plugin says which game every request is about. A branch file from before branches said which game they're
     // from is found by its name.
     let file = decode(param(query, "file").unwrap_or(""));

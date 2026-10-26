@@ -12,7 +12,7 @@ account, API key or cloud.
 On Windows, in PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://proscled.github.io/rogit/install.ps1 | iex"
+irm https://proscled.github.io/rogit/install.ps1 | iex
 ```
 
 On macOS, in Terminal:
