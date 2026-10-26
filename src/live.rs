@@ -16,17 +16,26 @@ pub struct Live {
     refs: HashMap<Ref, String>,
     /// Whether every object got its ID. Without them, patches can't be placed and the plugin sends full copies.
     pub identified: bool,
-    /// When this copy was last written to disk (the autosave), and whether it changed since.
+    /// When this copy was last written to disk (the autosave; also as Unix seconds for the plugin), and whether it
+    /// changed since.
     pub saved: Instant,
+    pub saved_at: Option<u64>,
     pub changed: bool,
+    /// How many changes weren't committed at the last refresh of the changes.
+    pub uncommitted: usize,
+}
+
+/// A place as the bytes of an .rbxl file.
+pub fn to_bytes(dom: &WeakDom) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let services = dom.root().children().to_vec();
+    rbx_binary::to_writer(&mut bytes, dom, &services).map_err(|e| e.to_string())?;
+    Ok(bytes)
 }
 
 /// A copy of a place in memory, for commits and discards that change one.
 pub fn copy_of(dom: &WeakDom) -> Result<WeakDom, String> {
-    let mut bytes = Vec::new();
-    let services = dom.root().children().to_vec();
-    rbx_binary::to_writer(&mut bytes, dom, &services).map_err(|e| e.to_string())?;
-    rbx_binary::from_reader(&bytes[..]).map_err(|e| e.to_string())
+    rbx_binary::from_reader(&to_bytes(dom)?[..]).map_err(|e| e.to_string())
 }
 
 /// Objects in the order the plugin walks them: each one, then its children in order (depth first).
@@ -46,7 +55,8 @@ impl Live {
     /// Takes a full copy. `manifest.services[].ids` lists "id|Class" for every object the plugin copied, in the order
     /// it walked them. Copies leave out a few runtime objects (TouchInterest), so entries without a match are skipped.
     pub fn new(dom: WeakDom, manifest: &Value) -> Live {
-        let mut live = Live { dom, ids: HashMap::new(), refs: HashMap::new(), identified: false, saved: Instant::now(), changed: false };
+        let mut live =
+            Live { dom, ids: HashMap::new(), refs: HashMap::new(), identified: false, saved: Instant::now(), saved_at: None, changed: false, uncommitted: 0 };
         live.identified = live.name_services(manifest).is_some();
         live
     }
@@ -196,9 +206,11 @@ impl Live {
         true
     }
 
-    /// A copy of this place, for commits and discards.
-    pub fn copy(&self) -> Result<WeakDom, String> {
-        copy_of(&self.dom)
+    /// A copy of this place, for commits, with its .rbxl bytes (the commit's file when everything is committed).
+    pub fn copy(&self) -> Result<(WeakDom, Vec<u8>), String> {
+        let bytes = to_bytes(&self.dom)?;
+        let dom = rbx_binary::from_reader(&bytes[..]).map_err(|e| e.to_string())?;
+        Ok((dom, bytes))
     }
 
     /// Objects with an ID; for checks.

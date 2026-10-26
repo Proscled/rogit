@@ -7,7 +7,7 @@ use crate::diff::{self, Change, IGNORED, Index, Row, Status, Tree};
 use crate::project::RojoPaths;
 use base64::Engine;
 use rbx_dom_weak::types::{Attributes, Ref, Variant};
-use rbx_dom_weak::{InstanceBuilder, WeakDom};
+use rbx_dom_weak::{InstanceBuilder, Ustr, WeakDom};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -101,13 +101,16 @@ pub struct Plan {
 struct Place<'a> {
     dom: &'a WeakDom,
     index: Index,
+    /// Each object's children by key, made the first time it's needed.
+    children: std::cell::OnceCell<HashMap<String, Vec<String>>>,
 }
 
 impl Place<'_> {
-    fn property(&self, key: &str, name: &str) -> Option<&Variant> {
+    /// Takes the property's `Ustr` name: making one from text takes a global lock, and merges look up millions.
+    fn property(&self, key: &str, name: &Ustr) -> Option<&Variant> {
         let entry = self.index.get(key)?;
         let inst = self.dom.get_by_ref(entry.referent)?;
-        inst.properties.get(&name.into())
+        inst.properties.get(name)
     }
 
     fn name(&self, key: &str) -> String {
@@ -124,17 +127,20 @@ impl Place<'_> {
 
     /// Keys of everything inside `key`, using the index's parent links.
     fn inside(&self, key: &str) -> Vec<String> {
-        let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
-        for entry in &self.index.entries {
-            if let Some(parent) = &entry.parent {
-                children.entry(parent.as_str()).or_default().push(entry.key.as_str());
+        let children = self.children.get_or_init(|| {
+            let mut children: HashMap<String, Vec<String>> = HashMap::new();
+            for entry in &self.index.entries {
+                if let Some(parent) = &entry.parent {
+                    children.entry(parent.clone()).or_default().push(entry.key.clone());
+                }
             }
-        }
+            children
+        });
         let mut out = Vec::new();
         let mut stack = vec![key];
         while let Some(k) = stack.pop() {
             for child in children.get(k).into_iter().flatten() {
-                out.push(child.to_string());
+                out.push(child.clone());
                 stack.push(child);
             }
         }
@@ -148,17 +154,18 @@ impl Place<'_> {
 }
 
 /// Properties compared for a merge: present on all three sides and not ignored.
-fn property_names(sides: [&Place; 3], key: &str) -> Vec<String> {
+fn property_names(sides: [&Place; 3], key: &str) -> Vec<Ustr> {
     let Some(entry) = sides[0].index.get(key) else { return vec![] };
     let inst = sides[0].dom.get_by_ref(entry.referent).unwrap();
-    let mut names: Vec<String> = inst
+    let others = [sides[1], sides[2]].map(|side| side.index.get(key).and_then(|e| side.dom.get_by_ref(e.referent)));
+    let mut names: Vec<Ustr> = inst
         .properties
         .keys()
-        .map(|k| k.to_string())
         .filter(|k| !IGNORED.contains(&k.as_str()))
-        .filter(|k| sides[1].property(key, k).is_some() && sides[2].property(key, k).is_some())
+        .filter(|k| others.iter().all(|other| other.is_some_and(|i| i.properties.contains_key(*k))))
+        .copied()
         .collect();
-    names.sort();
+    names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     names
 }
 
@@ -302,23 +309,26 @@ impl Builder<'_> {
     }
 
     /// Whether the source changed this object at all (properties, name or parent) since the base.
+    /// Most objects in a big place are untouched, so this looks each one up once and compares in place.
     fn source_changed(&self, key: &str) -> bool {
-        let parent = |place: &Place| place.index.get(key).and_then(|e| e.parent.clone());
-        if self.base.name(key) != self.source.name(key) || parent(&self.base) != parent(&self.source) {
+        let (Some(before), Some(after)) = (self.base.index.get(key), self.source.index.get(key)) else { return true };
+        let (Some(old), Some(new)) = (self.base.dom.get_by_ref(before.referent), self.source.dom.get_by_ref(after.referent)) else { return true };
+        if before.parent != after.parent || old.name != new.name {
             return true;
         }
-        property_names([&self.base, &self.source, &self.source], key).iter().any(|n| match (self.base.property(key, n), self.source.property(key, n)) {
-            (Some(a), Some(b)) => !diff::same(a, b, (&self.base.index, &self.source.index)),
-            _ => false,
+        let refs = (&self.base.index, &self.source.index);
+        old.properties.iter().any(|(name, a)| {
+            !IGNORED.contains(&name.as_str()) && new.properties.get(name).is_some_and(|b| !diff::same(a, b, refs))
         })
     }
 
     /// An object that exists in the base and in the source.
     fn changed(&mut self, key: &str) {
+        // Nothing to bring over (and if the target removed it, it stays removed).
+        if !self.source_changed(key) {
+            return;
+        }
         let Some(target) = self.target_key(key) else {
-            if !self.source_changed(key) {
-                return; // The target removed it and the source didn't touch it: it stays removed.
-            }
             // The target removed what the source changed: put the source's version back only if asked.
             let Some(parent) = self.source.index.get(key).and_then(|e| e.parent.clone()).and_then(|p| self.target_key(&p)) else {
                 return;
@@ -338,11 +348,12 @@ impl Builder<'_> {
         let mut clean = Vec::new();
         let mut refs = Map::new();
         let mut settings = Map::new();
-        for name in property_names([&self.base, &self.source, &self.target], key) {
+        for property in property_names([&self.base, &self.source, &self.target], key) {
+            let name = &property;
             // Work out the change with borrowed values; only owned results leave this block.
             let (label, mut change, target_changed, encoded, ref_target) = {
                 let (Some(base), Some(theirs), Some(ours)) =
-                    (self.base.property(key, &name), self.source.property(key, &name), self.target.property(key, &name))
+                    (self.base.property(key, name), self.source.property(key, name), self.target.property(key, name))
                 else {
                     continue;
                 };
@@ -358,11 +369,11 @@ impl Builder<'_> {
                     continue;
                 }
                 let rotated = diff::rotation_differs(ours, theirs);
-                let label = diff::label(&name, rotated);
+                let label = diff::label(name.as_str(), rotated);
                 let change = Change::values(
                     label.clone(),
-                    diff::show(ours, &class, &name, &self.target.index, rotated),
-                    diff::show(theirs, &class, &name, &self.source.index, rotated),
+                    diff::show(ours, &class, name.as_str(), &self.target.index, rotated),
+                    diff::show(theirs, &class, name.as_str(), &self.source.index, rotated),
                 );
                 let ref_target = matches!(theirs, Variant::Ref(_)).then(|| self.ref_target(theirs));
                 (label, change, target_changed, encoded, ref_target)
@@ -371,22 +382,22 @@ impl Builder<'_> {
                 let id = self.conflict(key, format!("{label} was changed on both sides."));
                 change.conflict = Some(id);
                 if let Some(value) = encoded {
-                    let values = Map::from_iter([(name.clone(), value)]);
+                    let values = Map::from_iter([(name.to_string(), value)]);
                     self.operations.push(Op::Settings { service: self.target.name(key), values, conflict: Some(id) });
                 } else {
                     let template = self.template(key);
                     let (properties, refs) = match ref_target {
-                        Some(target) => (vec![], Map::from_iter([(name.clone(), target)])),
-                        None => (vec![name.clone()], Map::new()),
+                        Some(target) => (vec![], Map::from_iter([(name.to_string(), target)])),
+                        None => (vec![name.to_string()], Map::new()),
                     };
                     self.operations.push(Op::Set { target: target.clone(), properties, template, refs, conflict: Some(id) });
                 }
             } else if let Some(value) = encoded {
-                settings.insert(name.clone(), value);
+                settings.insert(name.to_string(), value);
             } else if let Some(target) = ref_target {
-                refs.insert(name.clone(), target);
+                refs.insert(name.to_string(), target);
             } else {
-                clean.push(name.clone());
+                clean.push(name.to_string());
             }
             rows.push(change);
         }
@@ -500,15 +511,18 @@ fn workspace_attribute(dom: &WeakDom, name: &str) -> Option<String> {
 /// Plans bringing what `source` changed since `base` into `target`: the branch into main for a merge, main into the
 /// branch for an update.
 pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, rojo: &RojoPaths, direction: Direction) -> Result<Plan, String> {
-    let base_index = diff::index(base, rojo);
-    let mut source_index = diff::index(source, rojo);
+    // The three places are indexed at the same time; on a big game each takes about a tenth of a second.
+    let (base_index, mut source_index, mut target_index) = std::thread::scope(|scope| {
+        let source = scope.spawn(|| diff::index(source, rojo));
+        let target = scope.spawn(|| diff::index(target, rojo));
+        (diff::index(base, rojo), source.join().unwrap(), target.join().unwrap())
+    });
     diff::adopt_new_ids(base, &base_index, source, &mut source_index);
-    let mut target_index = diff::index(target, rojo);
     diff::adopt_new_ids(base, &base_index, target, &mut target_index);
     let mut b = Builder {
-        base: Place { dom: base, index: base_index },
-        source: Place { dom: source, index: source_index },
-        target: Place { dom: target, index: target_index },
+        base: Place { dom: base, index: base_index, children: Default::default() },
+        source: Place { dom: source, index: source_index, children: Default::default() },
+        target: Place { dom: target, index: target_index, children: Default::default() },
         direction,
         bundle: WeakDom::new(InstanceBuilder::new("Folder")),
         templates: 0,

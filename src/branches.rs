@@ -309,11 +309,14 @@ impl Branches {
         fs::read(self.commits_file(name)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
     }
 
-    /// Keeps a commit: the branch as committed.
-    pub fn add_commit(&self, name: &str, dom: &rbx_dom_weak::WeakDom, commit: &Commit) -> Result<(), String> {
+    /// Keeps a commit: the branch as committed, as a place in memory or already as an .rbxl file's `bytes`.
+    pub fn add_commit(&self, name: &str, dom: &rbx_dom_weak::WeakDom, bytes: Option<&[u8]>, commit: &Commit) -> Result<(), String> {
         let target = self.commit_dir(name, &commit.id).with_extension("rbxl");
         fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
-        place::write(dom, &target)?;
+        match bytes {
+            Some(bytes) => fs::write(&target, bytes).map_err(|e| format!("Couldn't write {}: {e}", target.display()))?,
+            None => place::write(dom, &target)?,
+        }
         let mut commits = self.commits(name);
         commits.insert(0, commit.clone());
         fs::write(self.commits_file(name), serde_json::to_vec_pretty(&commits).unwrap()).map_err(|e| e.to_string())

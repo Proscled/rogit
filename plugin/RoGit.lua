@@ -2510,11 +2510,58 @@ local function startWatching()
 		end
 		noteEdit()
 	end
+	-- Whether a new object is one Init would give an ID: saved, not a camera, and not inside something Rojo syncs or
+	-- something that isn't saved.
+	local rojoSet: { [string]: boolean } = {}
+	local rojoSource = nil
+	local function trackable(object: Instance): boolean
+		local rojo = state.rojo
+		if rojo == nil or rojo.all or object:IsA("Camera") then
+			return false
+		end
+		if rojoSource ~= rojo then
+			rojoSource, rojoSet = rojo, {}
+			for _, path in rojo.paths do
+				rojoSet[path] = true
+			end
+		end
+		local names = {}
+		local current = object
+		while not trackedSet[current] do
+			if not current.Archivable or current.Parent == nil then
+				return false
+			end
+			table.insert(names, current.Name)
+			current = current.Parent :: Instance
+		end
+		local path = current.Name
+		if rojoSet[path] then
+			return false
+		end
+		for i = #names, 1, -1 do
+			path ..= "/" .. names[i]
+			if rojoSet[path] then
+				return false
+			end
+		end
+		return true
+	end
+
 	-- A newly added object keeps its RoGit ID unless another object has it (a Ctrl+D copy, a paste); then it gets its
-	-- own. This runs while Studio is still making the copy, so it's part of the same undo step.
+	-- own. Something new gets one too, so RoGit can follow it if it's renamed or moved before it's merged. This runs
+	-- while Studio is still adding the object, so it's part of the same undo step.
 	local function claimId(object: Instance)
+		if not idOwners then
+			return
+		end
 		local id = object:GetAttribute(TAG)
-		if not idOwners or type(id) ~= "string" then
+		if type(id) ~= "string" then
+			if trackable(object) then
+				local fresh = newId(10)
+				if pcall(object.SetAttribute, object, TAG, fresh) then
+					idOwners[fresh] = object
+				end
+			end
 			return
 		end
 		local owner = idOwners[id]

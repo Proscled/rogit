@@ -606,6 +606,18 @@ pub(crate) fn adopt_new_ids(start: &WeakDom, old: &Index, current: &WeakDom, new
     }
 }
 
+/// `f` applied to every item, in order, spread over the processor's cores. Comparing every object in a big place is
+/// most of the work behind each refresh of the changes.
+pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let size = items.len().div_ceil(threads).max(2048);
+    let f = &f;
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = items.chunks(size).map(|part| scope.spawn(move || part.iter().map(f).collect::<Vec<R>>())).collect();
+        parts.into_iter().flat_map(|part| part.join().unwrap()).collect()
+    })
+}
+
 /// Everything that changed between the starting point and the branch now.
 pub fn compare(start: &WeakDom, current: &WeakDom, rojo: &RojoPaths) -> Review {
     compare_with(start, &index(start, rojo), current, rojo)
@@ -632,7 +644,11 @@ pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom, rojo
         }
         found
     };
-    for entry in &new.entries {
+    let compared = par_map(&new.entries, |entry| match added.contains(entry.key.as_str()) {
+        true => vec![],
+        false => changes((start, old, old.get(&entry.key).unwrap().referent), (current, &new, entry.referent)),
+    });
+    for (entry, mut list) in new.entries.iter().zip(compared) {
         if added.contains(entry.key.as_str()) {
             if let Some(owner) = top(&new, &added, &entry.key) {
                 *inside.entry(owner).or_default() += 1;
@@ -640,7 +656,6 @@ pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom, rojo
             continue;
         }
         let before = old.get(&entry.key).unwrap();
-        let mut list = changes((start, &old, before.referent), (current, &new, entry.referent));
         if before.parent != entry.parent {
             let path = |index: &Index, key: &Option<String>| key.as_ref().and_then(|k| index.get(k)).map(|e| e.path.clone()).unwrap_or_default();
             list.insert(0, Change::new("Parent", path(&old, &before.parent), path(&new, &entry.parent)));
@@ -882,5 +897,35 @@ mod bench {
             "{} objects tracked: read both {:?}, index one {:?}, compare {:?} ({} rows)",
             index_only, read, indexed, started.elapsed(), review.rows.len()
         );
+        let rojo = RojoPaths::default();
+        let old = index(&start, &rojo);
+        let t = std::time::Instant::now();
+        let mut new = index(&current, &rojo);
+        let index_time = t.elapsed();
+        let t = std::time::Instant::now();
+        adopt_new_ids(&start, &old, &current, &mut new);
+        let adopt_time = t.elapsed();
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for e in &new.entries {
+            if let Some(b) = old.get(&e.key) {
+                n += changes((&start, &old, b.referent), (&current, &new, e.referent)).len();
+            }
+        }
+        println!("PHASES index {index_time:?}, adopt {adopt_time:?}, property compare {:?} ({n} changes)", t.elapsed());
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            compare_with(&start, &old, &current, &rojo);
+            println!("PHASES compare_with (each refresh) {:?}", t.elapsed());
+        }
+        let t = std::time::Instant::now();
+        crate::place::write(&current, &std::env::temp_dir().join("rogit-bench-write.rbxl")).unwrap();
+        let write_time = t.elapsed();
+        let t = std::time::Instant::now();
+        let copy = crate::live::copy_of(&current).unwrap();
+        let copy_time = t.elapsed();
+        let t = std::time::Instant::now();
+        let plan = crate::merge::plan(&start, &current, &copy, &rojo, crate::merge::Direction::Merge).unwrap();
+        println!("PHASES write {write_time:?}, copy {copy_time:?}, merge plan {:?} ({} ops)", t.elapsed(), plan.operations.len());
     }
 }

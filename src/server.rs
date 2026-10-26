@@ -47,6 +47,18 @@ struct State {
     recovering: HashSet<String>,
 }
 
+impl State {
+    fn new(project: Project) -> State {
+        let branches = Branches::new(project.root.join(DATA_DIR));
+        let history = History::new(project.root.join(DATA_DIR));
+        State {
+            project, branches, history, roblox: Roblox::new(), seen_places: HashSet::new(), planned: HashMap::new(),
+            updates: HashMap::new(), restores: HashMap::new(), sessions: HashMap::new(), unsaved: HashMap::new(),
+            committed: HashMap::new(), live: HashMap::new(), recovering: HashSet::new(),
+        }
+    }
+}
+
 /// A branch's last commit (or where it last met main), indexed once.
 struct Committed {
     /// The commit's ID, or the base it stands for.
@@ -89,23 +101,42 @@ pub fn serve(project: Project, port: Option<u16>) -> Result<(), String> {
         });
     };
     let address = format!("127.0.0.1:{port}");
-    let branches = Branches::new(project.root.join(DATA_DIR));
-    let history = History::new(project.root.join(DATA_DIR));
-    let mut state = State {
-        project, branches, history, roblox: Roblox::new(), seen_places: HashSet::new(), planned: HashMap::new(),
-        updates: HashMap::new(), restores: HashMap::new(), sessions: HashMap::new(), unsaved: HashMap::new(),
-        committed: HashMap::new(), live: HashMap::new(), recovering: HashSet::new(),
-    };
+    let mut state = State::new(project);
     println!("RoGit {} is serving {} on http://{address}", env!("CARGO_PKG_VERSION"), state.project.folder_name());
     match state.project.config() {
         Ok(Some(config)) => println!("Project: {} (main place {})", config.game.name, config.game.main_place_id),
         Ok(None) => println!("Not set up yet. Open your game's start place in Studio and click Init in the RoGit panel."),
         Err(e) => println!("Warning: {e}"),
     }
-    for request in server.incoming_requests() {
-        handle(&mut state, request);
+    loop {
+        match server.recv_timeout(Duration::from_millis(500)) {
+            Ok(Some(request)) => {
+                handle(&mut state, request);
+                autosave(&mut state, false);
+            }
+            Ok(None) => autosave(&mut state, true),
+            Err(e) => return Err(format!("The server stopped: {e}")),
+        }
     }
-    Ok(())
+}
+
+/// Writes each open branch's copy in memory to disk as its autosave. A big place takes a fifth of a second to write,
+/// so this waits until nothing else is going on (`idle`), at most every 10 seconds; during nonstop activity, it still
+/// writes at least once a minute.
+fn autosave(state: &mut State, idle: bool) {
+    let every = Duration::from_secs(if idle { 10 } else { 60 });
+    for (name, live) in state.live.iter_mut() {
+        // Unsaved work from before waits to be restored; the autosave mustn't replace it.
+        if !live.changed || live.saved.elapsed() < every || state.recovering.contains(name) {
+            continue;
+        }
+        live.saved = Instant::now();
+        live.changed = false;
+        match state.branches.save_latest(name, &live.dom) {
+            Ok(()) => live.saved_at = Some(unix_now()),
+            Err(e) => println!("Couldn't autosave {name}: {e}"),
+        }
+    }
 }
 
 fn handle(state: &mut State, mut request: Request) {
@@ -114,7 +145,23 @@ fn handle(state: &mut State, mut request: Request) {
     let _ = request.as_reader().read_to_string(&mut body);
     let url = request.url().to_owned();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
-    let result = match (request.method(), path) {
+    let result = route(state, request.method(), path, query, &body);
+    let (code, value) = match result {
+        Ok(value) => (200, value),
+        Err((code, message)) => (code, json!({ "error": message })),
+    };
+    // ROGIT_TRACE=1 prints every request with its size and time, for finding slow spots.
+    if std::env::var_os("ROGIT_TRACE").is_some() {
+        let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        eprintln!("{}.{:03} {path} {} KB {} ms", since.as_secs() % 100, since.subsec_millis(), body.len() / 1024, started.elapsed().as_millis());
+    }
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let _ = request.respond(Response::from_string(value.to_string()).with_status_code(code).with_header(header));
+}
+
+/// Answers one request from the plugin.
+fn route(state: &mut State, method: &Method, path: &str, query: &str, body: &str) -> Reply {
+    match (method, path) {
         (Method::Get, "/api/rogit") => Ok(status(state, query)),
         (Method::Get, "/api/place") => place(state, query),
         (Method::Post, "/api/init") => init(state, &body),
@@ -144,18 +191,7 @@ fn handle(state: &mut State, mut request: Request) {
         (Method::Post, "/api/branches/restored") => restored(state, &body),
         (Method::Post, "/api/branches/unsaved/dismiss") => dismiss_unsaved(state, &body),
         _ => Err((404, "Not found.".to_owned())),
-    };
-    let (code, value) = match result {
-        Ok(value) => (200, value),
-        Err((code, message)) => (code, json!({ "error": message })),
-    };
-    // ROGIT_TRACE=1 prints every request with its size and time, for finding slow spots.
-    if std::env::var_os("ROGIT_TRACE").is_some() {
-        let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-        eprintln!("{}.{:03} {path} {} KB {} ms", since.as_secs() % 100, since.subsec_millis(), body.len() / 1024, started.elapsed().as_millis());
     }
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-    let _ = request.respond(Response::from_string(value.to_string()).with_status_code(code).with_header(header));
 }
 
 fn param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
@@ -193,11 +229,117 @@ fn decode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use rbx_dom_weak::types::{Ref, Variant};
+
     #[test]
     fn decodes_studio_url_encoding() {
         assert_eq!(super::decode("test%2D1%2Erbxl"), "test-1.rbxl");
         assert_eq!(super::decode("a+b%20c%"), "a b c%");
         assert_eq!(super::decode("%zz%E2%9C%93"), "%zz✓");
+    }
+
+    /// Plays the plugin's part on a big place (ROGIT_BENCH_PLACE, a .rbxl): a branch's full copy, an edit sent as a
+    /// patch, an empty patch, a commit and a merge, printing how long rogit serve takes for each.
+    /// `ROGIT_BENCH_PLACE=… cargo test --release replays_the_plugin -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn replays_the_plugin_on_a_big_place() {
+        let Ok(path) = std::env::var("ROGIT_BENCH_PLACE") else { return };
+        let place = crate::place::read(std::path::Path::new(&path)).unwrap();
+        let root = std::env::temp_dir().join(format!("rogit-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("rogit.toml"), "[game]\nname = \"Bench\"\nuniverse_id = 1\nmain_place_id = 2\n").unwrap();
+        let mut state = State::new(Project::new(root.clone()));
+
+        // Studio's session IDs, made up: one per object, listed in the plugin's walk order.
+        let mut ids: HashMap<Ref, String> = HashMap::new();
+        let walk = |dom: &WeakDom, top: Ref| {
+            let mut out = Vec::new();
+            let mut stack = vec![top];
+            while let Some(r) = stack.pop() {
+                out.push(r);
+                stack.extend(dom.get_by_ref(r).unwrap().children().iter().rev().copied());
+            }
+            out
+        };
+        for r in place.descendants().map(|i| i.referent()).collect::<Vec<_>>() {
+            let n = ids.len();
+            ids.insert(r, format!("d{n}"));
+        }
+        let listed = |dom: &WeakDom, top: Ref, ids: &HashMap<Ref, String>| -> Vec<String> {
+            walk(dom, top).into_iter().map(|r| format!("{}|{}", ids[&r], dom.get_by_ref(r).unwrap().class)).collect()
+        };
+        // A full copy of `dom` uploaded the way the plugin does: one file per service, and a manifest.
+        let upload = |state: &State, capture: &str| -> Value {
+            let dir = state.branches.upload_dir(capture);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut services = Vec::new();
+            for &service in place.root().children() {
+                let inst = place.get_by_ref(service).unwrap();
+                let file = std::fs::File::create(dir.join(format!("{}.rbxm", inst.name))).unwrap();
+                rbx_binary::to_writer(file, &place, inst.children()).unwrap();
+                let listed: Vec<String> = inst.children().iter().flat_map(|&c| listed(&place, c, &ids)).collect();
+                services.push(json!({ "name": inst.name, "className": inst.class.as_str(), "settings": {}, "attributes": {}, "ids": listed }));
+            }
+            json!({ "services": services })
+        };
+        let timed = |state: &mut State, what: &str, path: &str, body: Value| -> Value {
+            let started = Instant::now();
+            let reply = route(state, &Method::Post, path, "", &body.to_string()).unwrap_or_else(|(code, e)| panic!("{what}: {code} {e}"));
+            println!("REPLAY {what}: {} ms", started.elapsed().as_millis());
+            reply
+        };
+
+        // New branch (made directly: the request would open it in Studio), then its window's first full copy.
+        let manifest = upload(&state, "benchmain1");
+        state.branches.create("bench", "benchmain1", &manifest).unwrap();
+        let manifest = upload(&state, "benchstart1");
+        timed(&mut state, "starting point", "/api/branches/start", json!({ "name": "bench", "capture": "benchstart1", "manifest": manifest }));
+        let manifest = upload(&state, "benchcopy1");
+        let reply = timed(&mut state, "full copy", "/api/branches/changes", json!({ "name": "bench", "capture": "benchcopy1", "manifest": manifest, "session": "s" }));
+        assert_eq!(reply["live"], json!(true));
+
+        // Move the biggest model in Workspace with fewer than 3,000 objects by 20 studs, as one patch.
+        let workspace = place.root().children().iter().copied().find(|&r| place.get_by_ref(r).unwrap().class.as_str() == "Workspace").unwrap();
+        let model = place
+            .get_by_ref(workspace)
+            .unwrap()
+            .children()
+            .iter()
+            .copied()
+            .filter(|&r| place.get_by_ref(r).unwrap().class.as_str() == "Model")
+            .max_by_key(|&r| place.descendants_of(r).count().min(3000) as i64 - (place.descendants_of(r).count() >= 3000) as i64 * 10_000)
+            .unwrap();
+        let mut data = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("Folder"));
+        let copy = place.clone_into_external(model, &mut data);
+        // A move, as Studio makes one: each part's CFrame and the model's pivot shift; offsets inside stay.
+        for r in walk(&data, copy) {
+            for (name, value) in data.get_by_ref_mut(r).unwrap().properties.iter_mut() {
+                match (name.as_str(), value) {
+                    ("CFrame", Variant::CFrame(c)) => c.position.x += 20.0,
+                    ("WorldPivotData", Variant::OptionalCFrame(Some(c))) => c.position.x += 20.0,
+                    _ => {}
+                }
+            }
+        }
+        let patch_dir = state.branches.upload_dir("benchpatch1");
+        std::fs::create_dir_all(&patch_dir).unwrap();
+        rbx_binary::to_writer(std::fs::File::create(patch_dir.join("Patch.rbxm")).unwrap(), &data, &[copy]).unwrap();
+        let upsert = json!({ "id": ids[&model], "parent": "service:Workspace", "ids": listed(&place, model, &ids) });
+        let objects = place.descendants_of(model).count() + 1;
+        let reply = timed(&mut state, &format!("patch moving a model with {objects} objects"), "/api/branches/patch", json!({
+            "name": "bench", "capture": "benchpatch1", "upserts": [upsert], "removes": [], "services": [], "refs": [],
+        }));
+        assert_ne!(reply["full"], json!(true), "the patch should apply");
+        let rows = reply["changes"]["rows"].as_array().unwrap().iter().filter(|r| r["status"] != json!("context")).count();
+        println!("REPLAY changes listed: {rows}");
+        timed(&mut state, "empty patch", "/api/branches/patch", json!({ "name": "bench", "upserts": [], "removes": [], "services": [], "refs": [] }));
+        timed(&mut state, "commit", "/api/branches/commit", json!({ "name": "bench", "message": "Move", "live": true }));
+        let manifest = upload(&state, "benchmain2");
+        let reply = timed(&mut state, "merge plan", "/api/branches/merge", json!({ "name": "bench", "capture": "benchmain2", "manifest": manifest }));
+        println!("REPLAY merge summary: {}", reply["plan"]["summary"]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 
@@ -389,10 +531,22 @@ fn existing(state: &State, name: &str) -> Result<(), (u16, String)> {
 
 /// Puts an uploaded copy back together in memory and removes the upload.
 fn take_upload(state: &State, capture: &str, manifest: &Value) -> Result<WeakDom, (u16, String)> {
-    let upload = state.branches.upload_dir(capture);
+    assemble_upload(&state.branches, capture, manifest)
+}
+
+fn assemble_upload(branches: &Branches, capture: &str, manifest: &Value) -> Result<WeakDom, (u16, String)> {
+    let upload = branches.upload_dir(capture);
     let place = crate::place::assemble(&upload, manifest);
     let _ = std::fs::remove_dir_all(&upload);
     place.map(|(dom, _)| dom).map_err(|e| (500, e))
+}
+
+/// With ROGIT_TRACE set, prints how long a step of a request took, and starts timing the next one.
+fn step(name: &str, since: &mut Instant) {
+    if std::env::var_os("ROGIT_TRACE").is_some() {
+        eprintln!("  {name}: {} ms", since.elapsed().as_millis());
+    }
+    *since = Instant::now();
 }
 
 fn unix_now() -> u64 {
@@ -403,27 +557,39 @@ fn unix_now() -> u64 {
 fn plan_merge(state: &mut State, body: &str) -> Reply {
     require_game(state)?;
     let started = Instant::now();
+    let mut timer = Instant::now();
     let (name, capture, manifest) = capture_request(body)?;
     existing(state, &name)?;
-    let main = take_upload(state, &capture, &manifest)?;
-    // Like git, a merge takes the branch's last commit; without commits, its newest copy.
+    // Like git, a merge takes the branch's last commit; without commits, its newest copy. It's read while main's copy
+    // is put together: in a big game each takes a moment.
     let commits = state.branches.commits(&name);
-    let (branch, source, time) = match commits.first() {
-        Some(last) => (state.branches.commit_place(&name, &last.id).map_err(|e| (500, e))?, "commit", last.time),
-        None => state.branches.newest(&name).map_err(|e| (500, e))?,
-    };
-    let uncommitted = match commits.first() {
-        Some(_) => match state.branches.newest(&name) {
+    let branches = &state.branches;
+    let (main, branch) = std::thread::scope(|scope| {
+        let main = scope.spawn(|| assemble_upload(branches, &capture, &manifest));
+        let branch = match commits.first() {
+            Some(last) => branches.commit_place(&name, &last.id).map(|dom| (dom, "commit", last.time)),
+            None => branches.newest(&name),
+        };
+        (main.join().unwrap(), branch)
+    });
+    let (main, (branch, source, time)) = (main?, branch.map_err(|e| (500, e))?);
+    step("main's copy and the branch", &mut timer);
+    // The branch's changes since its last commit, as its window last showed them.
+    let uncommitted = match (commits.first(), state.live.get(&name)) {
+        (None, _) => 0,
+        (Some(_), Some(live)) => live.uncommitted,
+        (Some(_), None) => match state.branches.newest(&name) {
             Ok((newest, _, _)) => diff::compare(&branch, &newest, &state.project.rojo_paths()).rows.iter().filter(|r| r.status != diff::Status::Context).count(),
             Err(_) => 0,
         },
-        None => 0,
     };
     let (base, since, since_time) = state
         .branches
         .base(&name, merge::last_merge(&main, &name).as_deref(), merge::last_update(&branch).as_deref())
         .map_err(|e| (409, e))?;
+    step("uncommitted count and base", &mut timer);
     let plan = merge::plan(&base, &branch, &main, &state.project.rojo_paths(), Direction::Merge).map_err(|e| (500, e))?;
+    step("plan", &mut timer);
     let s = &plan.summary;
     println!(
         "Planned merging {name} ({source} branch, since {}): {} added, {} removed, {} changed, {} conflicts ({} ms)",
@@ -664,6 +830,11 @@ fn uncommitted(state: &State, name: &str, current: &WeakDom) -> diff::Review {
     diff::compare_with(&base.dom, &base.index, current, &state.project.rojo_paths())
 }
 
+/// How many changes a review lists (not counting the rows that only show where they are).
+fn count(review: &diff::Review) -> usize {
+    review.rows.iter().filter(|r| r.status != diff::Status::Context).count()
+}
+
 /// The staged keys that are still among the changes.
 fn staged_now(state: &State, name: &str, review: &diff::Review) -> Vec<String> {
     let keys: HashSet<&str> = review.rows.iter().filter(|r| r.status != diff::Status::Context).map(|r| r.key.as_str()).collect();
@@ -694,9 +865,11 @@ fn changes(state: &mut State, body: &str) -> Reply {
         state.branches.keep_latest(&name, &capture, &manifest).map_err(|e| (500, e))?
     };
     load_committed(state, &name, merge::last_update(&dom))?;
-    let live = Live::new(dom, &manifest);
+    let mut live = Live::new(dom, &manifest);
+    live.saved_at = Some(unix_now());
     let identified = live.identified;
     let review = uncommitted(state, &name, &live.dom);
+    live.uncommitted = count(&review);
     state.live.insert(name.clone(), live);
     let mut reply = changes_reply(state, &name, review, Some(unix_now()));
     reply["live"] = json!(identified);
@@ -706,6 +879,7 @@ fn changes(state: &mut State, body: &str) -> Reply {
 /// Just what changed in Studio since the last copy (see `Live::patch`); the changed objects are uploaded under
 /// `capture` as `Patch`. Replies like `changes`, or with `full: true` when the plugin should send a full copy.
 fn patch(state: &mut State, body: &str) -> Reply {
+    let mut timer = Instant::now();
     let request = json_body(body)?;
     let name = request["name"].as_str().unwrap_or_default().to_owned();
     existing(state, &name)?;
@@ -728,23 +902,18 @@ fn patch(state: &mut State, body: &str) -> Reply {
         state.live.remove(&name);
         return Ok(json!({ "full": true }));
     }
-    // The copy in memory is also the autosave; it's written out every few seconds, unless unsaved work from before is
-    // waiting to be restored (saving the branch also ends that wait).
+    step("patch", &mut timer);
+    // The copy in memory is also the autosave (see `autosave`). Saving the branch ends any wait to restore unsaved
+    // work from before.
+    let saved = live.saved_at;
     if state.recovering.contains(&name) && state.branches.unsaved_copy(&name).is_none() {
         state.recovering.remove(&name);
-    }
-    let mut saved = None;
-    if live.changed && live.saved.elapsed() > Duration::from_secs(10) && !state.recovering.contains(&name) {
-        live.saved = Instant::now();
-        live.changed = false;
-        match state.branches.save_latest(&name, &live.dom) {
-            Ok(()) => saved = Some(unix_now()),
-            Err(e) => println!("Couldn't autosave {name}: {e}"),
-        }
     }
     let record = merge::last_update(&state.live[&name].dom);
     load_committed(state, &name, record)?;
     let review = uncommitted(state, &name, &state.live[&name].dom);
+    step("compare", &mut timer);
+    state.live.get_mut(&name).unwrap().uncommitted = count(&review);
     Ok(changes_reply(state, &name, review, saved))
 }
 
@@ -757,35 +926,35 @@ fn stage(state: &mut State, body: &str) -> Reply {
     Ok(json!({ "staged": keys }))
 }
 
-/// The branch as it is in Studio, for a commit or a discard: the copy kept in memory (`live: true`), or a full copy
-/// uploaded under `capture`. Returns an owned copy, or None when there's no copy in memory (then the plugin sends one).
-fn current_copy(state: &State, body: &str, request: &Value, name: &str) -> Result<Option<WeakDom>, (u16, String)> {
+/// The branch as it is in Studio, for a commit or a restore: a copy of the one kept in memory (`live: true`, with its
+/// .rbxl bytes), or a full copy uploaded under `capture`. None when there's no copy in memory (the plugin sends one).
+fn current_copy(state: &State, body: &str, request: &Value, name: &str) -> Result<Option<(WeakDom, Option<Vec<u8>>)>, (u16, String)> {
     if request["live"].as_bool().unwrap_or(false) {
         return match state.live.get(name) {
-            Some(live) => live.copy().map(Some).map_err(|e| (500, e)),
+            Some(live) => live.copy().map(|(dom, bytes)| Some((dom, Some(bytes)))).map_err(|e| (500, e)),
             None => Ok(None),
         };
     }
     let (_, capture, manifest) = capture_request(body)?;
-    let upload = state.branches.upload_dir(&capture);
-    let dom = crate::place::assemble(&upload, &manifest);
-    let _ = std::fs::remove_dir_all(&upload);
-    dom.map(|(dom, _)| Some(dom)).map_err(|e| (500, e))
+    assemble_upload(&state.branches, &capture, &manifest).map(|dom| Some((dom, None)))
 }
 
 /// Commits the branch as it is in Studio, like `git commit`: only the staged changes when some are staged, otherwise
 /// all of them. `auto` commits everything (after a pull or a revert).
 fn commit(state: &mut State, body: &str) -> Reply {
     let started = Instant::now();
+    let mut timer = Instant::now();
     let request = json_body(body)?;
     let name = request["name"].as_str().unwrap_or_default().to_owned();
     existing(state, &name)?;
     let message = request["message"].as_str().unwrap_or("").trim().chars().take(100).collect::<String>();
     let auto = request["auto"].as_bool().unwrap_or(false);
-    let Some(current) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
+    let Some((current, bytes)) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
+    step("copy", &mut timer);
     load_committed(state, &name, merge::last_update(&current))?;
     let rojo = state.project.rojo_paths();
     let all = uncommitted(state, &name, &current);
+    step("compare", &mut timer);
     let staged: HashSet<String> = if auto { HashSet::new() } else { staged_now(state, &name, &all).into_iter().collect() };
     let (snapshot, summary, left) = if staged.is_empty() {
         let summary = all.summary.clone();
@@ -802,12 +971,25 @@ fn commit(state: &mut State, body: &str) -> Reply {
     if summary == diff::Summary::default() {
         return Err((409, "Nothing to commit.".to_owned()));
     }
-    let count = state.branches.commits(&name).len();
-    let message = if message.is_empty() { format!("Commit {}", count + 1) } else { message };
+    let number = state.branches.commits(&name).len() + 1;
+    let message = if message.is_empty() { format!("Commit {number}") } else { message };
     let id = format!("c{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
     let commit = Commit { id, message, time: unix_now(), summary, auto };
-    state.branches.add_commit(&name, &snapshot, &commit).map_err(|e| (500, e))?;
+    // Written while the commit is indexed (it's what changes are measured from next). When everything is committed,
+    // the copy's bytes are the file.
+    let bytes = bytes.filter(|_| staged.is_empty());
+    let branches = &state.branches;
+    let index = std::thread::scope(|scope| {
+        let written = scope.spawn(|| branches.add_commit(&name, &snapshot, bytes.as_deref(), &commit));
+        let index = diff::index(&snapshot, &rojo);
+        written.join().unwrap().map(|()| index)
+    })
+    .map_err(|e| (500, e))?;
     state.branches.set_staged(&name, &[]).map_err(|e| (500, e))?;
+    step("write and index", &mut timer);
+    if let Some(live) = state.live.get_mut(&name) {
+        live.uncommitted = count(&left);
+    }
     if !auto {
         let event = Event {
             id: commit.id.clone(), kind: "commit".into(), branch: name.clone(), time: commit.time,
@@ -817,7 +999,6 @@ fn commit(state: &mut State, body: &str) -> Reply {
     }
     // The new commit is what changes are measured from now; keep it in memory instead of reading it back.
     let since = json!({ "kind": "commit", "message": commit.message, "time": commit.time });
-    let index = diff::index(&snapshot, &rojo);
     state.committed.insert(name.clone(), Committed { which: commit.id.clone(), dom: snapshot, index, since: since.clone() });
     println!("Committed {name}: \"{}\" ({} ms)", commit.message, started.elapsed().as_millis());
     Ok(json!({ "commit": commit, "commits": state.branches.commits(&name), "changes": left, "staged": [], "since": since }))
@@ -893,15 +1074,23 @@ fn plan_discard(state: &mut State, body: &str) -> Reply {
     existing(state, &name)?;
     let discard: HashSet<String> =
         request["keys"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(str::to_owned)).collect();
-    let Some(current) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
-    load_committed(state, &name, merge::last_update(&current))?;
+    // The copy in memory is compared where it is and copied once; an uploaded copy is the copy's source.
+    let live = request["live"].as_bool().unwrap_or(false);
+    let uploaded = match live {
+        true if !state.live.contains_key(&name) => return Ok(json!({ "full": true })),
+        true => None,
+        false => current_copy(state, body, &request, &name)?.map(|(dom, _)| dom),
+    };
+    let record = merge::last_update(uploaded.as_ref().unwrap_or_else(|| &state.live[&name].dom));
+    load_committed(state, &name, record)?;
+    let current = uploaded.as_ref().unwrap_or_else(|| &state.live[&name].dom);
     let rojo = state.project.rojo_paths();
-    let rows = uncommitted(state, &name, &current).rows;
+    let rows = uncommitted(state, &name, current).rows;
     let keep: HashSet<String> =
         rows.iter().filter(|r| r.status != diff::Status::Context && !discard.contains(&r.key)).map(|r| r.key.clone()).collect();
-    let copy = crate::live::copy_of(&current).map_err(|e| (500, e))?;
+    let copy = crate::live::copy_of(current).map_err(|e| (500, e))?;
     let wanted = crate::stage::partial(&state.committed[&name].dom, copy, &rows, &keep, &rojo);
-    let plan = merge::plan(&current, &wanted, &current, &rojo, Direction::Restore).map_err(|e| (500, e))?;
+    let plan = merge::plan(current, &wanted, current, &rojo, Direction::Restore).map_err(|e| (500, e))?;
     Ok(json!({ "plan": plan }))
 }
 
@@ -911,7 +1100,7 @@ fn plan_restore(state: &mut State, body: &str) -> Reply {
     let request = json_body(body)?;
     let name = request["name"].as_str().unwrap_or_default().to_owned();
     existing(state, &name)?;
-    let Some(current) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
+    let Some((current, _)) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
     let copy = state.branches.latest_place(&name).map_err(|e| (500, e))?;
     plan_restore_of(state, &name, "restore", &copy, &current)
 }
