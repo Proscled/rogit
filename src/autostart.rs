@@ -134,12 +134,15 @@ fn windows_on(exe: &Path) -> Result<(), String> {
     let _ = fs::remove_file(project::home()?.join("start.vbs"));
     // Replace whichever RoGit is running (an older version, after an update) with this one.
     stop_running();
-    // Detached from this program's input and output: anything reading the installer's output would otherwise wait
-    // for RoGit to stop.
+    // Its output goes to a log. It mustn't hold on to this program's: anything reading the installer's output would
+    // otherwise wait for RoGit to stop.
+    #[cfg(windows)]
+    crate::windows::keep_own_output();
+    let log = fs::OpenOptions::new().create(true).append(true).open(project::home()?.join("serve.log")).map_err(|e| e.to_string())?;
     Command::new(&background)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log)
         .spawn()
         .map_err(|e| format!("Couldn't start RoGit in the background: {e}"))?;
     println!("RoGit is running in the background and starts when you log in.");

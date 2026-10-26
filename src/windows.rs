@@ -2,7 +2,8 @@
 //! installers do, rather than through PowerShell or reg.exe.
 
 use std::ptr;
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE_FLAG_INHERIT, SetHandleInformation};
+use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
     RegSetValueExW,
@@ -11,6 +12,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHU
 
 const ENVIRONMENT: &str = "Environment";
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// Stops programs this one starts from getting its input and output too. Windows hands a new program every handle
+/// that can be inherited, so RoGit left running in the background would keep the installer's output open, and
+/// anything reading that output would wait for RoGit to stop.
+pub fn keep_own_output() {
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // Fails harmlessly when there's no such handle.
+        unsafe { SetHandleInformation(GetStdHandle(which), HANDLE_FLAG_INHERIT, 0) };
+    }
+}
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()

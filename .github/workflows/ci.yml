@@ -84,7 +84,8 @@ jobs:
             $running = (Get-Process rogit* -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Id)" }) -join ', '
             $entry = (Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -ErrorAction SilentlyContinue).RoGit
             $files = (Get-ChildItem $bin -ErrorAction SilentlyContinue).Name -join ', '
-            throw "RoGit is not running in the background. Running: [$running]. Login entry: [$entry]. Files: [$files]. Installer said: $($installed -replace '\s+', ' ')"
+            $log = Get-Content "$env:LOCALAPPDATA\rogit\serve.log" -Raw -ErrorAction SilentlyContinue
+            throw "RoGit is not running in the background. Running: [$running]. Login entry: [$entry]. Files: [$files]. Its log: [$($log -replace '\s+', ' ')]. Installer said: $($installed -replace '\s+', ' ')"
           }
           $reply = Wait-RoGit
           if ($reply.server -ne 'rogit') { throw "Unexpected reply: $reply" }
