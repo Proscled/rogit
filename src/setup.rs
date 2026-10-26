@@ -147,14 +147,13 @@ fn remove_folder(bin: &std::path::Path) -> Result<(), String> {
     if !cfg!(windows) {
         return fs::remove_dir_all(bin).map_err(|e| format!("Couldn't delete {}: {e}", bin.display()));
     }
-    let command = format!("ping 127.0.0.1 -n 3 > nul & rmdir /S /Q \"{}\"", bin.display());
     let mut later = Command::new("cmd");
-    later.args(["/C", &command]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        // cmd reads its command line itself, so it goes as written (escaped quotes would break the folder's path).
         // No console window for it.
-        later.creation_flags(0x0800_0000);
+        later.raw_arg(format!("/C ping 127.0.0.1 -n 3 > nul & rmdir /S /Q \"{}\"", bin.display())).creation_flags(0x0800_0000);
     }
     later.spawn().map(|_| ()).map_err(|e| format!("Couldn't delete {}: {e}", bin.display()))
 }

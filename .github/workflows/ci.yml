@@ -42,6 +42,7 @@ jobs:
         env:
           ROGIT_NO_AUTOSTART: "1"
         run: |
+          trap 'echo "::error::Failed at line $LINENO of the macOS installer step"' ERR
           (cd target/release && zip -q "$RUNNER_TEMP/rogit.zip" rogit)
           mkdir -p "$RUNNER_TEMP/fake"
           printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\ncp "$RUNNER_TEMP/rogit.zip" "$out"\n' > "$RUNNER_TEMP/fake/curl"
@@ -63,6 +64,8 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          # Failures become annotations, which anyone can read (the log needs admin rights).
+          trap { Write-Output "::error::$_"; exit 1 }
           Compress-Archive -Path target\release\rogit.exe -DestinationPath "$env:RUNNER_TEMP\rogit.zip"
           function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing) Copy-Item "$env:RUNNER_TEMP\rogit.zip" $OutFile }
           Get-Content site\install.ps1 -Raw | Invoke-Expression
