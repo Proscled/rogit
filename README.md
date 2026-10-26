@@ -4,16 +4,10 @@ Branches for your Roblox places: maps, models, UI, meshes and terrain. Make a br
 and merge it back into your game, like Git. Scripts aren't part of branches; keep them however you like.
 
 RoGit has two pieces: the Studio plugin, where you use it, and RoGit itself, which runs in the background on your
-computer and keeps every game's branches. It runs on macOS and Windows. Everything stays on your computer; there's no
+computer and keeps every game's branches. It runs on Windows and macOS. Everything stays on your computer; there's no
 account, API key or cloud.
 
 ## Install
-
-On macOS, in Terminal:
-
-```sh
-curl -fsSL https://proscled.github.io/rogit/install.sh | sh
-```
 
 On Windows, in PowerShell:
 
@@ -21,7 +15,13 @@ On Windows, in PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://proscled.github.io/rogit/install.ps1 | iex"
 ```
 
-The installer puts `rogit` in `~/.rogit/bin` (macOS) or `%LOCALAPPDATA%\rogit\bin` (Windows), installs the Studio
+On macOS, in Terminal:
+
+```sh
+curl -fsSL https://proscled.github.io/rogit/install.sh | sh
+```
+
+The installer puts `rogit` in `%LOCALAPPDATA%\rogit\bin` (Windows) or `~/.rogit/bin` (macOS), installs the Studio
 plugin, and starts RoGit in the background, from then on whenever you log in. Run it again to update. The
 [install page](https://proscled.github.io/rogit/#install) also covers plain downloads and building from source.
 
@@ -31,8 +31,8 @@ plugin, and starts RoGit in the background, from then on whenever you log in. Ru
 2. Click **Init**. RoGit gives every object a small hidden ID attribute, so it can follow it between branches. Save
    the place afterwards.
 
-That's all; do it once per game. RoGit keeps each game's branches in `~/.rogit/games` (`%LOCALAPPDATA%\rogit\games`
-on Windows).
+That's all; do it once per game. RoGit keeps each game's branches in `%LOCALAPPDATA%\rogit\games` (`~/.rogit/games`
+on macOS).
 
 ## Use
 

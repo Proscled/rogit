@@ -45,6 +45,8 @@ struct State {
     committed: HashMap<String, Committed>,
     /// Each open branch as it is in Studio, kept current by the plugin's patches.
     live: HashMap<String, Live>,
+    /// Commits made from the copy in memory, being read back (as what changes are measured from) on another thread.
+    committing: HashMap<String, std::thread::JoinHandle<Result<Committed, String>>>,
     /// Branches with unsaved work waiting to be restored: their autosave isn't overwritten until it's restored,
     /// dismissed, or the branch is saved.
     recovering: HashSet<String>,
@@ -57,7 +59,7 @@ impl State {
         State {
             id, project, branches, history, roblox: Roblox::new(), seen_places: HashSet::new(), planned: HashMap::new(),
             updates: HashMap::new(), restores: HashMap::new(), sessions: HashMap::new(), unsaved: HashMap::new(),
-            committed: HashMap::new(), live: HashMap::new(), recovering: HashSet::new(),
+            committed: HashMap::new(), live: HashMap::new(), committing: HashMap::new(), recovering: HashSet::new(),
         }
     }
 }
@@ -430,8 +432,29 @@ mod tests {
         assert_ne!(reply["full"], json!(true), "the patch should apply");
         let rows = reply["changes"]["rows"].as_array().unwrap().iter().filter(|r| r["status"] != json!("context")).count();
         println!("REPLAY changes listed: {rows}");
-        timed(&mut state, "empty patch", "/api/branches/patch", json!({ "name": "bench", "upserts": [], "removes": [], "services": [], "refs": [] }));
-        timed(&mut state, "commit", "/api/branches/commit", json!({ "name": "bench", "message": "Move", "live": true }));
+        let empty = json!({ "name": "bench", "upserts": [], "removes": [], "services": [], "refs": [] });
+        timed(&mut state, "empty patch", "/api/branches/patch", empty.clone());
+        let reply = timed(&mut state, "commit", "/api/branches/commit", json!({ "name": "bench", "message": "Move", "live": true }));
+        let commit = reply["commit"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(reply["commit"]["summary"]["changed"], json!(1));
+        // The next refresh waits for the commit to be read back, then measures from it.
+        let listed = |reply: &Value| reply["changes"]["rows"].as_array().unwrap().iter().filter(|r| r["status"] != json!("context")).count();
+        let reply = timed(&mut state, "first refresh after the commit", "/api/branches/patch", empty.clone());
+        assert_eq!(listed(&reply), 0);
+        // Move it again, then plan reverting to the commit from the copy in memory.
+        for r in walk(&data, copy) {
+            if let Some(Variant::CFrame(c)) = data.get_by_ref_mut(r).unwrap().properties.get_mut(&"CFrame".into()) {
+                c.position.x += 20.0;
+            }
+        }
+        std::fs::create_dir_all(&patch_dir).unwrap();
+        rbx_binary::to_writer(std::fs::File::create(patch_dir.join("Patch.rbxm")).unwrap(), &data, &[copy]).unwrap();
+        let reply = timed(&mut state, "patch moving it again", "/api/branches/patch", json!({
+            "name": "bench", "capture": "benchpatch1", "upserts": [upsert], "removes": [], "services": [], "refs": [],
+        }));
+        assert_eq!(listed(&reply), 1);
+        let reply = timed(&mut state, "revert plan", "/api/branches/revert", json!({ "name": "bench", "id": commit, "live": true }));
+        assert_eq!(reply["plan"]["summary"]["changed"], json!(1));
         let manifest = upload(&state, "benchmain2");
         let reply = timed(&mut state, "merge plan", "/api/branches/merge", json!({ "name": "bench", "capture": "benchmain2", "manifest": manifest }));
         println!("REPLAY merge summary: {}", reply["plan"]["summary"]);
@@ -874,6 +897,7 @@ fn archive(state: &mut State, body: &str) -> Reply {
     state.updates.remove(&name);
     state.restores.remove(&name);
     state.committed.remove(&name);
+    state.committing.remove(&name);
     state.live.remove(&name);
     let closed = state.branches.archive(&name).map_err(|e| (500, e))?;
     println!("Archived {name}{}", if closed > 0 { " (closed it in Studio)" } else { "" });
@@ -904,6 +928,10 @@ fn committed(state: &State, name: &str, record: Option<&str>) -> Result<(WeakDom
 /// Makes sure what the branch's changes are measured from is in memory and indexed: refreshes come often, and a big
 /// place takes a while to read and index.
 fn load_committed(state: &mut State, name: &str, record: Option<String>) -> Result<(), (u16, String)> {
+    if let Some(reading) = state.committing.remove(name) {
+        let read = reading.join().map_err(|_| (500, "Couldn't read the commit back.".to_owned()))?;
+        state.committed.insert(name.to_owned(), read.map_err(|e| (500, e))?);
+    }
     let which = match state.branches.commits(name).first() {
         Some(last) => last.id.clone(),
         None => format!("base:{}", record.clone().unwrap_or_default()),
@@ -962,6 +990,7 @@ fn changes(state: &mut State, body: &str) -> Reply {
     let identified = live.identified;
     let review = uncommitted(state, &name, &live.dom);
     live.uncommitted = count(&review);
+    live.summary = review.summary.clone();
     state.live.insert(name.clone(), live);
     let mut reply = changes_reply(state, &name, review, Some(unix_now()));
     reply["live"] = json!(identified);
@@ -1005,7 +1034,9 @@ fn patch(state: &mut State, body: &str) -> Reply {
     load_committed(state, &name, record)?;
     let review = uncommitted(state, &name, &state.live[&name].dom);
     step("compare", &mut timer);
-    state.live.get_mut(&name).unwrap().uncommitted = count(&review);
+    let live = state.live.get_mut(&name).unwrap();
+    live.uncommitted = count(&review);
+    live.summary = review.summary.clone();
     Ok(changes_reply(state, &name, review, saved))
 }
 
@@ -1041,6 +1072,10 @@ fn commit(state: &mut State, body: &str) -> Reply {
     existing(state, &name)?;
     let message = request["message"].as_str().unwrap_or("").trim().chars().take(100).collect::<String>();
     let auto = request["auto"].as_bool().unwrap_or(false);
+    let live = request["live"].as_bool().unwrap_or(false);
+    if live && state.live.contains_key(&name) && (auto || state.branches.staged(&name).is_empty()) {
+        return commit_everything(state, &name, message, auto, started);
+    }
     let Some((current, bytes)) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
     step("copy", &mut timer);
     load_committed(state, &name, merge::last_update(&current))?;
@@ -1095,6 +1130,46 @@ fn commit(state: &mut State, body: &str) -> Reply {
     Ok(json!({ "commit": commit, "commits": state.branches.commits(&name), "changes": left, "staged": [], "since": since }))
 }
 
+/// Commits all of the branch from the copy in memory, the usual case. Its bytes are the commit's file, and what changes
+/// are measured from next is read back from them on another thread, so even a big place's commit answers right away.
+/// The changes are as the last refresh found them: the plugin sends its last edits just before.
+fn commit_everything(state: &mut State, name: &str, message: String, auto: bool, started: Instant) -> Reply {
+    let live = &state.live[name];
+    let summary = live.summary.clone();
+    if summary == diff::Summary::default() {
+        return Err((409, "Nothing to commit.".to_owned()));
+    }
+    let bytes = crate::live::to_bytes(&live.dom).map_err(|e| (500, e))?;
+    let number = state.branches.commits(name).len() + 1;
+    let message = if message.is_empty() { format!("Commit {number}") } else { message };
+    let id = format!("c{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let commit = Commit { id, message, time: unix_now(), summary, auto };
+    state.branches.add_commit(name, &live.dom, Some(&bytes), &commit).map_err(|e| (500, e))?;
+    state.branches.set_staged(name, &[]).map_err(|e| (500, e))?;
+    if !auto {
+        let event = Event {
+            id: commit.id.clone(), kind: "commit".into(), branch: name.to_owned(), time: commit.time,
+            summary: serde_json::to_value(&commit.summary).ok(), has_rows: false, message: Some(commit.message.clone()),
+        };
+        let _ = state.history.add(event, None);
+    }
+    let since = json!({ "kind": "commit", "message": commit.message, "time": commit.time });
+    let (which, read_since) = (commit.id.clone(), since.clone());
+    state.committed.remove(name);
+    let reading = std::thread::spawn(move || {
+        let dom = rbx_binary::from_reader(&bytes[..]).map_err(|e| format!("Couldn't read the commit back: {e}"))?;
+        let index = diff::index(&dom);
+        Ok(Committed { which, dom, index, since: read_since })
+    });
+    state.committing.insert(name.to_owned(), reading);
+    let live = state.live.get_mut(name).unwrap();
+    live.uncommitted = 0;
+    live.summary = diff::Summary::default();
+    println!("Committed {name}: \"{}\" ({} ms)", commit.message, started.elapsed().as_millis());
+    let left = diff::Review { summary: diff::Summary::default(), rows: vec![], truncated: 0 };
+    Ok(json!({ "commit": commit, "commits": state.branches.commits(name), "changes": left, "staged": [], "since": since }))
+}
+
 /// Everything that happened, newest first, for the plugin's graph: branches made, commits, merges, pulls, reverts
 /// and archives. Branches and commits from before the history kept them are added from their own records.
 fn graph(state: &State) -> Vec<Event> {
@@ -1138,20 +1213,41 @@ fn view_commit(state: &mut State, body: &str) -> Reply {
 /// Plans bringing an earlier copy of the branch back into the branch as it is now (`current`). The reply carries
 /// the copy's update record, which the plugin sets too, so later merges and updates measure from the right place.
 fn plan_restore_of(state: &mut State, name: &str, kind: &str, copy: &WeakDom, current: &WeakDom) -> Reply {
-    let plan = merge::plan(current, copy, current, Direction::Restore).map_err(|e| (500, e))?;
-    let rows = json!({ "rows": plan.rows, "truncated": plan.truncated });
-    let s = &plan.summary;
-    println!("Planned {kind} of {name}: {} added, {} removed, {} changed", s.added, s.removed, s.changed);
-    let reply = json!({ "plan": plan, "record": merge::last_update(copy).unwrap_or_default() });
+    let (reply, rows) = restore_plan(name, kind, copy, current)?;
     state.restores.insert(name.to_owned(), (kind.to_owned(), rows));
     Ok(reply)
 }
 
-/// Plans turning the branch (as it is in Studio, `capture`) back into one of its commits.
+/// The plan for bringing `copy` back into the branch as it is (`current`), and its rows for the history.
+fn restore_plan(name: &str, kind: &str, copy: &WeakDom, current: &WeakDom) -> Result<(Value, Value), (u16, String)> {
+    let plan = merge::plan(current, copy, current, Direction::Restore).map_err(|e| (500, e))?;
+    let rows = json!({ "rows": plan.rows, "truncated": plan.truncated });
+    let s = &plan.summary;
+    println!("Planned {kind} of {name}: {} added, {} removed, {} changed", s.added, s.removed, s.changed);
+    Ok((json!({ "plan": plan, "record": merge::last_update(copy).unwrap_or_default() }), rows))
+}
+
+/// Plans turning the branch back into one of its commits. The branch as it is in Studio is the copy in memory
+/// (`live: true`) or a full copy uploaded under `capture`.
 fn plan_revert(state: &mut State, body: &str) -> Reply {
-    let (name, capture, manifest) = capture_request(body)?;
+    let request = json_body(body)?;
+    let name = request["name"].as_str().unwrap_or_default().to_owned();
     existing(state, &name)?;
-    let id = json_body(body)?["id"].as_str().unwrap_or_default().to_owned();
+    let id = request["id"].as_str().unwrap_or_default().to_owned();
+    if request["live"].as_bool().unwrap_or(false) {
+        let Some(live) = state.live.get(&name) else { return Ok(json!({ "full": true })) };
+        // Reverting to the last commit (the usual case) uses the copy of it that's already in memory.
+        load_committed(state, &name, merge::last_update(&live.dom))?;
+        let read = match state.committed.get(&name) {
+            Some(last) if last.which == id => None,
+            _ => Some(state.branches.commit_place(&name, &id).map_err(|e| (404, e))?),
+        };
+        let copy = read.as_ref().unwrap_or_else(|| &state.committed[&name].dom);
+        let (reply, rows) = restore_plan(&name, "revert", copy, &state.live[&name].dom)?;
+        state.restores.insert(name, ("revert".to_owned(), rows));
+        return Ok(reply);
+    }
+    let (_, capture, manifest) = capture_request(body)?;
     let current = take_upload(state, &capture, &manifest)?;
     let copy = state.branches.commit_place(&name, &id).map_err(|e| (404, e))?;
     plan_restore_of(state, &name, "revert", &copy, &current)

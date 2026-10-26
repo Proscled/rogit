@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RoGit: branches for Roblox places</title>
-<meta name="description" content="Build in a branch, see exactly what changed, and merge it back into your Roblox game. Like Git, for your places. Free, open source, macOS and Windows.">
+<meta name="description" content="Build in a branch, see exactly what changed, and merge it back into your Roblox game. Like Git, for your places. Free, open source, Windows and macOS.">
 <meta property="og:title" content="RoGit: branches for Roblox places">
 <meta property="og:description" content="Build in a branch, see exactly what changed, and merge it back into your game.">
 <meta property="og:image" content="https://__SITE__/merge-window.jpg">
@@ -237,26 +237,26 @@
   <div class="hero">
     <div class="wrap">
       <div>
-        <div class="eyebrow"><span class="dot"></span>For Roblox Studio · macOS and Windows</div>
+        <div class="eyebrow"><span class="dot"></span>For Roblox Studio · Windows and macOS</div>
         <h1>Branches for your Roblox places</h1>
         <p class="lead">Build a new map, lobby or UI in a branch, see exactly what changed, and merge it back into your game. Like Git, for your places.</p>
 
         <div class="install" id="get">
           <div class="tabs" role="tablist" aria-label="Your computer">
-            <button role="tab" id="tab-mac" aria-controls="cmd-mac" aria-selected="true" data-os="mac">macOS</button>
-            <button role="tab" id="tab-win" aria-controls="cmd-win" aria-selected="false" data-os="win">Windows</button>
+            <button role="tab" id="tab-win" aria-controls="cmd-win" aria-selected="true" data-os="win">Windows</button>
+            <button role="tab" id="tab-mac" aria-controls="cmd-mac" aria-selected="false" data-os="mac">macOS</button>
             <span class="version" id="version"></span>
           </div>
-          <div class="cmd" id="cmd-mac" role="tabpanel" aria-labelledby="tab-mac">
-            <code>curl -fsSL https://__SITE__/install.sh | sh</code>
-            <button class="copy" type="button">Copy</button>
-          </div>
-          <div class="cmd ps" id="cmd-win" role="tabpanel" aria-labelledby="tab-win" hidden>
+          <div class="cmd ps" id="cmd-win" role="tabpanel" aria-labelledby="tab-win">
             <code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code>
             <button class="copy" type="button">Copy</button>
           </div>
-          <p class="note" id="note-mac">Paste it in Terminal (in Applications → Utilities). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
-          <p class="note" id="note-win" hidden>Paste it in PowerShell (search for it in the Start menu). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
+          <div class="cmd" id="cmd-mac" role="tabpanel" aria-labelledby="tab-mac" hidden>
+            <code>curl -fsSL https://__SITE__/install.sh | sh</code>
+            <button class="copy" type="button">Copy</button>
+          </div>
+          <p class="note" id="note-win">Paste it in PowerShell (search for it in the Start menu). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
+          <p class="note" id="note-mac" hidden>Paste it in Terminal (in Applications → Utilities). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
         </div>
         <p class="more">Run it again to update. <a href="#install">Other ways to install</a></p>
       </div>
@@ -340,9 +340,9 @@
       <div class="options">
         <div>
           <h3>Installer <span class="tag">recommended</span></h3>
-          <p>Puts RoGit in <code>~/.rogit/bin</code> on macOS or <code>%LOCALAPPDATA%\rogit\bin</code> on Windows, installs the plugin, and starts RoGit whenever you log in.</p>
-          <div class="cmd"><code>curl -fsSL https://__SITE__/install.sh | sh</code><button class="copy" type="button">Copy</button></div>
+          <p>Puts RoGit in <code>%LOCALAPPDATA%\rogit\bin</code> on Windows or <code>~/.rogit/bin</code> on macOS, installs the plugin, and starts RoGit whenever you log in.</p>
           <div class="cmd ps"><code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd"><code>curl -fsSL https://__SITE__/install.sh | sh</code><button class="copy" type="button">Copy</button></div>
           <p class="small">For a specific version, set <code>ROGIT_VERSION=v0.2.0</code> first.</p>
         </div>
         <div>
@@ -372,7 +372,7 @@
         </details>
         <details>
           <summary>Where are my branches?</summary>
-          <div><p>In <code>~/.rogit/games</code> on macOS and <code>%LOCALAPPDATA%\rogit\games</code> on Windows, with a folder for each game. Each branch is a place file you can also open yourself.</p></div>
+          <div><p>In <code>%LOCALAPPDATA%\rogit\games</code> on Windows and <code>~/.rogit/games</code> on macOS, with a folder for each game. Each branch is a place file you can also open yourself.</p></div>
         </details>
         <details>
           <summary>What about my scripts?</summary>
@@ -395,9 +395,9 @@
           <div>
             <p>First stop RoGit starting when you log in:</p>
             <div class="cmd"><code>rogit autostart off</code><button class="copy" type="button">Copy</button></div>
+            <p>On Windows, delete <code>%LOCALAPPDATA%\rogit\bin</code> and <code>%LOCALAPPDATA%\Roblox\Plugins\RoGit.lua</code>, then remove the rogit folder from Path in <b>Edit environment variables for your account</b>.</p>
             <p>On macOS, delete RoGit and the plugin, then remove the line <code>. "$HOME/.rogit/env"</code> from <code>~/.zshenv</code> (and <code>~/.bash_profile</code> or <code>~/.bashrc</code> if it's there):</p>
             <div class="cmd"><code>rm -rf ~/.rogit/bin ~/Documents/Roblox/Plugins/RoGit.lua</code><button class="copy" type="button">Copy</button></div>
-            <p>On Windows, delete <code>%LOCALAPPDATA%\rogit\bin</code> and <code>%LOCALAPPDATA%\Roblox\Plugins\RoGit.lua</code>, then remove the rogit folder from Path in <b>Edit environment variables for your account</b>.</p>
             <p>Your branches stay in RoGit's <code>games</code> folder until you delete it.</p>
           </div>
         </details>
@@ -430,7 +430,8 @@
   }
   tabs.forEach(tab => tab.addEventListener('click', () => choose(tab.dataset.os)));
   const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent;
-  choose(/win/i.test(platform) ? 'win' : 'mac');
+  // Windows unless this is clearly a Mac: most Roblox developers are on Windows.
+  choose(/mac/i.test(platform) ? 'mac' : 'win');
 
   // Copy buttons.
   document.querySelectorAll('.copy').forEach(button => button.addEventListener('click', async () => {

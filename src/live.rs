@@ -21,8 +21,9 @@ pub struct Live {
     pub saved: Instant,
     pub saved_at: Option<u64>,
     pub changed: bool,
-    /// How many changes weren't committed at the last refresh of the changes.
+    /// How many changes weren't committed at the last refresh of the changes, and their summary.
     pub uncommitted: usize,
+    pub summary: crate::diff::Summary,
 }
 
 /// A place as the bytes of an .rbxl file.
@@ -56,7 +57,7 @@ impl Live {
     /// it walked them. Copies leave out a few runtime objects (TouchInterest), so entries without a match are skipped.
     pub fn new(dom: WeakDom, manifest: &Value) -> Live {
         let mut live =
-            Live { dom, ids: HashMap::new(), refs: HashMap::new(), identified: false, saved: Instant::now(), saved_at: None, changed: false, uncommitted: 0 };
+            Live { dom, ids: HashMap::new(), refs: HashMap::new(), identified: false, saved: Instant::now(), saved_at: None, changed: false, uncommitted: 0, summary: Default::default() };
         live.identified = live.name_services(manifest).is_some();
         live
     }

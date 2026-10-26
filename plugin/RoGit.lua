@@ -2019,10 +2019,8 @@ startRevert = function(commit: any)
 	end
 	dropView()
 	local lost = uncommitted()
-	run("Copying the branch…", function()
-		local capture, manifest = copy()
-		step("Comparing with “" .. commit.message .. "”…")
-		local reply = call("POST", "/api/branches/revert", { name = branch.name, id = commit.id, capture = capture, manifest = manifest })
+	run("Comparing with “" .. commit.message .. "”…", function()
+		local reply = callWithBranch("/api/branches/revert", { name = branch.name, id = commit.id })
 		showView({
 			kind = "revert", data = reply.plan, branch = branch.name, record = reply.record, message = commit.message,
 			title = "Revert to “" .. commit.message .. "”",
