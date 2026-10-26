@@ -5,8 +5,8 @@ use std::ptr;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW,
+    RegDeleteValueW, RegQueryValueExW, RegSetValueExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
 
@@ -31,10 +31,23 @@ fn wide(text: &str) -> Vec<u16> {
 struct Key(HKEY);
 
 impl Key {
+    /// Creates the key if it isn't there yet: a new Windows account has no Run key until something starts at login.
     fn open(path: &str) -> Result<Key, String> {
         let mut key: HKEY = ptr::null_mut();
         let name = wide(path);
-        let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, name.as_ptr(), 0, KEY_READ | KEY_WRITE, &mut key) };
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                name.as_ptr(),
+                0,
+                ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_READ | KEY_WRITE,
+                ptr::null(),
+                &mut key,
+                ptr::null_mut(),
+            )
+        };
         if status != ERROR_SUCCESS {
             return Err(format!("Couldn't open HKEY_CURRENT_USER\\{path} (error {status})."));
         }
