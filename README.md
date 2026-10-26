@@ -33,7 +33,8 @@ says when there's a new version) and `rogit uninstall` removes it; your branches
    the place afterwards.
 
 That's all; do it once per game. RoGit keeps each game's branches in `%LOCALAPPDATA%\rogit\games` (`~/.rogit/games`
-on macOS).
+on macOS). Commits and the other copies RoGit keeps share what they have in common, so a commit only adds the part of
+the place that changed, and archiving a branch frees its space.
 
 ## Use
 

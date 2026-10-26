@@ -51,6 +51,14 @@ struct State {
     /// Branches with unsaved work waiting to be restored: their autosave isn't overwritten until it's restored,
     /// dismissed, or the branch is saved.
     recovering: HashSet<String>,
+    /// Whether everything from before the store has been moved into it (see `tidy`), how many copies were moved so
+    /// far, and whether moving one failed (it's left as it was, and tidying stops until RoGit restarts).
+    tidied: bool,
+    moved: usize,
+    tidy_failed: bool,
+    /// Whether copies were replaced or deleted since the store last dropped the pieces nothing uses, and when it did.
+    sweep_due: bool,
+    swept: Option<Instant>,
 }
 
 impl State {
@@ -61,7 +69,13 @@ impl State {
             id, project, branches, history, roblox: Roblox::new(), seen_places: HashSet::new(), planned: HashMap::new(),
             updates: HashMap::new(), restores: HashMap::new(), sessions: HashMap::new(), unsaved: HashMap::new(),
             committed: HashMap::new(), live: HashMap::new(), committing: HashMap::new(), recovering: HashSet::new(),
+            tidied: false, moved: 0, tidy_failed: false, sweep_due: true, swept: None,
         }
+    }
+
+    /// A copy was kept as it came from Studio: move it into the store when nothing else is going on.
+    fn tidy_later(&mut self) {
+        self.tidied = self.tidy_failed;
     }
 }
 
@@ -160,7 +174,10 @@ pub fn serve(port: Option<u16>) -> Result<(), String> {
                 handle(&mut games, request);
                 games.games.values_mut().for_each(|state| autosave(state, Duration::from_secs(60)));
             }
-            Ok(None) => games.games.values_mut().for_each(|state| autosave(state, Duration::from_secs(10))),
+            Ok(None) => games.games.values_mut().for_each(|state| {
+                autosave(state, Duration::from_secs(10));
+                tidy(state);
+            }),
             Err(e) => return Err(format!("The server stopped: {e}")),
         }
     }
@@ -205,9 +222,48 @@ fn autosave(state: &mut State, every: Duration) {
         live.saved = Instant::now();
         live.changed = false;
         match state.branches.save_latest(name, &live.dom) {
-            Ok(()) => live.saved_at = Some(unix_now()),
+            Ok(()) => {
+                live.saved_at = Some(unix_now());
+                state.sweep_due = true;
+            }
             Err(e) => println!("Couldn't autosave {name}: {e}"),
         }
+    }
+}
+
+/// Tidies a game's data while nothing else is going on, a step at a time: moves copies from before the store into it,
+/// then, at most once a minute, deletes the pieces no copy uses any more.
+fn tidy(state: &mut State) {
+    if !state.tidied {
+        match state.branches.tidy_one() {
+            Ok(Some(_)) => {
+                state.moved += 1;
+                state.sweep_due = true;
+            }
+            Ok(None) => state.tidied = true,
+            Err(e) => {
+                println!("Couldn't move a copy into RoGit's store: {e}");
+                (state.tidied, state.tidy_failed) = (true, true);
+            }
+        }
+        if state.tidied && state.moved > 1 {
+            println!("Moved {} copies into RoGit's store, where they share what they have in common", state.moved);
+        }
+        if state.tidied {
+            state.moved = 0;
+        }
+        return;
+    }
+    if !state.sweep_due || state.swept.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+        return;
+    }
+    state.sweep_due = false;
+    state.swept = Some(Instant::now());
+    match state.branches.sweep() {
+        // Autosaves free a little every minute while you work; only say so when it's worth mentioning.
+        Ok((_, bytes)) if bytes >= 10 << 20 => println!("Freed {:.0} MB that no copy uses any more", bytes as f64 / 1048576.0),
+        Ok(_) => {}
+        Err(e) => println!("Couldn't free unused space: {e}"),
     }
 }
 
@@ -446,7 +502,13 @@ mod tests {
         println!("REPLAY changes listed: {rows}");
         let empty = json!({ "name": "bench", "upserts": [], "removes": [], "services": [], "refs": [] });
         timed(&mut state, "empty patch", "/api/branches/patch", empty.clone());
+        let stored = || -> u64 {
+            let folders = std::fs::read_dir(root.join("store")).into_iter().flatten().flatten();
+            folders.flat_map(|f| std::fs::read_dir(f.path()).unwrap().flatten()).map(|e| e.metadata().unwrap().len()).sum()
+        };
+        let before = stored();
         let reply = timed(&mut state, "commit", "/api/branches/commit", json!({ "name": "bench", "message": "Move", "live": true }));
+        println!("REPLAY the commit added {:.2} MB to the store ({:.1} MB in all)", (stored() - before) as f64 / 1048576.0, stored() as f64 / 1048576.0);
         let commit = reply["commit"]["id"].as_str().unwrap().to_owned();
         assert_eq!(reply["commit"]["summary"]["changed"], json!(1));
         // The next refresh waits for the commit to be read back, then measures from it.
@@ -769,6 +831,7 @@ fn merged(state: &mut State, body: &str) -> Reply {
         match &planned {
             Some((planned, branch, _)) if planned == id => {
                 state.branches.keep_base(name, id, branch).map_err(|e| (500, format!("Couldn't keep the merged copy: {e}")))?;
+                state.sweep_due = true;
             }
             _ => println!("  This merge wasn't planned by this rogit serve, so the next merge of {name} starts from earlier."),
         }
@@ -784,6 +847,7 @@ fn update_branch(state: &mut State, body: &str) -> Reply {
     let (name, capture, manifest) = capture_request(body)?;
     existing(state, &name)?;
     let branch = state.branches.keep_latest(&name, &capture, &manifest).map_err(|e| (500, e))?;
+    state.tidy_later();
     let capture = format!("c{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
     let update = Update { capture, asked: Instant::now(), offered: false, branch, ready: None, failed: None };
     state.updates.insert(name.clone(), update);
@@ -866,6 +930,7 @@ fn updated(state: &mut State, body: &str) -> Reply {
         match &ready {
             Some((planned, main, _)) if planned == id => {
                 state.branches.keep_base(name, id, main).map_err(|e| (500, format!("Couldn't keep main's copy: {e}")))?;
+                state.sweep_due = true;
             }
             _ => println!("  This update wasn't planned by this rogit serve, so the next one starts from earlier."),
         }
@@ -926,6 +991,7 @@ fn archive(state: &mut State, body: &str) -> Reply {
     state.committing.remove(&name);
     state.live.remove(&name);
     let closed = state.branches.archive(&name).map_err(|e| (500, e))?;
+    state.sweep_due = true;
     println!("Archived {name}{}", if closed > 0 { " (closed it in Studio)" } else { "" });
     let event = Event { id: branches::new_id(Since::Merge), kind: "archive".into(), branch: name, time: unix_now(), summary: None, has_rows: false, message: None };
     let _ = state.history.add(event, None);
@@ -1008,6 +1074,7 @@ fn changes(state: &mut State, body: &str) -> Reply {
     let dom = if state.recovering.contains(&name) {
         take_upload(state, &capture, &manifest)?
     } else {
+        state.tidy_later();
         state.branches.keep_latest(&name, &capture, &manifest).map_err(|e| (500, e))?
     };
     load_committed(state, &name, merge::last_update(&dom))?;

@@ -595,8 +595,13 @@ pub(crate) fn adopt_new_ids(start: &WeakDom, old: &Index, current: &WeakDom, new
 /// `f` applied to every item, in order, spread over the processor's cores. Comparing every object in a big place is
 /// most of the work behind each refresh of the changes.
 pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    par_map_by(items, 2048, f)
+}
+
+/// Like `par_map`, with at least `at_least` items to a thread: fewer for slow work on each item.
+pub(crate) fn par_map_by<T: Sync, R: Send>(items: &[T], at_least: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
-    let size = items.len().div_ceil(threads).max(2048);
+    let size = items.len().div_ceil(threads).max(at_least);
     let f = &f;
     std::thread::scope(|scope| {
         let parts: Vec<_> = items.chunks(size).map(|part| scope.spawn(move || part.iter().map(f).collect::<Vec<R>>())).collect();

@@ -634,6 +634,8 @@ name = "rogit"
 version = "0.3.4"
 dependencies = [
  "base64 0.23.1",
+ "blake3",
+ "lz4_flex",
  "rbx_binary",
  "rbx_dom_weak",
  "rbx_reflection",
@@ -646,6 +648,7 @@ dependencies = [
  "ureq",
  "windows-sys 0.61.2",
  "zip",
+ "zstd",
 ]
 
 [[package]]

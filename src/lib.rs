@@ -13,6 +13,7 @@ mod roblox;
 mod server;
 mod setup;
 mod stage;
+mod store;
 #[cfg(windows)]
 mod windows;
 

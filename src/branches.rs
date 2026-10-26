@@ -1,7 +1,8 @@
-//! Branches live in `.rogit/branches/`: `<name>.rbxl` is the file you open in Studio, and `<name>/` keeps its
-//! details and starting point.
+//! Branches live in `branches/`: `<name>.rbxl` is the file you open in Studio, and `<name>/` keeps its details and
+//! its copies (starting point, commits, autosave, where it met main), which are kept in the game's store.
 
 use crate::place;
+use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -29,7 +30,7 @@ pub struct Branch {
     pub pinned: bool,
 }
 
-/// A saved state of a branch, like a git commit. Its copy lives in `<branch>/commits/<id>.rbxl`.
+/// A saved state of a branch, like a git commit. Its copy is `<branch>/commits/<id>.copy`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Commit {
     pub id: String,
@@ -76,6 +77,7 @@ fn modified(path: &Path) -> Option<u64> {
 
 pub struct Branches {
     data: PathBuf,
+    store: Store,
 }
 
 pub fn valid_name(name: &str) -> bool {
@@ -91,7 +93,7 @@ pub fn valid_capture(id: &str) -> bool {
 
 impl Branches {
     pub fn new(data: PathBuf) -> Self {
-        Branches { data }
+        Branches { store: Store::new(&data), data }
     }
 
     fn dir(&self) -> PathBuf {
@@ -192,13 +194,16 @@ impl Branches {
     /// Keeps the copy taken when the branch first opened as its starting point.
     pub fn set_starting_point(&self, name: &str, capture: &str, manifest: &Value, game: u64) -> Result<(), String> {
         let mut branch = self.get(name).ok_or_else(|| format!("There's no branch called {name}."))?;
-        let target = self.dir().join(name).join("start");
-        let _ = fs::remove_dir_all(&target);
-        fs::rename(self.upload_dir(capture), &target).map_err(|e| format!("Couldn't keep the starting point: {e}"))?;
-        fs::write(target.join("manifest.json"), manifest.to_string()).map_err(|e| e.to_string())?;
         // Studio changes some things when it opens a file (its lighting upgrade, for example). Rewrite the
         // branch file from the starting point, so it matches it until you save the branch yourself.
-        place::build(&target, manifest, &self.file(name), &format!("{game}:{name}"))?;
+        let upload = self.upload_dir(capture);
+        let file = self.file(name);
+        let built = place::build(&upload, manifest, &file, &format!("{game}:{name}"));
+        let _ = fs::remove_dir_all(&upload);
+        built?;
+        let bytes = fs::read(&file).map_err(|e| format!("Couldn't read {}: {e}", file.display()))?;
+        self.store.keep(&bytes, &self.dir().join(name).join("start.copy")).map_err(|e| format!("Couldn't keep the starting point: {e}"))?;
+        let _ = fs::remove_dir_all(self.dir().join(name).join("start"));
         branch.has_starting_point = true;
         self.save(&branch)
     }
@@ -209,31 +214,55 @@ impl Branches {
         if !branch.has_starting_point {
             return Err(format!("{name} has no starting point yet. Open it in Studio once first."));
         }
-        let dir = self.dir().join(name).join("start");
-        let manifest: Value = serde_json::from_slice(&fs::read(dir.join("manifest.json")).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        place::assemble(&dir, &manifest).map(|(dom, _)| dom)
+        self.read_copy(&self.dir().join(name).join("start"))
+    }
+
+    /// A copy: kept in the store (`<path>.copy`), from before the store (`<path>.rbxl`), or as it came from Studio
+    /// (a folder `<path>/` with one file per service), which early versions kept.
+    fn read_copy(&self, path: &Path) -> Result<rbx_dom_weak::WeakDom, String> {
+        let copy = path.with_extension("copy");
+        if copy.exists() {
+            return self.store.read(&copy);
+        }
+        if path.is_dir() {
+            return place::assemble(path, &read_manifest(path)?).map(|(dom, _)| dom);
+        }
+        place::read(&path.with_extension("rbxl"))
+    }
+
+    fn has_copy(path: &Path) -> bool {
+        path.with_extension("copy").exists() || path.with_extension("rbxl").exists()
     }
 
     /// Keeps the newest copy of the branch from Studio (it includes unsaved edits).
     pub fn keep_latest(&self, name: &str, capture: &str, manifest: &Value) -> Result<rbx_dom_weak::WeakDom, String> {
+        // Kept as it came, which is quickest; the next autosave (or tidying up) moves it into the store.
         let target = self.dir().join(name).join("latest");
         let _ = fs::remove_dir_all(&target);
         fs::rename(self.upload_dir(capture), &target).map_err(|e| format!("Couldn't keep the copy: {e}"))?;
         fs::write(target.join("manifest.json"), manifest.to_string()).map_err(|e| e.to_string())?;
+        for older in ["latest.copy", "latest.rbxl"] {
+            let _ = fs::remove_file(self.dir().join(name).join(older));
+        }
         place::assemble(&target, manifest).map(|(dom, _)| dom)
     }
 
-    /// Writes the copy `rogit serve` keeps in memory (kept current by the plugin) as the branch's autosave.
+    /// Keeps the copy `rogit serve` keeps in memory (kept current by the plugin) as the branch's autosave.
     pub fn save_latest(&self, name: &str, dom: &rbx_dom_weak::WeakDom) -> Result<(), String> {
-        place::write(dom, &self.dir().join(name).join("latest.rbxl"))
+        let latest = self.dir().join(name).join("latest");
+        self.store.keep_place(dom, &latest.with_extension("copy"))?;
+        let _ = fs::remove_dir_all(&latest);
+        let _ = fs::remove_file(latest.with_extension("rbxl"));
+        Ok(())
     }
 
-    /// When RoGit last kept a copy of the branch from Studio: a full copy (`latest/`) or its copy in memory written
-    /// out (`latest.rbxl`), whichever is newer. Returns the time and whether it's the written-out one.
+    /// When RoGit last kept a copy of the branch from Studio: a full copy as it came (`latest/`) or its copy in memory
+    /// (`latest.copy`, or `latest.rbxl` from before the store), whichever is newer. Returns the time and whether it's
+    /// the copy from memory.
     fn latest_time(&self, name: &str) -> Option<(u64, bool)> {
-        let dir = modified(&self.dir().join(name).join("latest").join("manifest.json"));
-        let file = modified(&self.dir().join(name).join("latest.rbxl"));
+        let latest = self.dir().join(name).join("latest");
+        let dir = modified(&latest.join("manifest.json"));
+        let file = modified(&latest.with_extension("copy")).or_else(|| modified(&latest.with_extension("rbxl")));
         match (dir, file) {
             (Some(d), Some(f)) if f >= d => Some((f, true)),
             (_, Some(f)) if dir.is_none() => Some((f, true)),
@@ -253,20 +282,25 @@ impl Branches {
         }
     }
 
+    /// A base's copy, without its extension (see `read_copy`).
     fn base_copy(&self, name: &str, id: &str) -> PathBuf {
-        self.dir().join(name).join("bases").join(format!("{id}.rbxl"))
+        self.dir().join(name).join("bases").join(id)
     }
 
     /// Keeps a place where the branch and main met: the branch as it was merged, or the main it was updated from.
     /// The next review, merge or update then only shows what changed after it. Keeps the last few, since an older
     /// one may still count (the newest could be undone or never saved).
     pub fn keep_base(&self, name: &str, id: &str, dom: &rbx_dom_weak::WeakDom) -> Result<(), String> {
-        let file = self.base_copy(name, id);
+        let file = self.base_copy(name, id).with_extension("copy");
         let dir = file.parent().unwrap();
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        place::write(dom, &file)?;
-        let mut copies: Vec<(u64, PathBuf)> =
-            fs::read_dir(dir).into_iter().flatten().flatten().map(|e| (modified(&e.path()).unwrap_or_default(), e.path())).collect();
+        self.store.keep_place(dom, &file)?;
+        let mut copies: Vec<(u64, PathBuf)> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "copy" || ext == "rbxl"))
+            .map(|e| (modified(&e.path()).unwrap_or_default(), e.path()))
+            .collect();
         copies.sort_by(|a, b| b.0.cmp(&a.0));
         for (_, old) in copies.into_iter().skip(6) {
             let _ = fs::remove_file(old);
@@ -281,11 +315,11 @@ impl Branches {
         let newest = [merge.filter(|id| id.starts_with('m')), update.filter(|id| id.starts_with('u'))]
             .into_iter()
             .flatten()
-            .filter(|id| valid_capture(id) && self.base_copy(name, id).exists())
+            .filter(|id| valid_capture(id) && Self::has_copy(&self.base_copy(name, id)))
             .max_by_key(|id| id_time(id));
         if let Some(id) = newest {
             let kind = if id.starts_with('u') { Since::Update } else { Since::Merge };
-            return Ok((place::read(&self.base_copy(name, id))?, kind, (id_time(id) / 1_000_000_000) as u64));
+            return Ok((self.read_copy(&self.base_copy(name, id))?, kind, (id_time(id) / 1_000_000_000) as u64));
         }
         let created = self.get(name).map(|b| b.created).unwrap_or_default();
         Ok((self.starting_point(name)?, Since::Start, created))
@@ -312,11 +346,10 @@ impl Branches {
 
     /// Keeps a commit: the branch as committed, as a place in memory or already as an .rbxl file's `bytes`.
     pub fn add_commit(&self, name: &str, dom: &rbx_dom_weak::WeakDom, bytes: Option<&[u8]>, commit: &Commit) -> Result<(), String> {
-        let target = self.commit_dir(name, &commit.id).with_extension("rbxl");
-        fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+        let target = self.commit_dir(name, &commit.id).with_extension("copy");
         match bytes {
-            Some(bytes) => fs::write(&target, bytes).map_err(|e| format!("Couldn't write {}: {e}", target.display()))?,
-            None => place::write(dom, &target)?,
+            Some(bytes) => self.store.keep(bytes, &target)?,
+            None => self.store.keep_place(dom, &target)?,
         }
         let mut commits = self.commits(name);
         commits.insert(0, commit.clone());
@@ -328,14 +361,7 @@ impl Branches {
         if !self.commits(name).iter().any(|c| c.id == id) {
             return Err("That commit doesn't exist any more.".into());
         }
-        let dir = self.commit_dir(name, id);
-        if !dir.is_dir() {
-            return place::read(&dir.with_extension("rbxl"));
-        }
-        // Early commits kept the copy as it came from Studio.
-        let manifest: Value = serde_json::from_slice(&fs::read(dir.join("manifest.json")).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        place::assemble(&dir, &manifest).map(|(dom, _)| dom)
+        self.read_copy(&self.commit_dir(name, id))
     }
 
     /// The keys of the changes staged for the next commit.
@@ -357,14 +383,13 @@ impl Branches {
     }
 
     pub fn latest_place(&self, name: &str) -> Result<rbx_dom_weak::WeakDom, String> {
-        let (_, written_out) = self.latest_time(name).ok_or("RoGit has no copy of this branch yet.")?;
-        if written_out {
-            return place::read(&self.dir().join(name).join("latest.rbxl"));
-        }
+        let (_, from_memory) = self.latest_time(name).ok_or("RoGit has no copy of this branch yet.")?;
         let latest = self.dir().join(name).join("latest");
-        let manifest: Value = serde_json::from_slice(&fs::read(latest.join("manifest.json")).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        place::assemble(&latest, &manifest).map(|(dom, _)| dom)
+        match from_memory {
+            true if latest.with_extension("copy").exists() => self.store.read(&latest.with_extension("copy")),
+            true => place::read(&latest.with_extension("rbxl")),
+            false => place::assemble(&latest, &read_manifest(&latest)?).map(|(dom, _)| dom),
+        }
     }
 
     /// Stops offering the unsaved copy (until a newer one is made).
@@ -378,6 +403,73 @@ impl Branches {
         self.save(&branch)
     }
 
+    /// Deletes the pieces of copies no branch uses any more. Returns how many and how many bytes.
+    pub fn sweep(&self) -> Result<(usize, u64), String> {
+        self.store.sweep()
+    }
+
+    /// Tidies up one thing from before copies were kept in the store, and copies uploaded from Studio that were
+    /// never used. Returns what it did, or None once there's nothing left.
+    pub fn tidy_one(&self) -> Result<Option<String>, String> {
+        let an_hour_ago = now().saturating_sub(3600);
+        for upload in fs::read_dir(self.data.join("uploads")).into_iter().flatten().flatten() {
+            if modified(&upload.path()).is_some_and(|time| time < an_hour_ago) {
+                fs::remove_dir_all(upload.path()).map_err(|e| e.to_string())?;
+                return Ok(Some("an unused upload".into()));
+            }
+        }
+        for branch in self.list() {
+            let dir = self.dir().join(&branch.name);
+            // The newest autosave: the other one is out of date.
+            if let Some((time, from_memory)) = self.latest_time(&branch.name) {
+                let latest = dir.join("latest");
+                let old_file = latest.with_extension("rbxl");
+                if old_file.exists() || latest.is_dir() {
+                    let in_store = from_memory && latest.with_extension("copy").exists();
+                    match from_memory {
+                        true => fs::remove_dir_all(&latest),
+                        false => fs::remove_file(&old_file),
+                    }
+                    .ok();
+                    if !in_store {
+                        self.move_into_store(&latest, time)?;
+                    }
+                    let _ = fs::remove_file(&old_file);
+                    let _ = fs::remove_dir_all(&latest);
+                    return Ok(Some(format!("{}'s autosave", branch.name)));
+                }
+            }
+            let mut old = vec![dir.join("start")];
+            for folder in ["commits", "bases"] {
+                old.extend(fs::read_dir(dir.join(folder)).into_iter().flatten().flatten().map(|e| e.path().with_extension("")));
+            }
+            for path in old {
+                let file = path.with_extension("rbxl");
+                if path.is_dir() || file.exists() {
+                    let time = modified(&file).or_else(|| modified(&path.join("manifest.json"))).unwrap_or_else(now);
+                    self.move_into_store(&path, time)?;
+                    let _ = fs::remove_file(&file);
+                    let _ = fs::remove_dir_all(&path);
+                    return Ok(Some(format!("a copy of {}", branch.name)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Keeps the copy at `path` (see `read_copy`) in the store, dated `time`, as it was.
+    fn move_into_store(&self, path: &Path, time: u64) -> Result<(), String> {
+        let copy = path.with_extension("copy");
+        let file = path.with_extension("rbxl");
+        if file.exists() {
+            self.store.keep(&fs::read(&file).map_err(|e| e.to_string())?, &copy)?;
+        } else {
+            self.store.keep_place(&place::assemble(path, &read_manifest(path)?)?.0, &copy)?;
+        }
+        let when = UNIX_EPOCH + std::time::Duration::from_secs(time);
+        fs::File::options().write(true).open(&copy).and_then(|f| f.set_modified(when)).map_err(|e| e.to_string())
+    }
+
     pub fn open(&self, name: &str) -> Result<(), String> {
         let file = self.file(name);
         if !file.exists() {
@@ -385,6 +477,11 @@ impl Branches {
         }
         open_in_studio(&file).map_err(|e| format!("Couldn't open Studio: {e}"))
     }
+}
+
+fn read_manifest(dir: &Path) -> Result<Value, String> {
+    let bytes = fs::read(dir.join("manifest.json")).map_err(|e| format!("Couldn't read {}: {e}", dir.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
 #[cfg(unix)]
@@ -498,6 +595,59 @@ mod tests {
         // A record that names the wrong kind, or a copy that isn't there, doesn't count.
         assert!(branches.base("b", Some(&update), None).is_err(), "falls back to the starting point, which b doesn't have");
         fs::remove_dir_all(data).unwrap();
+    }
+
+    /// Moves a copy of a real game's data (`ROGIT_BENCH_GAME`, which it changes) into the store, and checks every copy
+    /// reads back the same.
+    #[test]
+    #[ignore]
+    fn moves_a_real_game_into_the_store() {
+        let Ok(game) = std::env::var("ROGIT_BENCH_GAME") else { return };
+        let branches = Branches::new(PathBuf::from(&game));
+        let size = || -> u64 {
+            let mut total = 0;
+            let mut folders = vec![PathBuf::from(&game)];
+            while let Some(folder) = folders.pop() {
+                for entry in fs::read_dir(folder).unwrap().flatten() {
+                    match entry.path().is_dir() {
+                        true => folders.push(entry.path()),
+                        false => total += entry.metadata().unwrap().len(),
+                    }
+                }
+            }
+            total
+        };
+        let copies = |branches: &Branches| -> Vec<(String, rbx_dom_weak::WeakDom)> {
+            let mut all = vec![];
+            for b in branches.list() {
+                if b.has_starting_point {
+                    all.push((format!("{} start", b.name), branches.starting_point(&b.name).unwrap()));
+                }
+                for c in branches.commits(&b.name) {
+                    all.push((format!("{} {}", b.name, c.id), branches.commit_place(&b.name, &c.id).unwrap()));
+                }
+                if branches.latest_time(&b.name).is_some() {
+                    all.push((format!("{} latest", b.name), branches.latest_place(&b.name).unwrap()));
+                }
+            }
+            all
+        };
+        let before = (size(), copies(&branches), branches.latest_time("new-map"));
+        let started = std::time::Instant::now();
+        let mut steps = 0;
+        while let Some(what) = branches.tidy_one().unwrap() {
+            println!("  moved {what}");
+            steps += 1;
+        }
+        let swept = branches.sweep().unwrap();
+        println!("{steps} steps in {} ms, swept {swept:?}", started.elapsed().as_millis());
+        let after = copies(&branches);
+        assert_eq!(before.1.len(), after.len());
+        for ((name, old), (_, new)) in before.1.iter().zip(&after) {
+            assert!(crate::diff::compare(old, new).rows.is_empty(), "{name} changed");
+        }
+        assert_eq!(before.2, branches.latest_time("new-map"), "the autosave keeps its time");
+        println!("{:.1} MB before, {:.1} MB after", before.0 as f64 / 1048576.0, size() as f64 / 1048576.0);
     }
 
     #[test]
