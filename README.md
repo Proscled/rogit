@@ -11,18 +11,18 @@ Windows. Everything stays on your computer; there's no account, API key or cloud
 On macOS, in Terminal:
 
 ```sh
-curl -fsSL https://<github-user>.github.io/rogit/install.sh | sh
+curl -fsSL https://proscled.github.io/rogit/install.sh | sh
 ```
 
 On Windows, in PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://<github-user>.github.io/rogit/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://proscled.github.io/rogit/install.ps1 | iex"
 ```
 
 The installer puts `rogit` in `~/.rogit/bin` (macOS) or `%LOCALAPPDATA%\rogit\bin` (Windows), adds that folder to
 your PATH and installs the Studio plugin. Run it again to update. The
-[install page](https://<github-user>.github.io/rogit/#install) also covers Rokit, plain downloads and building from
+[install page](https://proscled.github.io/rogit/#install) also covers Rokit, plain downloads and building from
 source.
 
 ## Set up

@@ -6,7 +6,6 @@
 2. In the repository's **Settings → Pages**, set **Source** to **GitHub Actions**. Then run the **Site** workflow
    once from the Actions tab. It publishes `site/` to `https://<owner>.github.io/<repo>/`, with the repository's
    names filled in, and again on every push to `main` that changes `site/`.
-3. Replace `<github-user>` in `README.md` with the owner.
 
 ## Each release
 

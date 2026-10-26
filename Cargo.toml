@@ -5,6 +5,8 @@ edition = "2024"
 description = "Branches for your Roblox places' assets, with a Studio plugin. Scripts stay with Rojo."
 license = "MPL-2.0"
 readme = "README.md"
+repository = "https://github.com/Proscled/rogit"
+homepage = "https://proscled.github.io/rogit"
 
 [dependencies]
 base64 = "0.23.1"
