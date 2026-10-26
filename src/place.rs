@@ -100,9 +100,19 @@ pub(crate) fn attribute(encoded: &Value) -> Option<Variant> {
     to_variant(kind, encoded)
 }
 
-/// Writes a place file from the copy in `dir` (one `<Service>.rbxm` per service) and its manifest.
-pub fn build(dir: &Path, manifest: &Value, out: &Path) -> Result<BuildReport, String> {
-    let (dom, settings_skipped) = assemble(dir, manifest)?;
+/// Writes a branch file from the copy in `dir` (one `<Service>.rbxm` per service) and its manifest. `branch` says
+/// which game and branch it is ("<game ID>:<name>"), on its Workspace: a local file has no game ID of its own.
+pub fn build(dir: &Path, manifest: &Value, out: &Path, branch: &str) -> Result<BuildReport, String> {
+    let (mut dom, settings_skipped) = assemble(dir, manifest)?;
+    let workspace = dom.root().children().iter().copied().find(|r| dom.get_by_ref(*r).is_some_and(|i| i.class.as_str() == "Workspace"));
+    if let Some(inst) = workspace.and_then(|r| dom.get_by_ref_mut(r)) {
+        let mut attributes = match inst.properties.get(&"Attributes".into()) {
+            Some(Variant::Attributes(a)) => a.clone(),
+            _ => Attributes::new(),
+        };
+        attributes.insert(crate::diff::BRANCH.to_owned(), Variant::String(branch.to_owned()));
+        inst.properties.insert("Attributes".into(), Variant::Attributes(attributes));
+    }
     let objects = dom.descendants().count() - 1;
     write(&dom, out)?;
     Ok(BuildReport { objects, settings_skipped })
@@ -181,7 +191,7 @@ mod tests {
              "Unknown": {"t": "number", "v": 1}}}
         ]});
         let out = dir.join("branch.rbxl");
-        let report = build(&dir, &manifest, &out).unwrap();
+        let report = build(&dir, &manifest, &out, "1:test").unwrap();
         assert_eq!((report.objects, report.settings_skipped), (3, 1));
 
         let place = rbx_binary::from_reader(&fs::read(&out).unwrap()[..]).unwrap();
@@ -189,6 +199,14 @@ mod tests {
         assert_eq!(workspace.class.as_str(), "Workspace");
         assert_eq!(place.get_by_ref(workspace.children()[0]).unwrap().name, "Crate");
         assert!(workspace.properties.iter().any(|(k, v)| k.as_str() == "Gravity" && *v == Variant::Float32(98.1)));
+        // The branch file says which game and branch it is, next to the attributes it was copied with.
+        let Some(Variant::Attributes(attributes)) = workspace.properties.get(&"Attributes".into()) else { panic!("no attributes") };
+        // (Attribute text comes back from a place file as raw bytes.)
+        let text = |key: &str| match attributes.get(key) {
+            Some(Variant::BinaryString(bytes)) => String::from_utf8(AsRef::<[u8]>::as_ref(bytes).to_vec()).ok(),
+            _ => None,
+        };
+        assert_eq!((text(crate::diff::BRANCH).as_deref(), text("Note").as_deref()), (Some("1:test"), Some("hi")));
         fs::remove_dir_all(dir).unwrap();
     }
 }

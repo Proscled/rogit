@@ -1,3 +1,4 @@
+mod autostart;
 mod branches;
 mod diff;
 mod history;
@@ -16,20 +17,23 @@ use std::{env, fs, process};
 
 const PLUGIN: &str = include_str!("../plugin/RoGit.lua");
 
-const HELP: &str = "RoGit: branches for your Roblox places' assets.
+const HELP: &str = "RoGit: branches for your Roblox places.
 
 Usage:
-  rogit serve [--port <port>]   Serve this project folder to the RoGit Studio plugin
-  rogit diff [<branch>] [--json] Show what a branch changed, or list branches
-  rogit plugin install          Install the RoGit plugin into Roblox Studio
-  rogit --version               Show the version";
+  rogit serve [--port <port>]    Run RoGit for Studio's RoGit panel (the installer starts it when you log in)
+  rogit autostart [on|off]       Start RoGit when you log in (and now), or stop starting it
+  rogit diff [<branch>] [--json] Show what a branch changed, or list every game's branches
+  rogit plugin install           Install the RoGit plugin into Roblox Studio
+  rogit --version                Show the version";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
-        ["serve"] => serve(None),
-        ["serve", "--port", port] => port.parse().map_err(|_| format!("Invalid port: {port}")).and_then(|port| serve(Some(port))),
+        ["serve"] => server::serve(None),
+        ["serve", "--port", port] => port.parse().map_err(|_| format!("Invalid port: {port}")).and_then(|port| server::serve(Some(port))),
+        ["autostart"] | ["autostart", "on"] => autostart::on(),
+        ["autostart", "off"] => autostart::off(),
         ["plugin", "install"] => install_plugin(),
         ["diff"] => diff(None, false),
         ["diff", name] => diff(Some(name), false),
@@ -46,30 +50,58 @@ fn main() {
     }
 }
 
-fn serve(port: Option<u16>) -> Result<(), String> {
-    let root = env::current_dir().map_err(|e| format!("Couldn't read the current folder: {e}"))?;
-    server::serve(project::Project::new(root), port)
+/// The games set up so far, by name, with their branches.
+fn games() -> Result<Vec<(project::Game, branches::Branches)>, String> {
+    let mut games: Vec<(project::Game, branches::Branches)> = fs::read_dir(project::games()?)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let config = project::Project::new(entry.path()).config().ok()??;
+            Some((config.game, branches::Branches::new(entry.path())))
+        })
+        .collect();
+    games.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    Ok(games)
+}
+
+/// The branches of the game that has a branch called `name`.
+fn branches_with(name: &str) -> Result<branches::Branches, String> {
+    let mut found: Vec<(project::Game, branches::Branches)> = games()?.into_iter().filter(|(_, b)| b.get(name).is_some()).collect();
+    match found.len() {
+        0 => Err(format!("There's no branch called {name}.")),
+        1 => Ok(found.remove(0).1),
+        _ => Err(format!(
+            "Several games have a branch called {name}: {}.",
+            found.iter().map(|(game, _)| game.name.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
 }
 
 fn diff(name: Option<&str>, as_json: bool) -> Result<(), String> {
-    let root = env::current_dir().map_err(|e| format!("Couldn't read the current folder: {e}"))?;
-    let project = project::Project::new(root.clone());
-    let branches = branches::Branches::new(root.join(project::DATA_DIR));
     let Some(name) = name else {
-        let list = branches.list();
-        if list.is_empty() {
-            println!("No branches yet. Make one with New branch in the RoGit panel in main.");
+        let games = games()?;
+        if games.is_empty() {
+            println!("No games set up yet. Open a game's start place in Studio and click Init in the RoGit panel.");
         }
-        for branch in list {
-            println!("{}  (made {})", branch.name, ago(branch.created));
+        for (game, branches) in games {
+            println!("{}", game.name);
+            let list = branches.list();
+            if list.is_empty() {
+                println!("  No branches yet.");
+            }
+            for branch in list {
+                println!("  {}  (made {})", branch.name, ago(branch.created));
+            }
         }
         return Ok(());
     };
+    let branches = branches_with(name)?;
     // Like a merge: the saved branch file, or the copy from the last review in Studio if that's newer. Compared,
     // like a review, with the last update from main or else the starting point.
     let (current, source, time) = branches.newest(name)?;
     let (base, _, _) = branches.base(name, None, merge::last_update(&current).as_deref())?;
-    let review = diff::compare(&base, &current, &project.rojo_paths());
+    let review = diff::compare(&base, &current);
     if as_json {
         println!("{}", serde_json::to_string(&review).map_err(|e| e.to_string())?);
         return Ok(());
@@ -79,13 +111,11 @@ fn diff(name: Option<&str>, as_json: bool) -> Result<(), String> {
 }
 
 fn plan_merge(name: &str, main: &str) -> Result<(), String> {
-    let root = env::current_dir().map_err(|e| format!("Couldn't read the current folder: {e}"))?;
-    let project = project::Project::new(root.clone());
-    let branches = branches::Branches::new(root.join(project::DATA_DIR));
+    let branches = branches_with(name)?;
     let main = place::read(std::path::Path::new(main))?;
     let (branch, _, _) = branches.newest(name)?;
     let (base, _, _) = branches.base(name, merge::last_merge(&main, name).as_deref(), merge::last_update(&branch).as_deref())?;
-    let plan = merge::plan(&base, &branch, &main, &project.rojo_paths(), merge::Direction::Merge)?;
+    let plan = merge::plan(&base, &branch, &main, merge::Direction::Merge)?;
     println!("{}", serde_json::to_string(&plan).map_err(|e| e.to_string())?);
     Ok(())
 }

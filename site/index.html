@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RoGit: branches for Roblox places</title>
-<meta name="description" content="Build in a branch, see exactly what changed, and merge it back into your Roblox game. Git for everything Rojo doesn't sync. Free, open source, macOS and Windows.">
+<meta name="description" content="Build in a branch, see exactly what changed, and merge it back into your Roblox game. Like Git, for your places. Free, open source, macOS and Windows.">
 <meta property="og:title" content="RoGit: branches for Roblox places">
 <meta property="og:description" content="Build in a branch, see exactly what changed, and merge it back into your game.">
 <meta property="og:image" content="https://__SITE__/merge-window.jpg">
@@ -145,7 +145,7 @@
   .intro { color: var(--muted); font-size: 17.5px; max-width: 40em; margin: 0 0 44px; }
 
   /* Steps */
-  .steps { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; counter-reset: step; }
+  .steps { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; counter-reset: step; }
   .steps li { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 22px; counter-increment: step; }
   .steps li::before {
     content: counter(step); display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px;
@@ -201,7 +201,6 @@
   @media (max-width: 900px) {
     .feature { grid-template-columns: minmax(0, 1fr); gap: 44px; }
     .feature.flip .shot { order: 0; }
-    .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 640px) {
@@ -238,9 +237,9 @@
   <div class="hero">
     <div class="wrap">
       <div>
-        <div class="eyebrow"><span class="dot"></span>For Roblox Studio and Rojo · macOS and Windows</div>
+        <div class="eyebrow"><span class="dot"></span>For Roblox Studio · macOS and Windows</div>
         <h1>Branches for your Roblox places</h1>
-        <p class="lead">Build a new map, lobby or UI in a branch, see exactly what changed, and merge it back into your game. Git for everything Rojo doesn't sync.</p>
+        <p class="lead">Build a new map, lobby or UI in a branch, see exactly what changed, and merge it back into your game. Like Git, for your places.</p>
 
         <div class="install" id="get">
           <div class="tabs" role="tablist" aria-label="Your computer">
@@ -256,8 +255,8 @@
             <code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code>
             <button class="copy" type="button">Copy</button>
           </div>
-          <p class="note" id="note-mac">Paste it in Terminal or VS Code's terminal. It installs rogit, adds it to your PATH and installs the Studio plugin.</p>
-          <p class="note" id="note-win" hidden>Paste it in PowerShell or VS Code's terminal. It installs rogit, adds it to your PATH and installs the Studio plugin.</p>
+          <p class="note" id="note-mac">Paste it in Terminal (in Applications → Utilities). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
+          <p class="note" id="note-win" hidden>Paste it in PowerShell (search for it in the Start menu). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
         </div>
         <p class="more">Run it again to update. <a href="#install">Other ways to install</a></p>
       </div>
@@ -268,20 +267,15 @@
     <div class="wrap">
       <p class="kicker">Quick start</p>
       <h2>From install to your first branch</h2>
-      <p class="intro">RoGit has two parts, like Rojo: the <code>rogit</code> command, which keeps your branches in your project folder, and the Studio plugin, where you use them.</p>
+      <p class="intro">RoGit has two parts: the Studio plugin, where you use it, and RoGit itself, which runs quietly in the background and keeps your branches. The installer sets up both.</p>
       <ol class="steps">
         <li>
           <h3>Install</h3>
-          <p>Run the install command above. Open a new terminal afterwards so it finds <code>rogit</code>.</p>
-        </li>
-        <li>
-          <h3>Serve your project</h3>
-          <p>In your game's project folder, next to <code>default.project.json</code>:</p>
-          <div class="cmd"><code>rogit serve</code></div>
+          <p>Run the install command above. RoGit starts right away, and from then on whenever you log in.</p>
         </li>
         <li>
           <h3>Init in Studio</h3>
-          <p>Open your game's start place, then <b>Plugins → RoGit</b> and click <b>Init</b>. Save the place afterwards.</p>
+          <p>Open your game's start place, then <b>Plugins → RoGit</b> and click <b>Init</b>. Save the place afterwards. Once per game.</p>
         </li>
         <li>
           <h3>Make a branch</h3>
@@ -297,7 +291,7 @@
         <div>
           <p class="kicker">In a branch</p>
           <h2>Source Control for your map</h2>
-          <p class="intro" style="margin-bottom:0">The panel works like VS Code's Source Control, for parts, models, UI, lighting and terrain.</p>
+          <p class="intro" style="margin-bottom:0">The panel lists every change as you build: parts, models, UI, lighting and terrain.</p>
           <ul class="points">
             <li><span><b>Changes as you build.</b> Every edit shows up within a moment, even in places with 100,000 objects.</span></li>
             <li><span><b>Stage, commit, discard.</b> Commit some changes and keep working on the rest. Discard puts things back, and Ctrl+Z undoes that too.</span></li>
@@ -328,12 +322,12 @@
       </div>
 
       <div class="grid">
-        <div><h3>Stays on your computer</h3><p>Branches are .rbxl files in your project's <code>.rogit</code> folder. No account, API key or cloud.</p></div>
-        <div><h3>Scripts stay with Rojo</h3><p>RoGit skips scripts and everything your project file syncs, so it never fights Rojo.</p></div>
+        <div><h3>Stays on your computer</h3><p>Branches are place files in RoGit's folder on your computer. No account, API key or cloud.</p></div>
+        <div><h3>Scripts left alone</h3><p>RoGit doesn't touch scripts, or folders that hold scripts. Keep them however you like.</p></div>
         <div><h3>Fast in big games</h3><p>After one copy of the place, only the objects you change are sent.</p></div>
         <div><h3>Terrain, meshes, unions</h3><p>Terrain voxels, material colors, MeshParts and unions merge like everything else.</p></div>
         <div><h3>A graph of it all</h3><p>Every branch, commit, merge and pull in one graph. Click one to see what it changed.</p></div>
-        <div><h3>Several games</h3><p>Run <code>rogit serve</code> in each game's folder. The plugin finds the right one.</p></div>
+        <div><h3>All your games</h3><p>One RoGit handles every game. Open a place, and it knows which game it belongs to.</p></div>
       </div>
     </div>
   </section>
@@ -342,24 +336,18 @@
     <div class="wrap">
       <p class="kicker">Install</p>
       <h2>Ways to install</h2>
-      <p class="intro">Every way ends the same: the <code>rogit</code> command on your PATH and the plugin in Studio's plugins folder.</p>
+      <p class="intro">Every way ends the same: RoGit running in the background, and its plugin in Studio's plugins folder.</p>
       <div class="options">
         <div>
           <h3>Installer <span class="tag">recommended</span></h3>
-          <p>Puts rogit in <code>~/.rogit/bin</code> on macOS or <code>%LOCALAPPDATA%\rogit\bin</code> on Windows, adds that folder to your PATH and installs the plugin.</p>
+          <p>Puts RoGit in <code>~/.rogit/bin</code> on macOS or <code>%LOCALAPPDATA%\rogit\bin</code> on Windows, installs the plugin, and starts RoGit whenever you log in.</p>
           <div class="cmd"><code>curl -fsSL https://__SITE__/install.sh | sh</code><button class="copy" type="button">Copy</button></div>
           <div class="cmd ps"><code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code><button class="copy" type="button">Copy</button></div>
-          <p class="small">For a specific version, set <code>ROGIT_VERSION=v0.1.0</code> first.</p>
-        </div>
-        <div>
-          <h3>Rokit</h3>
-          <p>If your project already uses <a href="https://github.com/rojo-rbx/rokit">Rokit</a> for Rojo, add rogit next to it. The version is pinned in <code>rokit.toml</code> for your whole team.</p>
-          <div class="cmd"><code>rokit add __REPO__</code><button class="copy" type="button">Copy</button></div>
-          <div class="cmd"><code>rogit plugin install</code><button class="copy" type="button">Copy</button></div>
+          <p class="small">For a specific version, set <code>ROGIT_VERSION=v0.2.0</code> first.</p>
         </div>
         <div>
           <h3>Download</h3>
-          <p>Get the zip for your computer from the <a href="https://github.com/__REPO__/releases/latest">latest release</a>, put <code>rogit</code> somewhere on your PATH, and run <code>rogit plugin install</code>.</p>
+          <p>Get the zip for your computer from the <a href="https://github.com/__REPO__/releases/latest">latest release</a>, put <code>rogit</code> somewhere on your PATH, then run <code>rogit plugin install</code> and <code>rogit autostart</code>.</p>
           <p class="small">On macOS, a file downloaded with a browser is blocked until you run <code>xattr -d com.apple.quarantine rogit</code>. The installer doesn't need this.</p>
         </div>
         <div>
@@ -367,6 +355,7 @@
           <p>With <a href="https://rustup.rs">Rust</a> installed:</p>
           <div class="cmd"><code>cargo install --locked --git https://github.com/__REPO__</code><button class="copy" type="button">Copy</button></div>
           <div class="cmd"><code>rogit plugin install</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd"><code>rogit autostart</code><button class="copy" type="button">Copy</button></div>
         </div>
       </div>
     </div>
@@ -378,16 +367,20 @@
       <h2>Common questions</h2>
       <div class="faq">
         <details>
+          <summary>The panel says RoGit isn't running</summary>
+          <div><p>RoGit starts in the background when you log in. To start it now, run the install command again, or run <code>rogit serve</code> in a terminal and leave it open.</p></div>
+        </details>
+        <details>
+          <summary>Where are my branches?</summary>
+          <div><p>In <code>~/.rogit/games</code> on macOS and <code>%LOCALAPPDATA%\rogit\games</code> on Windows, with a folder for each game. Each branch is a place file you can also open yourself.</p></div>
+        </details>
+        <details>
+          <summary>What about my scripts?</summary>
+          <div><p>RoGit leaves scripts alone, and any folder that holds a script. Branches and merges are about everything else in the place, so keep scripts however you like.</p></div>
+        </details>
+        <details>
           <summary>The terminal says rogit isn't found or isn't recognized</summary>
-          <div><p>Terminals only read your PATH when they start. Open a new one. On Windows, quit VS Code completely and open it again, because its terminals inherit VS Code's PATH.</p></div>
-        </details>
-        <details>
-          <summary>The panel keeps saying it's looking for RoGit</summary>
-          <div><p>The plugin talks to <code>rogit serve</code>. Run it in your game's project folder and leave that terminal open while you work.</p></div>
-        </details>
-        <details>
-          <summary>The panel says "Other game"</summary>
-          <div><p>The <code>rogit serve</code> that's running belongs to a different game. Run <code>rogit serve</code> in this game's project folder too; both can run at once.</p></div>
+          <div><p>You only need the terminal for <code>rogit</code> commands. Terminals read your PATH when they start, so open a new one.</p></div>
         </details>
         <details>
           <summary>Windows says running scripts is disabled</summary>
@@ -395,15 +388,17 @@
         </details>
         <details>
           <summary>How do I update?</summary>
-          <div><p>Run the install command again. It replaces rogit and the plugin, and works while <code>rogit serve</code> is running; restart <code>rogit serve</code> afterwards.</p></div>
+          <div><p>Run the install command again. It replaces RoGit and the plugin, and restarts RoGit in the background.</p></div>
         </details>
         <details>
           <summary>How do I uninstall?</summary>
           <div>
-            <p>On macOS, delete rogit and the plugin, then remove the line <code>. "$HOME/.rogit/env"</code> from <code>~/.zshenv</code> (and <code>~/.bash_profile</code> or <code>~/.bashrc</code> if it's there):</p>
-            <div class="cmd"><code>rm -rf ~/.rogit ~/Documents/Roblox/Plugins/RoGit.lua</code><button class="copy" type="button">Copy</button></div>
-            <p>On Windows, delete <code>%LOCALAPPDATA%\rogit</code> and <code>%LOCALAPPDATA%\Roblox\Plugins\RoGit.lua</code>, then remove the rogit folder from Path in <b>Edit environment variables for your account</b>.</p>
-            <p>Your branches stay in each project's <code>.rogit</code> folder until you delete it.</p>
+            <p>First stop RoGit starting when you log in:</p>
+            <div class="cmd"><code>rogit autostart off</code><button class="copy" type="button">Copy</button></div>
+            <p>On macOS, delete RoGit and the plugin, then remove the line <code>. "$HOME/.rogit/env"</code> from <code>~/.zshenv</code> (and <code>~/.bash_profile</code> or <code>~/.bashrc</code> if it's there):</p>
+            <div class="cmd"><code>rm -rf ~/.rogit/bin ~/Documents/Roblox/Plugins/RoGit.lua</code><button class="copy" type="button">Copy</button></div>
+            <p>On Windows, delete <code>%LOCALAPPDATA%\rogit\bin</code> and <code>%LOCALAPPDATA%\Roblox\Plugins\RoGit.lua</code>, then remove the rogit folder from Path in <b>Edit environment variables for your account</b>.</p>
+            <p>Your branches stay in RoGit's <code>games</code> folder until you delete it.</p>
           </div>
         </details>
       </div>

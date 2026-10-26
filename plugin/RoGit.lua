@@ -1,5 +1,6 @@
 --!strict
--- RoGit Studio plugin. Talks to `rogit serve` on this computer, like the Rojo plugin talks to `rojo serve`.
+-- RoGit Studio plugin. Talks to RoGit (`rogit serve`), which runs in the background on this computer and keeps every
+-- game's branches.
 
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local EncodingService = game:GetService("EncodingService")
@@ -15,9 +16,9 @@ if not RunService:IsEdit() then
 	return
 end
 
--- rogit serve takes the first free one of these ports, so several projects can be served at once.
+-- RoGit takes the first free one of these ports.
 local PORTS = { 34875, 34876, 34877, 34878, 34879 }
--- The rogit serve this place belongs to; see findServer.
+-- Where RoGit is; see findServer.
 local serverBase = "http://127.0.0.1:34875"
 local TAG = "RoGitId"
 local POLL_SECONDS = 2
@@ -34,9 +35,9 @@ type Game = { name: string, universe_id: number, main_place_id: number }
 type Branch = { name: string, created: number, has_starting_point: boolean, merged: number?, updated: number?, pinned: boolean? }
 type State = {
 	connected: boolean,
-	folder: string?,
 	game: Game?,
-	rojo: any,
+	-- The game of a branch file made before branch files said which game they're from, as RoGit found it.
+	branchGame: number?,
 	branches: { Branch },
 	branch: Branch?,
 	isMain: boolean?,
@@ -66,10 +67,25 @@ type State = {
 
 local state: State = { connected = false, branches = {}, commits = {}, graph = {}, staged = {} }
 
--- Talking to rogit serve ---------------------------------------------------------------------------
+-- Talking to RoGit ---------------------------------------------------------------------------------
+
+-- The game this window is about: the open place's game, or for a branch (a local file) the game it was made from.
+local function gameId(): number
+	if game.GameId ~= 0 then
+		return game.GameId
+	end
+	local tag = workspace:GetAttribute("RoGitBranch")
+	local id = if type(tag) == "string" then tonumber(string.match(tag, "^(%d+):")) else nil
+	return id or state.branchGame or 0
+end
+
+-- Every request says which game it's about; RoGit keeps each game's branches apart.
+local function withGame(path: string): string
+	return path .. (if string.find(path, "?", 1, true) then "&" else "?") .. string.format("game=%d", gameId())
+end
 
 local function request(method: string, path: string, body: any?, raw: string?): (boolean, any)
-	local options: any = { Url = serverBase .. path, Method = method }
+	local options: any = { Url = serverBase .. withGame(path), Method = method }
 	if raw ~= nil then
 		options.Body = raw
 		options.Headers = { ["Content-Type"] = "text/plain" }
@@ -83,10 +99,10 @@ local function request(method: string, path: string, body: any?, raw: string?): 
 	end
 	local decoded, value = pcall(HttpService.JSONDecode, HttpService, response.Body)
 	if not decoded then
-		return false, "rogit serve sent an unexpected reply."
+		return false, "RoGit sent an unexpected reply."
 	end
 	if not response.Success then
-		return false, value.error or ("rogit serve answered HTTP " .. response.StatusCode .. ".")
+		return false, value.error or ("RoGit answered HTTP " .. response.StatusCode .. ".")
 	end
 	return true, value
 end
@@ -105,7 +121,7 @@ local function newId(length: number): string
 	return table.concat(chars)
 end
 
--- This Studio window, so rogit serve can tell work from before it opened.
+-- This Studio window, so RoGit can tell work from before it opened.
 local SESSION = newId(12)
 -- Every RoGit ID in this place and its object, once the project is set up. A copy made with Ctrl+D or pasted carries
 -- its original's ID; with this, it gets its own right away.
@@ -114,26 +130,25 @@ local idOwners: { [string]: Instance }? = nil
 -- that's been worked in. Only a window that just opened can be missing unsaved work.
 local FRESH_WINDOW = not ChangeHistoryService:GetCanUndo()
 
--- Collects the objects RoGit tracks: everything saved in the place except scripts, Folders that
--- contain a script anywhere inside, and whatever Rojo syncs.
-local function trackedObjects(rojoPaths: { [string]: boolean }): ({ Instance }, number)
+-- Collects the objects RoGit tracks: everything saved in the place except scripts and Folders that contain a script
+-- anywhere inside.
+local function trackedObjects(): ({ Instance }, number)
 	local list: { Instance } = {}
 	local visited = 0
 
-	local function visit(parent: Instance, path: string): boolean
+	local function visit(parent: Instance): boolean
 		local hasScript = false
 		for _, child in parent:GetChildren() do
 			visited += 1
 			if visited % 10000 == 0 then
 				task.wait()
 			end
-			local childPath = path .. "/" .. child.Name
 			if child:IsA("LuaSourceContainer") then
 				hasScript = true
-			elseif child.Archivable and not rojoPaths[childPath] and not child:IsA("Camera") then
+			elseif child.Archivable and not child:IsA("Camera") then
 				local mark = #list
 				table.insert(list, child)
-				if visit(child, childPath) then
+				if visit(child) then
 					hasScript = true
 					if child:IsA("Folder") then
 						for i = #list, mark + 1, -1 do
@@ -148,8 +163,8 @@ local function trackedObjects(rojoPaths: { [string]: boolean }): ({ Instance }, 
 
 	for _, name in SERVICES do
 		local ok, service = pcall(game.GetService, game, name)
-		if ok and service and not rojoPaths[service.Name] then
-			visit(service, service.Name)
+		if ok and service then
+			visit(service)
 		end
 	end
 	return list, visited
@@ -157,16 +172,9 @@ end
 
 -- Gives every tracked object without an ID a short hidden one. Copies made with Ctrl+D share an ID, so
 -- repeats get a new one. Records a single undo step, and only when something changes.
-local function tagObjects(rojo: any): { tagged: number, added: number, skipped: number, seconds: number }
+local function tagObjects(): { tagged: number, added: number, skipped: number, seconds: number }
 	local started = os.clock()
-	if rojo == nil or rojo.all then
-		return { tagged = 0, added = 0, skipped = 0, seconds = 0 }
-	end
-	local rojoPaths: { [string]: boolean } = {}
-	for _, path in rojo.paths do
-		rojoPaths[path] = true
-	end
-	local objects, visited = trackedObjects(rojoPaths)
+	local objects, visited = trackedObjects()
 	local seen: { [string]: boolean } = {}
 	local missing: { Instance } = {}
 	for _, object in objects do
@@ -247,7 +255,7 @@ local function sendParts(capture: string, service: string, text: string, uploads
 		task.spawn(function()
 			local ok, reply = request("POST", string.format("/api/upload?capture=%s&file=%s&part=%d", capture, service, i - 1), nil, part)
 			if not ok then
-				uploads.failure = reply or "Lost the connection to rogit serve."
+				uploads.failure = reply or "Lost the connection to RoGit."
 			end
 			uploads.pending -= 1
 		end)
@@ -1512,8 +1520,8 @@ render = function()
 		connection.Text, connection.TextColor3 = "● Offline", GREY
 	end
 	if not state.connected and not state.busy then
-		placeKind.Text, placeTitle.Text = "NOT CONNECTED", "Run rogit serve"
-		placeDetail.Text = "In your project folder, for example in VS Code's terminal."
+		placeKind.Text, placeTitle.Text = "NOT CONNECTED", "RoGit isn't running"
+		placeDetail.Text = "It starts when you log in. To start it now, run rogit serve in a terminal."
 	elseif state.archived then
 		placeKind.Text, placeTitle.Text = "ARCHIVED", escape(state.archived)
 		placeDetail.Text = "This branch was archived. Close this window without saving."
@@ -1537,20 +1545,16 @@ render = function()
 	elseif g and game.GameId == g.universe_id then
 		placeKind.Text, placeTitle.Text = "OTHER PLACE", escape(state.experience or game.Name)
 		placeDetail.Text = "RoGit works in " .. escape(g.name) .. "'s start place. Open that one to use it."
-	elseif g then
-		placeKind.Text, placeTitle.Text = "OTHER GAME", escape(state.experience or game.Name)
-		placeDetail.Text = "rogit serve is running for " .. escape(g.name) .. ". To use RoGit here, run rogit serve in "
-			.. "this game's project folder too."
 	elseif game.PlaceId == 0 or game.GameId == 0 then
-		placeKind.Text, placeTitle.Text = "NOT SET UP", escape(state.folder or "")
-		placeDetail.Text = "Open your published game's start place."
+		placeKind.Text, placeTitle.Text = "NOT PUBLISHED", escape(game.Name)
+		placeDetail.Text = "RoGit works with published games. Open your game's start place."
 	elseif state.isMain == nil then
 		placeKind.Text, placeTitle.Text, placeDetail.Text = "CHECKING", escape(state.experience or game.Name), ""
 	elseif state.isMain then
 		mode = "init"
 		placeKind.Text, placeTitle.Text = "SET UP", escape(state.experience or game.Name)
 		placeDetail.Text = "Init gives every object a small hidden ID, so RoGit can follow it between branches. "
-			.. "Scripts and Rojo's folders are left alone."
+			.. "Scripts are left alone."
 	else
 		placeKind.Text, placeTitle.Text = "NOT THE START PLACE", escape(state.experience or game.Name)
 		placeDetail.Text = "Open this game's start place to set up RoGit."
@@ -1642,12 +1646,12 @@ end
 local function call(method: string, path: string, body: any?): any
 	local ok, reply = request(method, path, body)
 	if not ok then
-		error(reply or "Lost the connection to rogit serve.", 0)
+		error(reply or "Lost the connection to RoGit.", 0)
 	end
 	return reply
 end
 
--- Copies this place to rogit serve and returns the capture ID and manifest.
+-- Copies this place to RoGit and returns the capture ID and manifest.
 local function copy(): (string, any)
 	local capture = newId(16)
 	return capture, copyPlace(capture)
@@ -1655,7 +1659,7 @@ end
 
 openBranch = function(name: string)
 	local ok, reply = request("POST", "/api/branches/open", { name = name })
-	state.problem = if ok then nil else (reply or "Couldn't reach rogit serve.")
+	state.problem = if ok then nil else (reply or "Couldn't reach RoGit.")
 	state.notice = if ok then "Opening " .. name .. "…" else nil
 	render()
 end
@@ -1665,13 +1669,13 @@ local function statusPath(): string
 	return "/api/rogit?place=" .. string.format("%d", game.PlaceId) .. file .. "&session=" .. SESSION
 end
 
--- Whether a rogit serve's reply is about this place: one of its branches, or a place in its game.
-local function servesThisPlace(reply: any): boolean
-	local g = reply.project and reply.project.game
-	return reply.branch ~= nil or reply.archived ~= nil or (g ~= nil and g.universe_id == game.GameId)
+-- A version ("1.2.3") as a number that sorts like the version.
+local function versionRank(version: any): number
+	local a, b, c = string.match(tostring(version), "^(%d+)%.(%d+)%.(%d+)")
+	return (tonumber(a) or 0) * 1e6 + (tonumber(b) or 0) * 1e3 + (tonumber(c) or 0)
 end
 
--- Looks through the ports for the rogit serve this place belongs to (or the best other one). Returns its reply.
+-- Looks through the ports for RoGit (the newest, if an older one is still running). Returns its reply.
 local lastSearch = 0
 local function findServer(): (boolean, any)
 	lastSearch = os.clock()
@@ -1680,7 +1684,7 @@ local function findServer(): (boolean, any)
 	for i, port in PORTS do
 		task.spawn(function()
 			local base = "http://127.0.0.1:" .. port
-			local ok, response = pcall(HttpService.RequestAsync, HttpService, { Url = base .. statusPath(), Method = "GET" })
+			local ok, response = pcall(HttpService.RequestAsync, HttpService, { Url = base .. withGame(statusPath()), Method = "GET" })
 			if ok and response.Success then
 				local decoded, reply = pcall(HttpService.JSONDecode, HttpService, response.Body)
 				if decoded and reply.server == "rogit" then
@@ -1693,17 +1697,10 @@ local function findServer(): (boolean, any)
 	while waiting > 0 do
 		task.wait()
 	end
-	-- This place's own project fits best, then one not set up yet (Init makes it this game's), then any other.
-	local function fit(reply: any): number
-		if servesThisPlace(reply) then
-			return 2
-		end
-		return if reply.project and reply.project.game == nil then 1 else 0
-	end
 	local best = nil
 	for i = 1, #PORTS do
 		local candidate = found[i]
-		if candidate and (best == nil or fit(candidate.reply) > fit(best.reply)) then
+		if candidate and (best == nil or versionRank(candidate.reply.version) > versionRank(best.reply.version)) then
 			best = candidate
 		end
 	end
@@ -1716,27 +1713,27 @@ end
 
 local function refresh()
 	local ok, reply = request("GET", statusPath())
-	-- Not the right rogit serve (or none): look through the ports now and then.
-	if (not ok or not servesThisPlace(reply)) and os.clock() - lastSearch > 5 then
+	-- RoGit isn't where it was (or never was): look through the ports now and then.
+	if not ok and os.clock() - lastSearch > 5 then
 		ok, reply = findServer()
 	end
 	if ok and not state.connected then
-		-- rogit serve (re)started, possibly in another folder: check this place again.
+		-- RoGit (re)started: check this place again.
 		state.isMain, state.problem = nil, nil
 	end
 	state.connected = ok
 	if ok then
-		state.folder = reply.project.folder
-		state.game = reply.project.game
-		state.rojo = reply.rojo
+		state.game = reply.project and reply.project.game
+		if type(reply.game) == "number" and reply.game ~= 0 then
+			state.branchGame = reply.game
+		end
 		state.branches = reply.branches or {}
 		state.branch = reply.branch
 		state.commits = reply.commits or {}
 		state.unsaved = reply.unsaved
 		state.graph = reply.graph or {}
 		state.archived = reply.archived
-		local otherGame = state.game ~= nil and (state.game :: Game).universe_id ~= game.GameId
-		if (not state.game or otherGame) and state.isMain == nil and game.PlaceId ~= 0 and game.GameId ~= 0 then
+		if not state.game and state.isMain == nil and game.PlaceId ~= 0 and game.GameId ~= 0 then
 			local found, place = request("GET", string.format("/api/place?game=%d&place=%d", game.GameId, game.PlaceId))
 			if found then
 				state.isMain, state.experience, state.problem = place.isMain, place.experience, nil
@@ -1761,7 +1758,7 @@ local function refresh()
 	if wanted and not state.busy then
 		run("Sending main to " .. wanted.branch .. "…", function()
 			local sent, failure = pcall(function()
-				tagObjects(state.rojo)
+				tagObjects()
 				local manifest = copyPlace(wanted.capture)
 				call("POST", "/api/main/copy", { capture = wanted.capture, manifest = manifest })
 			end)
@@ -1775,10 +1772,10 @@ local function refresh()
 end
 
 initButton.Activated:Connect(function()
-	run("Checking with rogit serve…", function()
-		local reply = call("POST", "/api/init", { game = game.GameId, place = game.PlaceId })
+	run("Checking with RoGit…", function()
+		call("POST", "/api/init", { game = game.GameId, place = game.PlaceId })
 		step("Giving every object an ID…")
-		local report = tagObjects(reply.rojo)
+		local report = tagObjects()
 		request("POST", "/api/init/done", report)
 		state.notice = string.format("Done: %d objects have an ID. Save main to keep them.", report.tagged)
 	end)
@@ -1793,7 +1790,7 @@ local function createBranch()
 		return
 	end
 	run("Copying main…", function()
-		tagObjects(state.rojo)
+		tagObjects()
 		local capture, manifest = copy()
 		step("Building " .. name .. "…")
 		call("POST", "/api/branches", { name = name, capture = capture, manifest = manifest })
@@ -1890,7 +1887,7 @@ local function startUpdate()
 	end
 	dropView()
 	run("Copying the branch…", function()
-		tagObjects(state.rojo)
+		tagObjects()
 		local capture, manifest = copy()
 		call("POST", "/api/branches/update", { name = branch.name, capture = capture, manifest = manifest })
 		step("Waiting for main… Keep " .. (if state.game then (state.game :: Game).name else "main") .. " open in Studio.")
@@ -1942,7 +1939,7 @@ startMerge = function(name: string)
 	end
 	dropView()
 	run("Copying main…", function()
-		tagObjects(state.rojo)
+		tagObjects()
 		local capture, manifest = copy()
 		step("Comparing " .. name .. " with main…")
 		local reply = call("POST", "/api/branches/merge", { name = name, capture = capture, manifest = manifest })
@@ -2382,7 +2379,7 @@ local function applyView()
 		state.view = nil
 		local done = string.format("%s: %d change%s.", verbs[3], applied, if applied == 1 then "" else "s")
 		if not clean then
-			done ..= string.format(" %d couldn't be applied; see the rogit serve terminal.", #problems)
+			done ..= string.format(" %d couldn't be applied.", #problems)
 		end
 		if kind == "merge" then
 			-- The graph shows the merge; only problems need a message.
@@ -2496,9 +2493,9 @@ local function startWatching()
 		watch.last = os.clock()
 	end
 
-	-- Only edits to the place count: Studio changes plenty of its own things (outlines, panels) all the time. Script
-	-- sources are Rojo's, so their edits don't count, but adding or removing a script changes its parent (a Folder with a
-	-- script inside isn't tracked).
+	-- Only edits to the place count: Studio changes plenty of its own things (outlines, panels) all the time. RoGit
+	-- leaves scripts alone, so their edits don't count, but adding or removing a script changes its parent (a Folder
+	-- with a script inside isn't tracked).
 	local function touched(object: Instance)
 		if object.ClassName == "Camera" or object:IsA("LuaSourceContainer") or not relevant(object) then
 			return
@@ -2510,39 +2507,17 @@ local function startWatching()
 		end
 		noteEdit()
 	end
-	-- Whether a new object is one Init would give an ID: saved, not a camera, and not inside something Rojo syncs or
-	-- something that isn't saved.
-	local rojoSet: { [string]: boolean } = {}
-	local rojoSource = nil
+	-- Whether a new object is one Init would give an ID: saved, not a camera, and not inside something that isn't saved.
 	local function trackable(object: Instance): boolean
-		local rojo = state.rojo
-		if rojo == nil or rojo.all or object:IsA("Camera") then
+		if object:IsA("Camera") then
 			return false
 		end
-		if rojoSource ~= rojo then
-			rojoSource, rojoSet = rojo, {}
-			for _, path in rojo.paths do
-				rojoSet[path] = true
-			end
-		end
-		local names = {}
 		local current = object
 		while not trackedSet[current] do
 			if not current.Archivable or current.Parent == nil then
 				return false
 			end
-			table.insert(names, current.Name)
 			current = current.Parent :: Instance
-		end
-		local path = current.Name
-		if rojoSet[path] then
-			return false
-		end
-		for i = #names, 1, -1 do
-			path ..= "/" .. names[i]
-			if rojoSet[path] then
-				return false
-			end
 		end
 		return true
 	end

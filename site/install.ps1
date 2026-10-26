@@ -1,9 +1,11 @@
-# Installs rogit on Windows: downloads the latest release into %LOCALAPPDATA%\rogit\bin, puts that folder on your PATH
-# and installs the RoGit Studio plugin. Run it again to update.
+# Installs RoGit on Windows: downloads the latest release into %LOCALAPPDATA%\rogit\bin, puts that folder on your PATH,
+# installs the RoGit Studio plugin, and starts RoGit in the background (and from now on whenever you log in). Run it
+# again to update.
 #
 #   powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"
 #
-# Set $env:ROGIT_VERSION = "v0.2.0" first to install that release instead of the latest.
+# Set $env:ROGIT_VERSION = "v0.2.0" first to install that release instead of the latest, or $env:ROGIT_NO_AUTOSTART = "1"
+# to start RoGit yourself (rogit serve).
 
 # Everything runs in its own scope: with `irm | iex` this script runs in your PowerShell session, and its variables
 # and settings shouldn't stay behind there.
@@ -85,14 +87,22 @@
         Write-Host "rogit is installed, but the Studio plugin wasn't. Run: rogit plugin install" -ForegroundColor Yellow
     }
 
+    # From now on RoGit runs in the background whenever you're logged in; this also restarts it after an update.
+    $started = $false
+    if (-not $env:ROGIT_NO_AUTOSTART) {
+        & $exe autostart
+        $started = $LASTEXITCODE -eq 0
+    }
+
     Write-Host ''
     Write-Host "$(& $exe --version) is installed in $bin."
     if ($added) {
-        Write-Host 'Added it to your PATH. Restart VS Code and other open terminals so they pick it up.'
+        Write-Host 'Added it to your PATH for new terminals.'
+    }
+    if (-not $started) {
+        Write-Host 'Start RoGit with: rogit serve'
     }
     Write-Host ''
-    Write-Host "Next: in your game's project folder, run"
-    Write-Host ''
-    Write-Host '    rogit serve' -ForegroundColor Cyan
+    Write-Host "Next, in Roblox Studio: open your game's start place, then Plugins > RoGit, and click Init."
     Write-Host ''
 }

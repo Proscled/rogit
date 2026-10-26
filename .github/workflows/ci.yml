@@ -38,6 +38,9 @@ jobs:
       - run: cargo build --release --locked
       - name: Install on macOS
         if: runner.os == 'macOS'
+        # A CI machine has no login session for a LaunchAgent; starting at login is checked by hand.
+        env:
+          ROGIT_NO_AUTOSTART: "1"
         run: |
           (cd target/release && zip -q "$RUNNER_TEMP/rogit.zip" rogit)
           mkdir -p "$RUNNER_TEMP/fake"
@@ -58,11 +61,23 @@ jobs:
           function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing) Copy-Item "$env:RUNNER_TEMP\rogit.zip" $OutFile }
           Get-Content site\install.ps1 -Raw | Invoke-Expression
           $bin = "$env:LOCALAPPDATA\rogit\bin"
-          # Update while rogit serve has rogit.exe open.
-          $serve = Start-Process "$bin\rogit.exe" -ArgumentList serve -WorkingDirectory $env:RUNNER_TEMP -PassThru
-          Start-Sleep -Seconds 2
+          # RoGit runs in the background and starts at login.
+          function Wait-RoGit {
+            for ($i = 0; $i -lt 20; $i++) {
+              try { return Invoke-RestMethod http://127.0.0.1:34875/api/rogit } catch { Start-Sleep -Milliseconds 500 }
+            }
+            throw 'RoGit is not running in the background.'
+          }
+          $reply = Wait-RoGit
+          if ($reply.server -ne 'rogit') { throw "Unexpected reply: $reply" }
+          $run = (Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).RoGit
+          if ($run -notlike 'wscript.exe *start.vbs*') { throw "RoGit doesn't start at login: $run" }
+          # Update while the background RoGit has rogit.exe open.
+          $before = (Get-Process rogit).Id
           Get-Content site\install.ps1 -Raw | Invoke-Expression
-          Stop-Process -Id $serve.Id
+          Wait-RoGit | Out-Null
+          $after = (Get-Process rogit).Id
+          if (@($after).Count -ne 1 -or $before -contains $after) { throw "The update didn't replace the running RoGit: $before -> $after" }
           $key = Get-Item HKCU:\Environment
           if ($key.GetValueKind('Path') -ne 'ExpandString') { throw 'PATH is no longer an expandable string.' }
           $path = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';'

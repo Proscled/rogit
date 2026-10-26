@@ -1,7 +1,6 @@
 //! Compares a branch with its starting point, object by object, and lays the result out like Studio's Explorer.
 
 use crate::place::property_type;
-use crate::project::RojoPaths;
 use rbx_dom_weak::types::{CFrame, Ref, Variant, Vector3};
 use rbx_dom_weak::{Instance, WeakDom};
 use rbx_reflection::DataType;
@@ -13,6 +12,8 @@ pub const TAG: &str = "RoGitId";
 pub const MERGES: &str = "RoGitMerges";
 /// Workspace attribute in a branch that records the last update from main.
 pub const UPDATE: &str = "RoGitUpdate";
+/// Workspace attribute in a branch file that says which game and branch it is: "<game ID>:<name>".
+pub const BRANCH: &str = "RoGitBranch";
 const MAX_ROWS: usize = 2000;
 /// Services whose contents are saved in place files. Matches the plugin's list.
 pub(crate) const SERVICES: [&str; 18] = [
@@ -149,37 +150,25 @@ pub(crate) fn tag(inst: &Instance) -> Option<String> {
     })
 }
 
-/// Lists what RoGit tracks, using the same rules as the plugin: everything in the saved services except
-/// scripts, Folders that contain a script anywhere inside, and whatever Rojo syncs. Objects are keyed by their
-/// RoGit ID; objects without one (or with a copied one) are keyed by their path.
-pub(crate) fn index(dom: &WeakDom, rojo: &RojoPaths) -> Index {
+/// Lists what RoGit tracks, using the same rules as the plugin: everything in the saved services except scripts and
+/// Folders that contain a script anywhere inside. Objects are keyed by their RoGit ID; objects without one (or with a
+/// copied one) are keyed by their path.
+pub(crate) fn index(dom: &WeakDom) -> Index {
     let mut index = Index::default();
-    if rojo.all {
-        return index;
-    }
-    let rojo: HashSet<&str> = rojo.paths.iter().map(String::as_str).collect();
     let mut untagged: HashMap<String, usize> = HashMap::new();
     for &service_ref in dom.root().children() {
         let service = dom.get_by_ref(service_ref).unwrap();
-        if !SERVICES.contains(&service.class.as_str()) || rojo.contains(service.name.as_str()) {
+        if !SERVICES.contains(&service.class.as_str()) {
             continue;
         }
         let key = format!("service:{}", service.name);
         index.push(Entry { key: key.clone(), own_key: key.clone(), referent: service_ref, parent: None, path: service.name.clone() });
-        visit(dom, service_ref, &service.name, &key, &rojo, &mut untagged, &mut index);
+        visit(dom, service_ref, &service.name, &key, &mut untagged, &mut index);
     }
     index
 }
 
-fn visit(
-    dom: &WeakDom,
-    parent: Ref,
-    parent_path: &str,
-    parent_key: &str,
-    rojo: &HashSet<&str>,
-    untagged: &mut HashMap<String, usize>,
-    index: &mut Index,
-) -> bool {
+fn visit(dom: &WeakDom, parent: Ref, parent_path: &str, parent_key: &str, untagged: &mut HashMap<String, usize>, index: &mut Index) -> bool {
     let mut has_script = false;
     for &child_ref in dom.get_by_ref(parent).unwrap().children() {
         let child = dom.get_by_ref(child_ref).unwrap();
@@ -192,9 +181,6 @@ fn visit(
         if child.class.as_str() == "Camera" {
             continue;
         }
-        if rojo.contains(path.as_str()) {
-            continue;
-        }
         let key = match tag(child).filter(|id| !index.by_key.contains_key(id)) {
             Some(id) => id,
             None => {
@@ -205,7 +191,7 @@ fn visit(
         };
         let mark = index.entries.len();
         index.push(Entry { key: key.clone(), own_key: key.clone(), referent: child_ref, parent: Some(parent_key.to_owned()), path: path.clone() });
-        if visit(dom, child_ref, &path, &key, rojo, untagged, index) {
+        if visit(dom, child_ref, &path, &key, untagged, index) {
             has_script = true;
             if child.class.as_str() == "Folder" {
                 index.truncate(mark);
@@ -240,7 +226,7 @@ fn close_cframe(a: &CFrame, b: &CFrame) -> bool {
 /// Attributes that never count as changes: RoGit's own, and the `RBX_` ones Roblox keeps for itself (for example
 /// while upgrading a place's lighting).
 pub(crate) fn own_attribute(name: &str) -> bool {
-    name == TAG || name == MERGES || name == UPDATE || name.starts_with("RBX_")
+    name == TAG || name == MERGES || name == UPDATE || name == BRANCH || name.starts_with("RBX_")
 }
 
 /// Equal, allowing for rounding in saved numbers. References compare by what they point at.
@@ -619,13 +605,13 @@ pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync)
 }
 
 /// Everything that changed between the starting point and the branch now.
-pub fn compare(start: &WeakDom, current: &WeakDom, rojo: &RojoPaths) -> Review {
-    compare_with(start, &index(start, rojo), current, rojo)
+pub fn compare(start: &WeakDom, current: &WeakDom) -> Review {
+    compare_with(start, &index(start), current)
 }
 
 /// Like `compare`, with the starting point's index made once and kept (a big place takes a while to index).
-pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom, rojo: &RojoPaths) -> Review {
-    let mut new = index(current, rojo);
+pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom) -> Review {
+    let mut new = index(current);
     adopt_new_ids(start, &old, current, &mut new);
     let mut tree = Tree::default();
     let mut summary = Summary::default();
@@ -711,7 +697,7 @@ mod tests {
         let gate = current.descendants().find(|i| i.name == "Gate").unwrap().referent();
         current.transfer_within(gate, current.root_ref());
         current.transfer_within(gate, map);
-        let review = compare(&start, &current, &RojoPaths::default());
+        let review = compare(&start, &current);
         assert_eq!(review.summary, Summary::default());
     }
 
@@ -745,7 +731,7 @@ mod tests {
         // Rename the tower and nudge its size by less than rounding.
         let tower = current.descendants().find(|i| i.name == "Tower").unwrap().referent();
         current.get_by_ref_mut(tower).unwrap().name = "Watchtower".into();
-        let review = compare(&start, &current, &RojoPaths::default());
+        let review = compare(&start, &current);
         assert_eq!(review.summary, Summary { added: 1, removed: 1, changed: 2 });
         let row = |name: &str| review.rows.iter().find(|r| r.name == name).unwrap();
         assert_eq!(row("Gate").status, Status::Changed);
@@ -771,7 +757,7 @@ mod tests {
         let mut attributes = Attributes::new();
         attributes.insert(TAG.to_owned(), Variant::BinaryString(b"late".to_vec().into()));
         current.get_by_ref_mut(effects).unwrap().properties.insert("Attributes".into(), Variant::Attributes(attributes));
-        let review = compare(&start, &current, &RojoPaths::default());
+        let review = compare(&start, &current);
         assert_eq!(review.summary, Summary::default());
     }
 
@@ -794,7 +780,7 @@ mod tests {
                 dom.get_by_ref_mut(r).unwrap().properties.insert(property.into(), value);
             }
         }
-        let review = compare(&start, &current, &RojoPaths::default());
+        let review = compare(&start, &current);
         assert_eq!(review.summary.changed, 1);
         let shed = review.rows.iter().find(|r| r.name == "Shed").unwrap();
         assert_eq!(shed.changes[0].name, "Pivot");
@@ -814,7 +800,7 @@ mod tests {
                 dom.get_by_ref_mut(r).unwrap().properties.insert("CFrame".into(), at(x));
             }
         }
-        let review = compare(&start, &current, &RojoPaths::default());
+        let review = compare(&start, &current);
         let names: Vec<&str> = review.rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["Workspace", "Map"]);
         assert_eq!(review.rows[1].changes, vec![Change::new("Moved inside", "", "3 objects")]);
@@ -831,7 +817,7 @@ mod tests {
         attributes.insert("RBX_LightingCompatibilityMigrated".to_owned(), Variant::Bool(true));
         attributes.insert(UPDATE.to_owned(), Variant::String("u1".into()));
         current.get_by_ref_mut(gate).unwrap().properties.insert("Attributes".into(), Variant::Attributes(attributes));
-        assert_eq!(compare(&start, &current, &RojoPaths::default()).summary, Summary::default());
+        assert_eq!(compare(&start, &current).summary, Summary::default());
     }
 
     #[test]
@@ -842,7 +828,7 @@ mod tests {
             dom.insert(workspace, tagged("Terrain", "Terrain", "terrain").with_property("SmoothGrid", Variant::BinaryString(data.to_vec().into())));
             dom
         };
-        let review = compare(&terrain(b"before"), &terrain(b"after"), &RojoPaths::default());
+        let review = compare(&terrain(b"before"), &terrain(b"after"));
         let row = review.rows.iter().find(|r| r.name == "Terrain").unwrap();
         assert_eq!(row.changes, vec![Change::new("Voxels", "", "changed")]);
     }
@@ -869,7 +855,7 @@ mod tests {
 
     #[test]
     fn identical_places_have_no_changes() {
-        let review = compare(&place(0.5, "Tower", true, false), &place(0.5, "Tower", true, false), &RojoPaths::default());
+        let review = compare(&place(0.5, "Tower", true, false), &place(0.5, "Tower", true, false));
         assert_eq!(review.summary, Summary::default());
         assert!(review.rows.is_empty());
     }
@@ -889,18 +875,17 @@ mod bench {
         let current = crate::place::read(std::path::Path::new(&path)).unwrap();
         let read = started.elapsed();
         let started = std::time::Instant::now();
-        let index_only = index(&start, &RojoPaths::default()).entries.len();
+        let index_only = index(&start).entries.len();
         let indexed = started.elapsed();
         let started = std::time::Instant::now();
-        let review = compare(&start, &current, &RojoPaths::default());
+        let review = compare(&start, &current);
         println!(
             "{} objects tracked: read both {:?}, index one {:?}, compare {:?} ({} rows)",
             index_only, read, indexed, started.elapsed(), review.rows.len()
         );
-        let rojo = RojoPaths::default();
-        let old = index(&start, &rojo);
+        let old = index(&start);
         let t = std::time::Instant::now();
-        let mut new = index(&current, &rojo);
+        let mut new = index(&current);
         let index_time = t.elapsed();
         let t = std::time::Instant::now();
         adopt_new_ids(&start, &old, &current, &mut new);
@@ -915,7 +900,7 @@ mod bench {
         println!("PHASES index {index_time:?}, adopt {adopt_time:?}, property compare {:?} ({n} changes)", t.elapsed());
         for _ in 0..3 {
             let t = std::time::Instant::now();
-            compare_with(&start, &old, &current, &rojo);
+            compare_with(&start, &old, &current);
             println!("PHASES compare_with (each refresh) {:?}", t.elapsed());
         }
         let t = std::time::Instant::now();
@@ -925,7 +910,7 @@ mod bench {
         let copy = crate::live::copy_of(&current).unwrap();
         let copy_time = t.elapsed();
         let t = std::time::Instant::now();
-        let plan = crate::merge::plan(&start, &current, &copy, &rojo, crate::merge::Direction::Merge).unwrap();
+        let plan = crate::merge::plan(&start, &current, &copy, crate::merge::Direction::Merge).unwrap();
         println!("PHASES write {write_time:?}, copy {copy_time:?}, merge plan {:?} ({} ops)", t.elapsed(), plan.operations.len());
     }
 }

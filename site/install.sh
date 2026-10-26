@@ -1,10 +1,12 @@
 #!/bin/sh
-# Installs rogit on macOS: downloads the latest release into ~/.rogit/bin, puts that folder on your PATH and installs
-# the RoGit Studio plugin. Run it again to update.
+# Installs RoGit on macOS: downloads the latest release into ~/.rogit/bin, puts that folder on your PATH, installs the
+# RoGit Studio plugin, and starts RoGit in the background (and from now on whenever you log in). Run it again to
+# update.
 #
 #   curl -fsSL https://__SITE__/install.sh | sh
 #
-# ROGIT_VERSION=v0.2.0 installs that release instead of the latest.
+# ROGIT_VERSION=v0.2.0 installs that release instead of the latest. ROGIT_NO_AUTOSTART=1 leaves starting RoGit to you
+# (rogit serve).
 
 set -eu
 
@@ -88,10 +90,17 @@ fi
 
 "$bin/rogit" plugin install
 
+# From now on RoGit runs in the background whenever you're logged in; this also restarts it after an update.
+started=""
+if [ -z "${ROGIT_NO_AUTOSTART:-}" ]; then
+    "$bin/rogit" autostart && started=1
+fi
+
 printf '\n%s is installed in ~/.rogit/bin.\n' "$("$bin/rogit" --version)"
 [ -n "$changed" ] && printf 'Added it to your PATH in%s.\n' "$changed"
 found="$(command -v rogit 2>/dev/null || true)"
 if [ -n "$found" ] && [ "$found" != "$bin/rogit" ]; then
     printf '\nNote: there is also a rogit at %s. If `rogit --version` in a new terminal shows another version, remove that one.\n' "$found"
 fi
-printf '\nNext: open a new terminal (VS Code: Terminal > New Terminal) in your game'"'"'s project folder and run\n\n    rogit serve\n\n'
+[ -z "$started" ] && printf '\nStart RoGit with: rogit serve\n'
+printf '\nNext, in Roblox Studio: open your game'"'"'s start place, then Plugins > RoGit, and click Init.\n\n'

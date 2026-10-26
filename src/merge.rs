@@ -4,7 +4,6 @@
 //! of changed and new objects.
 
 use crate::diff::{self, Change, IGNORED, Index, Row, Status, Tree};
-use crate::project::RojoPaths;
 use base64::Engine;
 use rbx_dom_weak::types::{Attributes, Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, Ustr, WeakDom};
@@ -83,7 +82,7 @@ pub struct Summary {
     pub removed: usize,
     pub changed: usize,
     pub conflicts: usize,
-    /// Scripts inside added or removed objects. Added ones are left out; Rojo keeps scripts.
+    /// Scripts inside added or removed objects. Added ones are left out: RoGit never brings scripts over.
     pub scripts_left_out: usize,
 }
 
@@ -256,7 +255,7 @@ impl Builder<'_> {
     }
 
     /// The source's whole new object, with references to objects outside it recorded as fixups. Scripts are left
-    /// out (Rojo keeps scripts).
+    /// out: RoGit never brings scripts over.
     fn subtree(&mut self, key: &str) -> (usize, Vec<Fixup>) {
         let original = self.source.index.get(key).unwrap().referent;
         let copy = self.source.dom.clone_into_external(original, &mut self.bundle);
@@ -510,12 +509,12 @@ fn workspace_attribute(dom: &WeakDom, name: &str) -> Option<String> {
 
 /// Plans bringing what `source` changed since `base` into `target`: the branch into main for a merge, main into the
 /// branch for an update.
-pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, rojo: &RojoPaths, direction: Direction) -> Result<Plan, String> {
+pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, direction: Direction) -> Result<Plan, String> {
     // The three places are indexed at the same time; on a big game each takes about a tenth of a second.
     let (base_index, mut source_index, mut target_index) = std::thread::scope(|scope| {
-        let source = scope.spawn(|| diff::index(source, rojo));
-        let target = scope.spawn(|| diff::index(target, rojo));
-        (diff::index(base, rojo), source.join().unwrap(), target.join().unwrap())
+        let source = scope.spawn(|| diff::index(source));
+        let target = scope.spawn(|| diff::index(target));
+        (diff::index(base), source.join().unwrap(), target.join().unwrap())
     });
     diff::adopt_new_ids(base, &base_index, source, &mut source_index);
     diff::adopt_new_ids(base, &base_index, target, &mut target_index);
@@ -640,7 +639,7 @@ mod tests {
         let mut main = place();
         set(&mut main, "Tower", "Size", Variant::Vector3(Vector3::new(9.0, 9.0, 9.0)));
 
-        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.summary, Summary { added: 1, removed: 1, changed: 1, conflicts: 0, scripts_left_out: 1 });
         assert!(plan.operations.iter().any(|op| matches!(op, Op::Set { target, properties, .. } if target == "gate" && properties == &["Color"])));
         assert!(plan.operations.iter().any(|op| matches!(op, Op::Remove { target, conflict: None } if target == "shed")));
@@ -664,7 +663,7 @@ mod tests {
         set(&mut main, "Roof", "Size", Variant::Vector3(Vector3::new(8.0, 1.0, 8.0)));
         remove(&mut branch, "Shed");
 
-        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.summary.conflicts, 2);
         let gate = plan.rows.iter().find(|r| r.name == "Gate").unwrap();
         assert_eq!(gate.changes[0].old, "0, 0, 255");
@@ -682,7 +681,7 @@ mod tests {
         for dom in [&mut branch, &mut main] {
             set(dom, "Gate", "Color", Variant::Color3(Color3::new(1.0, 0.0, 0.0)));
         }
-        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.summary, Summary::default());
         assert!(plan.operations.is_empty());
     }
@@ -710,11 +709,11 @@ mod tests {
 
         assert_eq!(last_merge(&main, "test-1").as_deref(), Some("m1"));
         assert_eq!(last_merge(&main, "other"), None);
-        let again = plan(&merged, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
+        let again = plan(&merged, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(again.summary, Summary { changed: 1, ..Summary::default() });
         assert!(matches!(&again.operations[..], [Op::Set { target, conflict: None, .. }] if target == "gate"));
         // Measured from the starting point instead, the gate would look changed on both sides.
-        let from_start = plan(&place(), &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
+        let from_start = plan(&place(), &branch, &main, Direction::Merge).unwrap();
         assert_eq!(from_start.summary.conflicts, 1);
     }
 
@@ -729,7 +728,7 @@ mod tests {
         set(&mut branch, "Tower", "Size", Variant::Vector3(Vector3::new(9.0, 9.0, 9.0)));
         set(&mut branch, "Roof", "Size", Variant::Vector3(Vector3::new(6.0, 1.0, 6.0)));
 
-        let plan = plan(&start, &main, &branch, &RojoPaths::default(), Direction::Update).unwrap();
+        let plan = plan(&start, &main, &branch, Direction::Update).unwrap();
         assert!(plan.operations.iter().any(|op| matches!(op, Op::Set { target, conflict: None, .. } if target == "gate")));
         // The branch's own work stays.
         assert!(!plan.operations.iter().any(|op| matches!(op, Op::Set { target, .. } if target == "tower")));
@@ -752,7 +751,7 @@ mod tests {
         let branch = placed(at(10.0, 0.0), at(10.0, 0.0));
         let main = placed(at(0.0, 5.0), at(0.0, 5.0));
 
-        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.conflicts.len(), 1, "one choice for the whole move");
         let id = plan.conflicts[0].id;
         let conflicts: Vec<Option<usize>> = plan.operations.iter().map(|op| match op {
@@ -773,7 +772,7 @@ mod tests {
         let map = branch.descendants().find(|i| i.name == "Map").unwrap().referent();
         branch.insert(map, tagged("Part", "Gate", "gate"));
         let main = place();
-        let plan = plan(&start, &branch, &main, &RojoPaths::default(), Direction::Merge).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.summary.added, 1);
         let bundle = base64::engine::general_purpose::STANDARD.decode(&plan.bundle).unwrap();
         let bundle = rbx_binary::from_reader(&bundle[..]).unwrap();
@@ -783,7 +782,7 @@ mod tests {
 
     #[test]
     fn an_object_main_already_has_is_not_added_twice() {
-        let plan = plan(&place(), &first_round(), &first_round(), &RojoPaths::default(), Direction::Merge).unwrap();
+        let plan = plan(&place(), &first_round(), &first_round(), Direction::Merge).unwrap();
         assert!(!plan.operations.iter().any(|op| matches!(op, Op::Add { .. })));
     }
 }

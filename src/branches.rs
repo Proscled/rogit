@@ -172,7 +172,8 @@ impl Branches {
     }
 
     /// Builds `<name>.rbxl` from an uploaded copy of main.
-    pub fn create(&self, name: &str, capture: &str, manifest: &Value) -> Result<place::BuildReport, String> {
+    /// Makes branch `name` of game `game` from main's copy, uploaded under `capture`.
+    pub fn create(&self, name: &str, capture: &str, manifest: &Value, game: u64) -> Result<place::BuildReport, String> {
         if !valid_name(name) {
             return Err("Use 1–40 letters, numbers, - or _ for the branch name, starting with a letter or number.".into());
         }
@@ -181,7 +182,7 @@ impl Branches {
         }
         fs::create_dir_all(self.dir()).map_err(|e| e.to_string())?;
         let upload = self.upload_dir(capture);
-        let report = place::build(&upload, manifest, &self.file(name));
+        let report = place::build(&upload, manifest, &self.file(name), &format!("{game}:{name}"));
         let _ = fs::remove_dir_all(&upload);
         let report = report?;
         self.save(&Branch { name: name.to_owned(), created: now(), has_starting_point: false, merged: None, updated: None, pinned: false })?;
@@ -189,7 +190,7 @@ impl Branches {
     }
 
     /// Keeps the copy taken when the branch first opened as its starting point.
-    pub fn set_starting_point(&self, name: &str, capture: &str, manifest: &Value) -> Result<(), String> {
+    pub fn set_starting_point(&self, name: &str, capture: &str, manifest: &Value, game: u64) -> Result<(), String> {
         let mut branch = self.get(name).ok_or_else(|| format!("There's no branch called {name}."))?;
         let target = self.dir().join(name).join("start");
         let _ = fs::remove_dir_all(&target);
@@ -197,7 +198,7 @@ impl Branches {
         fs::write(target.join("manifest.json"), manifest.to_string()).map_err(|e| e.to_string())?;
         // Studio changes some things when it opens a file (its lighting upgrade, for example). Rewrite the
         // branch file from the starting point, so it matches it until you save the branch yourself.
-        place::build(&target, manifest, &self.file(name))?;
+        place::build(&target, manifest, &self.file(name), &format!("{game}:{name}"))?;
         branch.has_starting_point = true;
         self.save(&branch)
     }

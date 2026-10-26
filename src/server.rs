@@ -1,11 +1,12 @@
-//! `rogit serve`: the local server the Studio plugin talks to, like `rojo serve`.
+//! `rogit serve`: the local server the Studio plugin talks to. One serves every game; each game's data is in its own
+//! folder (see `project`).
 
 use crate::branches::{self, Branches, Commit, Since};
 use crate::diff;
 use crate::history::{Event, History};
 use crate::live::Live;
 use crate::merge::{self, Direction};
-use crate::project::{DATA_DIR, Game, Project};
+use crate::project::{self, Game, Project};
 use crate::roblox::Roblox;
 use base64::Engine;
 use serde_json::{Value, json};
@@ -14,13 +15,15 @@ use rbx_dom_weak::WeakDom;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-/// The ports rogit serve uses: the first free one, so several projects can be served at once. The plugin looks
-/// through them for the project its place belongs to.
+/// The ports rogit serve can use: the first free one. The plugin looks through them for it.
 pub const PORTS: std::ops::RangeInclusive<u16> = 34875..=34879;
 
 type Reply = Result<Value, (u16, String)>;
 
+/// One game: its data folder and what's going on with its branches.
 struct State {
+    /// The game's ID (Roblox's universe ID).
+    id: u64,
     project: Project,
     branches: Branches,
     roblox: Roblox,
@@ -48,11 +51,11 @@ struct State {
 }
 
 impl State {
-    fn new(project: Project) -> State {
-        let branches = Branches::new(project.root.join(DATA_DIR));
-        let history = History::new(project.root.join(DATA_DIR));
+    fn new(id: u64, project: Project) -> State {
+        let branches = Branches::new(project.root.clone());
+        let history = History::new(project.root.clone());
         State {
-            project, branches, history, roblox: Roblox::new(), seen_places: HashSet::new(), planned: HashMap::new(),
+            id, project, branches, history, roblox: Roblox::new(), seen_places: HashSet::new(), planned: HashMap::new(),
             updates: HashMap::new(), restores: HashMap::new(), sessions: HashMap::new(), unsaved: HashMap::new(),
             committed: HashMap::new(), live: HashMap::new(), recovering: HashSet::new(),
         }
@@ -87,8 +90,48 @@ struct Update {
 const MAIN_PICKUP: Duration = Duration::from_secs(30);
 const MAIN_COPY: Duration = Duration::from_secs(180);
 
-/// Serves `project` on `port`, or on the first free port of `PORTS`.
-pub fn serve(project: Project, port: Option<u16>) -> Result<(), String> {
+/// Every game RoGit has data for, loaded when Studio first asks about it.
+struct Games {
+    /// The folder with a folder per game.
+    root: std::path::PathBuf,
+    games: HashMap<u64, State>,
+}
+
+impl Games {
+    fn new(root: std::path::PathBuf) -> Games {
+        Games { root, games: HashMap::new() }
+    }
+
+    fn get(&mut self, id: u64) -> &mut State {
+        let root = &self.root;
+        self.games.entry(id).or_insert_with(|| State::new(id, Project::new(root.join(id.to_string()))))
+    }
+
+    /// The folders of the games set up so far, by ID.
+    fn known(&self) -> Vec<(u64, Project)> {
+        let entries = std::fs::read_dir(&self.root).into_iter().flatten().flatten();
+        let mut games: Vec<(u64, Project)> =
+            entries.filter_map(|e| Some((e.file_name().to_str()?.parse().ok()?, Project::new(e.path())))).collect();
+        games.sort_by_key(|(id, _)| *id);
+        games
+    }
+
+    /// The game a branch belongs to, for branch files made before they said so themselves.
+    fn find_branch(&self, name: &str) -> Option<u64> {
+        self.known().into_iter().find(|(_, project)| Branches::new(project.root.clone()).get(name).is_some()).map(|(id, _)| id)
+    }
+}
+
+/// Serves every game on `port`, or on the first free port of `PORTS`. Does nothing if RoGit is already running.
+pub fn serve(port: Option<u16>) -> Result<(), String> {
+    // A second server would work on the same files as the first.
+    if let Some((running, version)) = running() {
+        if newer_or_same(&version, env!("CARGO_PKG_VERSION")) {
+            println!("RoGit is already running on http://127.0.0.1:{running}.");
+            return Ok(());
+        }
+        println!("An older RoGit ({version}) is running on port {running}. Stop it, so Studio talks to this one.");
+    }
     let ports: Vec<u16> = match port {
         Some(port) => vec![port],
         None => PORTS.collect(),
@@ -97,27 +140,42 @@ pub fn serve(project: Project, port: Option<u16>) -> Result<(), String> {
     let Some((port, server)) = found else {
         return Err(match port {
             Some(port) => format!("Couldn't listen on port {port}; something else is using it."),
-            None => format!("Ports {} to {} are all in use; is rogit serve already running five times?", PORTS.start(), PORTS.end()),
+            None => format!("Ports {} to {} are all in use.", PORTS.start(), PORTS.end()),
         });
     };
-    let address = format!("127.0.0.1:{port}");
-    let mut state = State::new(project);
-    println!("RoGit {} is serving {} on http://{address}", env!("CARGO_PKG_VERSION"), state.project.folder_name());
-    match state.project.config() {
-        Ok(Some(config)) => println!("Project: {} (main place {})", config.game.name, config.game.main_place_id),
-        Ok(None) => println!("Not set up yet. Open your game's start place in Studio and click Init in the RoGit panel."),
-        Err(e) => println!("Warning: {e}"),
+    let mut games = Games::new(project::games()?);
+    println!("RoGit {} is running on http://127.0.0.1:{port}. Leave it running while you use RoGit in Studio.", env!("CARGO_PKG_VERSION"));
+    for (_, project) in games.known() {
+        if let Ok(Some(config)) = project.config() {
+            println!("  {} (main place {})", config.game.name, config.game.main_place_id);
+        }
     }
     loop {
         match server.recv_timeout(Duration::from_millis(500)) {
             Ok(Some(request)) => {
-                handle(&mut state, request);
-                autosave(&mut state, false);
+                handle(&mut games, request);
+                games.games.values_mut().for_each(|state| autosave(state, false));
             }
-            Ok(None) => autosave(&mut state, true),
+            Ok(None) => games.games.values_mut().for_each(|state| autosave(state, true)),
             Err(e) => return Err(format!("The server stopped: {e}")),
         }
     }
+}
+
+/// A RoGit already running on this computer: its port and version.
+fn running() -> Option<(u16, String)> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_millis(500))).build().into();
+    PORTS.into_iter().find_map(|port| {
+        let text = agent.get(&format!("http://127.0.0.1:{port}/api/rogit")).call().ok()?.body_mut().read_to_string().ok()?;
+        let reply: Value = serde_json::from_str(&text).ok()?;
+        (reply["server"] == "rogit").then(|| (port, reply["version"].as_str().unwrap_or("0").to_owned()))
+    })
+}
+
+/// Whether version `a` ("1.2.3") is at least `b`.
+fn newer_or_same(a: &str, b: &str) -> bool {
+    let parts = |v: &str| v.split('.').map(|n| n.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    parts(a) >= parts(b)
 }
 
 /// Writes each open branch's copy in memory to disk as its autosave. A big place takes a fifth of a second to write,
@@ -139,13 +197,23 @@ fn autosave(state: &mut State, idle: bool) {
     }
 }
 
-fn handle(state: &mut State, mut request: Request) {
+fn handle(games: &mut Games, mut request: Request) {
     let started = Instant::now();
     let mut body = String::new();
     let _ = request.as_reader().read_to_string(&mut body);
     let url = request.url().to_owned();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
-    let result = route(state, request.method(), path, query, &body);
+    // The plugin says which game every request is about. A branch file from before branches said which game they're
+    // from is found by its name.
+    let file = decode(param(query, "file").unwrap_or(""));
+    let game = number(query, "game")
+        .filter(|id| *id != 0)
+        .or_else(|| file.strip_suffix(".rbxl").filter(|name| branches::valid_name(name)).and_then(|name| games.find_branch(name)));
+    let result = match game {
+        Some(id) => route(games.get(id), request.method(), path, query, &body),
+        None if path == "/api/rogit" => Ok(json!({ "server": "rogit", "version": env!("CARGO_PKG_VERSION"), "game": null })),
+        None => Err((400, "Open a published game's place in Studio, or one of its branches.".to_owned())),
+    };
     let (code, value) = match result {
         Ok(value) => (200, value),
         Err((code, message)) => (code, json!({ "error": message })),
@@ -233,6 +301,34 @@ mod tests {
     use rbx_dom_weak::types::{Ref, Variant};
 
     #[test]
+    fn finds_the_game_of_a_branch_and_keeps_games_apart() {
+        let root = std::env::temp_dir().join(format!("rogit-games-{}", std::process::id()));
+        let mut games = Games::new(root.clone());
+        for (id, name) in [(10, "Tycoon"), (20, "Obby")] {
+            games.get(id).project.init(Game { name: name.into(), universe_id: id, main_place_id: id + 1 }).unwrap();
+        }
+        // A branch of the obby, made the way rogit serve makes one.
+        let store = &games.get(20).branches;
+        let upload = store.upload_dir("copy12345");
+        std::fs::create_dir_all(&upload).unwrap();
+        store.create("lobby", "copy12345", &json!({ "services": [] }), 20).unwrap();
+        assert_eq!(games.find_branch("lobby"), Some(20));
+        assert_eq!(games.find_branch("nothing"), None);
+        assert!(games.get(10).branches.list().is_empty());
+        let status = status(games.get(20), "place=0&file=lobby.rbxl");
+        assert_eq!((status["game"].clone(), status["branch"]["name"].clone()), (json!(20), json!("lobby")));
+        assert_eq!(status["project"]["game"]["name"], json!("Obby"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compares_versions() {
+        assert!(newer_or_same("0.2.0", "0.2.0"));
+        assert!(newer_or_same("0.10.0", "0.9.1"));
+        assert!(!newer_or_same("0.1.0", "0.2.0"));
+    }
+
+    #[test]
     fn decodes_studio_url_encoding() {
         assert_eq!(super::decode("test%2D1%2Erbxl"), "test-1.rbxl");
         assert_eq!(super::decode("a+b%20c%"), "a b c%");
@@ -248,9 +344,9 @@ mod tests {
         let Ok(path) = std::env::var("ROGIT_BENCH_PLACE") else { return };
         let place = crate::place::read(std::path::Path::new(&path)).unwrap();
         let root = std::env::temp_dir().join(format!("rogit-replay-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("rogit.toml"), "[game]\nname = \"Bench\"\nuniverse_id = 1\nmain_place_id = 2\n").unwrap();
-        let mut state = State::new(Project::new(root.clone()));
+        let project = Project::new(root.clone());
+        project.init(Game { name: "Bench".into(), universe_id: 1, main_place_id: 2 }).unwrap();
+        let mut state = State::new(1, project);
 
         // Studio's session IDs, made up: one per object, listed in the plugin's walk order.
         let mut ids: HashMap<Ref, String> = HashMap::new();
@@ -293,7 +389,7 @@ mod tests {
 
         // New branch (made directly: the request would open it in Studio), then its window's first full copy.
         let manifest = upload(&state, "benchmain1");
-        state.branches.create("bench", "benchmain1", &manifest).unwrap();
+        state.branches.create("bench", "benchmain1", &manifest, 1).unwrap();
         let manifest = upload(&state, "benchstart1");
         timed(&mut state, "starting point", "/api/branches/start", json!({ "name": "bench", "capture": "benchstart1", "manifest": manifest }));
         let manifest = upload(&state, "benchcopy1");
@@ -354,7 +450,7 @@ fn json_body(body: &str) -> Result<Value, (u16, String)> {
 fn require_game(state: &State) -> Result<Game, (u16, String)> {
     match state.project.config() {
         Ok(Some(config)) => Ok(config.game),
-        Ok(None) => Err((409, "This folder isn't set up yet. Click Init in your game's start place.".into())),
+        Ok(None) => Err((409, "This game isn't set up yet. Click Init in its start place.".into())),
         Err(e) => Err((500, e.to_string())),
     }
 }
@@ -400,8 +496,8 @@ fn status(state: &mut State, query: &str) -> Value {
         "graph": graph(state),
         "server": "rogit",
         "version": env!("CARGO_PKG_VERSION"),
-        "project": { "folder": state.project.folder_name(), "game": state.project.config().ok().flatten().map(|c| c.game) },
-        "rojo": state.project.rojo_paths(),
+        "game": state.id,
+        "project": { "game": state.project.config().ok().flatten().map(|c| c.game) },
         "branches": state.branches.list(),
         "branch": branch,
     })
@@ -421,25 +517,23 @@ fn init(state: &mut State, body: &str) -> Reply {
     let (Some(game), Some(place)) = (request["game"].as_u64(), request["place"].as_u64()) else {
         return Err((400, "Missing game or place.".into()));
     };
-    if let Ok(Some(config)) = state.project.config() {
-        if config.game.universe_id != game {
-            return Err((409, format!("This folder is already set up for {}.", config.game.name)));
-        }
+    if game != state.id {
+        return Err((400, "That's a different game.".into()));
     }
     let experience = state.roblox.experience(game).map_err(|e| (502, e))?;
     if experience.start_place_id != place {
         return Err((409, format!("Init only works in the start place of {}.", experience.name)));
     }
     let game = Game { name: experience.name, universe_id: game, main_place_id: place };
-    let config = state.project.init(game).map_err(|e| (500, format!("Couldn't write the project files: {e}")))?;
-    println!("Set up {} in {}", config.game.name, state.project.folder_name());
-    Ok(json!({ "game": config.game, "rojo": state.project.rojo_paths() }))
+    let config = state.project.init(game).map_err(|e| (500, format!("Couldn't write RoGit's files for this game: {e}")))?;
+    println!("Set up {}", config.game.name);
+    Ok(json!({ "game": config.game }))
 }
 
 fn init_done(body: &str) -> Value {
     let report: Value = serde_json::from_str(body).unwrap_or_default();
     println!(
-        "Tagged {} objects in {:.1} s (skipped {} that Rojo or scripts own)",
+        "Tagged {} objects in {:.1} s (skipped {} scripts and what holds them)",
         report["tagged"], report["seconds"].as_f64().unwrap_or_default(), report["skipped"]
     );
     json!({ "ok": true })
@@ -468,7 +562,7 @@ fn create_branch(state: &mut State, body: &str) -> Reply {
     require_game(state)?;
     let started = Instant::now();
     let (name, capture, manifest) = capture_request(body)?;
-    let report = state.branches.create(&name, &capture, &manifest).map_err(|e| (409, e))?;
+    let report = state.branches.create(&name, &capture, &manifest, state.id).map_err(|e| (409, e))?;
     state.committed.remove(&name);
     println!(
         "Created branch {name}: {} objects in {} ms ({} settings Studio doesn't let plugins read stay at their defaults)",
@@ -483,7 +577,7 @@ fn create_branch(state: &mut State, body: &str) -> Reply {
 
 fn starting_point(state: &mut State, body: &str) -> Reply {
     let (name, capture, manifest) = capture_request(body)?;
-    state.branches.set_starting_point(&name, &capture, &manifest).map_err(|e| (409, e))?;
+    state.branches.set_starting_point(&name, &capture, &manifest, state.id).map_err(|e| (409, e))?;
     state.committed.remove(&name);
     println!("Recorded the starting point of {name}");
     Ok(json!({ "branch": state.branches.get(&name) }))
@@ -504,9 +598,8 @@ fn unsaved_work(state: &mut State, name: &str, opened: u64) -> Option<u64> {
             return differs.then_some(copy);
         }
     }
-    let rojo = state.project.rojo_paths();
     let differs = match (crate::place::read(&state.branches.file(name)), state.branches.latest_place(name)) {
-        (Ok(file), Ok(latest)) => !diff::compare(&file, &latest, &rojo).rows.is_empty(),
+        (Ok(file), Ok(latest)) => !diff::compare(&file, &latest).rows.is_empty(),
         _ => false,
     };
     state.unsaved.insert(name.to_owned(), ((saved, copy), differs));
@@ -579,7 +672,7 @@ fn plan_merge(state: &mut State, body: &str) -> Reply {
         (None, _) => 0,
         (Some(_), Some(live)) => live.uncommitted,
         (Some(_), None) => match state.branches.newest(&name) {
-            Ok((newest, _, _)) => diff::compare(&branch, &newest, &state.project.rojo_paths()).rows.iter().filter(|r| r.status != diff::Status::Context).count(),
+            Ok((newest, _, _)) => diff::compare(&branch, &newest).rows.iter().filter(|r| r.status != diff::Status::Context).count(),
             Err(_) => 0,
         },
     };
@@ -588,7 +681,7 @@ fn plan_merge(state: &mut State, body: &str) -> Reply {
         .base(&name, merge::last_merge(&main, &name).as_deref(), merge::last_update(&branch).as_deref())
         .map_err(|e| (409, e))?;
     step("uncommitted count and base", &mut timer);
-    let plan = merge::plan(&base, &branch, &main, &state.project.rojo_paths(), Direction::Merge).map_err(|e| (500, e))?;
+    let plan = merge::plan(&base, &branch, &main, Direction::Merge).map_err(|e| (500, e))?;
     step("plan", &mut timer);
     let s = &plan.summary;
     println!(
@@ -663,13 +756,12 @@ fn main_copy(state: &mut State, body: &str) -> Reply {
         return Ok(json!({ "branch": name }));
     }
     let main = take_upload(state, capture, &request["manifest"])?;
-    let rojo = state.project.rojo_paths();
     let update = state.updates.get_mut(&name).unwrap();
     let planned = state
         .branches
         .base(&name, merge::last_merge(&main, &name).as_deref(), merge::last_update(&update.branch).as_deref())
         .and_then(|(base, since, since_time)| {
-            merge::plan(&base, &main, &update.branch, &rojo, Direction::Update).map(|plan| (plan, since, since_time))
+            merge::plan(&base, &main, &update.branch, Direction::Update).map(|plan| (plan, since, since_time))
         });
     match planned {
         Ok((plan, since, since_time)) => {
@@ -818,7 +910,7 @@ fn load_committed(state: &mut State, name: &str, record: Option<String>) -> Resu
     };
     if state.committed.get(name).is_none_or(|c| c.which != which) {
         let (dom, since) = committed(state, name, record.as_deref())?;
-        let index = diff::index(&dom, &state.project.rojo_paths());
+        let index = diff::index(&dom);
         state.committed.insert(name.to_owned(), Committed { which, dom, index, since });
     }
     Ok(())
@@ -827,7 +919,7 @@ fn load_committed(state: &mut State, name: &str, record: Option<String>) -> Resu
 /// The changes in `current` since what `load_committed` loaded.
 fn uncommitted(state: &State, name: &str, current: &WeakDom) -> diff::Review {
     let base = &state.committed[name];
-    diff::compare_with(&base.dom, &base.index, current, &state.project.rojo_paths())
+    diff::compare_with(&base.dom, &base.index, current)
 }
 
 /// How many changes a review lists (not counting the rows that only show where they are).
@@ -952,7 +1044,6 @@ fn commit(state: &mut State, body: &str) -> Reply {
     let Some((current, bytes)) = current_copy(state, body, &request, &name)? else { return Ok(json!({ "full": true })) };
     step("copy", &mut timer);
     load_committed(state, &name, merge::last_update(&current))?;
-    let rojo = state.project.rojo_paths();
     let all = uncommitted(state, &name, &current);
     step("compare", &mut timer);
     let staged: HashSet<String> = if auto { HashSet::new() } else { staged_now(state, &name, &all).into_iter().collect() };
@@ -963,9 +1054,9 @@ fn commit(state: &mut State, body: &str) -> Reply {
     } else {
         let previous = &state.committed[&name].dom;
         let copy = crate::live::copy_of(&current).map_err(|e| (500, e))?;
-        let snapshot = crate::stage::partial(previous, copy, &all.rows, &staged, &rojo);
-        let summary = diff::compare_with(previous, &state.committed[&name].index, &snapshot, &rojo).summary;
-        let left = diff::compare(&snapshot, &current, &rojo);
+        let snapshot = crate::stage::partial(previous, copy, &all.rows, &staged);
+        let summary = diff::compare_with(previous, &state.committed[&name].index, &snapshot).summary;
+        let left = diff::compare(&snapshot, &current);
         (snapshot, summary, left)
     };
     if summary == diff::Summary::default() {
@@ -981,7 +1072,7 @@ fn commit(state: &mut State, body: &str) -> Reply {
     let branches = &state.branches;
     let index = std::thread::scope(|scope| {
         let written = scope.spawn(|| branches.add_commit(&name, &snapshot, bytes.as_deref(), &commit));
-        let index = diff::index(&snapshot, &rojo);
+        let index = diff::index(&snapshot);
         written.join().unwrap().map(|()| index)
     })
     .map_err(|e| (500, e))?;
@@ -1041,13 +1132,13 @@ fn view_commit(state: &mut State, body: &str) -> Reply {
         None => state.branches.starting_point(name),
     }
     .map_err(|e| (500, e))?;
-    Ok(json!({ "review": diff::compare(&before, &this, &state.project.rojo_paths()), "commit": commits[position] }))
+    Ok(json!({ "review": diff::compare(&before, &this), "commit": commits[position] }))
 }
 
 /// Plans bringing an earlier copy of the branch back into the branch as it is now (`current`). The reply carries
 /// the copy's update record, which the plugin sets too, so later merges and updates measure from the right place.
 fn plan_restore_of(state: &mut State, name: &str, kind: &str, copy: &WeakDom, current: &WeakDom) -> Reply {
-    let plan = merge::plan(current, copy, current, &state.project.rojo_paths(), Direction::Restore).map_err(|e| (500, e))?;
+    let plan = merge::plan(current, copy, current, Direction::Restore).map_err(|e| (500, e))?;
     let rows = json!({ "rows": plan.rows, "truncated": plan.truncated });
     let s = &plan.summary;
     println!("Planned {kind} of {name}: {} added, {} removed, {} changed", s.added, s.removed, s.changed);
@@ -1084,13 +1175,12 @@ fn plan_discard(state: &mut State, body: &str) -> Reply {
     let record = merge::last_update(uploaded.as_ref().unwrap_or_else(|| &state.live[&name].dom));
     load_committed(state, &name, record)?;
     let current = uploaded.as_ref().unwrap_or_else(|| &state.live[&name].dom);
-    let rojo = state.project.rojo_paths();
     let rows = uncommitted(state, &name, current).rows;
     let keep: HashSet<String> =
         rows.iter().filter(|r| r.status != diff::Status::Context && !discard.contains(&r.key)).map(|r| r.key.clone()).collect();
     let copy = crate::live::copy_of(current).map_err(|e| (500, e))?;
-    let wanted = crate::stage::partial(&state.committed[&name].dom, copy, &rows, &keep, &rojo);
-    let plan = merge::plan(current, &wanted, current, &rojo, Direction::Restore).map_err(|e| (500, e))?;
+    let wanted = crate::stage::partial(&state.committed[&name].dom, copy, &rows, &keep);
+    let plan = merge::plan(current, &wanted, current, Direction::Restore).map_err(|e| (500, e))?;
     Ok(json!({ "plan": plan }))
 }
 

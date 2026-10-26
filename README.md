@@ -1,10 +1,11 @@
 # RoGit
 
-Branches for your Roblox places' assets: maps, models, UI, meshes and terrain. Make a branch, build in it, review
-what changed, and merge it back into your game, like Git for everything Rojo doesn't sync. Scripts stay with Rojo.
+Branches for your Roblox places: maps, models, UI, meshes and terrain. Make a branch, build in it, see what changed,
+and merge it back into your game, like Git. Scripts aren't part of branches; keep them however you like.
 
-RoGit has two pieces, like Rojo: the `rogit` terminal tool and the RoGit Studio plugin. It runs on macOS and
-Windows. Everything stays on your computer; there's no account, API key or cloud.
+RoGit has two pieces: the Studio plugin, where you use it, and RoGit itself, which runs in the background on your
+computer and keeps every game's branches. It runs on macOS and Windows. Everything stays on your computer; there's no
+account, API key or cloud.
 
 ## Install
 
@@ -20,31 +21,31 @@ On Windows, in PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://proscled.github.io/rogit/install.ps1 | iex"
 ```
 
-The installer puts `rogit` in `~/.rogit/bin` (macOS) or `%LOCALAPPDATA%\rogit\bin` (Windows), adds that folder to
-your PATH and installs the Studio plugin. Run it again to update. The
-[install page](https://proscled.github.io/rogit/#install) also covers Rokit, plain downloads and building from
-source.
+The installer puts `rogit` in `~/.rogit/bin` (macOS) or `%LOCALAPPDATA%\rogit\bin` (Windows), installs the Studio
+plugin, and starts RoGit in the background, from then on whenever you log in. Run it again to update. The
+[install page](https://proscled.github.io/rogit/#install) also covers plain downloads and building from source.
 
-## Set up
+## Set up a game
 
-1. Run `rogit serve` in your project folder (next to `default.project.json`), for example in VS Code's terminal.
-   Working on several games? Run it in each one's folder; the plugin finds the right one for the place you open.
-2. Open your game's start place in Studio and open the RoGit panel (Plugins → RoGit).
-3. Click **Init**. RoGit writes `rogit.toml` (commit it), creates `.rogit/` (kept out of Git), and gives every
-   object a small hidden ID attribute so it can follow it between branches. Save the place afterwards.
+1. In Studio, open your game's start place and the RoGit panel (Plugins → RoGit).
+2. Click **Init**. RoGit gives every object a small hidden ID attribute, so it can follow it between branches. Save
+   the place afterwards.
+
+That's all; do it once per game. RoGit keeps each game's branches in `~/.rogit/games` (`%LOCALAPPDATA%\rogit\games`
+on Windows).
 
 ## Use
 
 **In main** (your game's start place):
 
-- **New branch**: copies main as it is, unsaved edits included, into `.rogit/branches/<name>.rbxl` and opens it.
+- **New branch**: copies main as it is, unsaved edits included, into a place file of its own and opens it.
 - **Merge**: shows what the branch's last commit changed, laid out like the Explorer. Something changed on both
   sides is a conflict: pick *Keep main* or *Use branch*. The merge is one undo step. Merge again later and only
   the newer commits come in.
 - **Pin** and **Archive** in a branch's `···` menu. Archive deletes the branch file (and closes it in Studio).
   RoGit offers it right after a merge.
 
-**In a branch**, the panel works like VS Code's Source Control:
+**In a branch**, the panel is source control for your map:
 
 - **Changes** lists everything not committed yet, and updates within about a quarter of a second of an edit, even
   in big places: after one full copy, RoGit only sends the objects that change. Click one to see what changed and
@@ -66,10 +67,13 @@ archives. Click a commit, merge or pull to see what it changed; open a commit in
 Everything saved in the place, except:
 
 - scripts, and any Folder with a script inside it;
-- whatever Rojo syncs (the `$path` entries in `default.project.json`);
 - Studio's own camera and the `RBX_` attributes Roblox keeps for itself.
 
-From the terminal, `rogit diff <branch>` prints a branch's changes (`--json` for tools).
+## From the terminal
+
+- `rogit diff` lists every game's branches; `rogit diff <branch>` prints what a branch changed (`--json` for tools).
+- `rogit serve` runs RoGit yourself, if it isn't running in the background.
+- `rogit autostart off` stops RoGit starting when you log in; `rogit autostart` turns it back on.
 
 ## Support
 
