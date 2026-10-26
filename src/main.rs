@@ -8,9 +8,9 @@ mod place;
 mod project;
 mod roblox;
 mod server;
+mod setup;
 mod stage;
 
-use std::path::PathBuf;
 use std::io::{self, IsTerminal};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
@@ -23,6 +23,8 @@ Usage:
   rogit serve [--port <port>]    Run RoGit for Studio's RoGit panel (the installer starts it when you log in)
   rogit autostart [on|off]       Start RoGit when you log in (and now), or stop starting it
   rogit diff [<branch>] [--json] Show what a branch changed, or list every game's branches
+  rogit update                   Update RoGit and its plugin to the newest version
+  rogit uninstall                Remove RoGit and its plugin (your branches stay)
   rogit plugin install           Install the RoGit plugin into Roblox Studio
   rogit --version                Show the version";
 
@@ -34,7 +36,9 @@ fn main() {
         ["serve", "--port", port] => port.parse().map_err(|_| format!("Invalid port: {port}")).and_then(|port| server::serve(Some(port))),
         ["autostart"] | ["autostart", "on"] => autostart::on(),
         ["autostart", "off"] => autostart::off(),
-        ["plugin", "install"] => install_plugin(),
+        ["plugin", "install"] => setup::install_plugin(),
+        ["update"] => setup::update(),
+        ["uninstall"] => setup::uninstall(),
         ["diff"] => diff(None, false),
         ["diff", name] => diff(Some(name), false),
         ["diff", name, "--json"] => diff(Some(name), true),
@@ -163,25 +167,6 @@ fn print_review(name: &str, review: &diff::Review, source: &str, time: u64) {
     if review.truncated > 0 {
         println!("…and {} more rows.", review.truncated);
     }
-}
-
-fn plugins_folder() -> Result<PathBuf, String> {
-    if cfg!(windows) {
-        let local = env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA isn't set.".to_owned())?;
-        Ok(PathBuf::from(local).join("Roblox").join("Plugins"))
-    } else {
-        let home = env::var("HOME").map_err(|_| "HOME isn't set.".to_owned())?;
-        Ok(PathBuf::from(home).join("Documents").join("Roblox").join("Plugins"))
-    }
-}
-
-fn install_plugin() -> Result<(), String> {
-    let folder = plugins_folder()?;
-    fs::create_dir_all(&folder).map_err(|e| format!("Couldn't create {}: {e}", folder.display()))?;
-    let target = folder.join("RoGit.lua");
-    fs::write(&target, PLUGIN).map_err(|e| format!("Couldn't write {}: {e}", target.display()))?;
-    println!("Installed the RoGit plugin to {}. Studio picks it up automatically.", target.display());
-    Ok(())
 }
 
 /// Checks on the Studio plugin's source, for mistakes Studio only reports when it loads the plugin.

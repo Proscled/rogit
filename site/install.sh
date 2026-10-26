@@ -103,4 +103,5 @@ if [ -n "$found" ] && [ "$found" != "$bin/rogit" ]; then
     printf '\nNote: there is also a rogit at %s. If `rogit --version` in a new terminal shows another version, remove that one.\n' "$found"
 fi
 [ -z "$started" ] && printf '\nStart RoGit with: rogit serve\n'
-printf '\nNext, in Roblox Studio: open your game'"'"'s start place, then Plugins > RoGit, and click Init.\n\n'
+printf '\nNext, in Roblox Studio: open your game'"'"'s start place, then Plugins > RoGit, and click Init.\n'
+printf 'Later, rogit update updates RoGit and rogit uninstall removes it.\n\n'

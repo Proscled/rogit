@@ -104,5 +104,6 @@
     }
     Write-Host ''
     Write-Host "Next, in Roblox Studio: open your game's start place, then Plugins > RoGit, and click Init."
+    Write-Host 'Later, rogit update updates RoGit and rogit uninstall removes it.'
     Write-Host ''
 }

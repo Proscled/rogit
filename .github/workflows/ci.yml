@@ -51,6 +51,12 @@ jobs:
           test "$(grep -c rogit/env ~/.zshenv)" = 1
           zsh -c 'rogit --version'
           test -f ~/Documents/Roblox/Plugins/RoGit.lua
+          # Uninstalling takes back everything the installer did, and keeps branches.
+          mkdir -p ~/.rogit/games/1 && touch ~/.rogit/games/1/game.toml
+          ~/.rogit/bin/rogit uninstall
+          if grep -q rogit/env ~/.zshenv; then echo 'PATH line left in .zshenv'; exit 1; fi
+          test ! -e ~/.rogit/bin && test ! -e ~/.rogit/env && test ! -e ~/Documents/Roblox/Plugins/RoGit.lua
+          test -f ~/.rogit/games/1/game.toml
       - name: Install on Windows
         if: runner.os == 'Windows'
         # Windows PowerShell 5.1, which the one-line install command uses.
@@ -84,3 +90,16 @@ jobs:
           if (@($path | Where-Object { $_ -eq $bin }).Count -ne 1) { throw "rogit's folder should be on PATH once: $path" }
           & "$bin\rogit.exe" --version
           if (-not (Test-Path "$env:LOCALAPPDATA\Roblox\Plugins\RoGit.lua")) { throw "The plugin wasn't installed." }
+          # Uninstalling takes back everything the installer did, and keeps branches.
+          New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\rogit\games\1" | Out-Null
+          Set-Content "$env:LOCALAPPDATA\rogit\games\1\game.toml" ''
+          & "$bin\rogit.exe" uninstall
+          if ($LASTEXITCODE -ne 0) { throw 'rogit uninstall failed.' }
+          Start-Sleep -Seconds 6
+          if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).RoGit) { throw 'RoGit still starts at login.' }
+          if (Get-Process rogit -ErrorAction SilentlyContinue) { throw 'RoGit is still running.' }
+          $path = (Get-Item HKCU:\Environment).GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';'
+          if ($path -contains $bin) { throw "rogit is still on PATH: $path" }
+          if (Test-Path $bin) { throw "$bin is still there." }
+          if (Test-Path "$env:LOCALAPPDATA\Roblox\Plugins\RoGit.lua") { throw 'The plugin is still installed.' }
+          if (-not (Test-Path "$env:LOCALAPPDATA\rogit\games\1\game.toml")) { throw 'Uninstalling removed branches.' }

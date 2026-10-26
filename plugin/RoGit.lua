@@ -16,6 +16,8 @@ if not RunService:IsEdit() then
 	return
 end
 
+-- This plugin's version; `rogit plugin install` (and so the installer) fills it in.
+local VERSION = "__ROGIT_VERSION__"
 -- RoGit takes the first free one of these ports.
 local PORTS = { 34875, 34876, 34877, 34878, 34879 }
 -- Where RoGit is; see findServer.
@@ -35,6 +37,9 @@ type Game = { name: string, universe_id: number, main_place_id: number }
 type Branch = { name: string, created: number, has_starting_point: boolean, merged: number?, updated: number?, pinned: boolean? }
 type State = {
 	connected: boolean,
+	-- The running RoGit's version, and the newest release it knows of.
+	version: string?,
+	latest: string?,
 	game: Game?,
 	-- The game of a branch file made before branch files said which game they're from, as RoGit found it.
 	branchGame: number?,
@@ -77,6 +82,12 @@ local function gameId(): number
 	local tag = workspace:GetAttribute("RoGitBranch")
 	local id = if type(tag) == "string" then tonumber(string.match(tag, "^(%d+):")) else nil
 	return id or state.branchGame or 0
+end
+
+-- A version ("1.2.3") as a number that sorts like the version.
+local function versionRank(version: any): number
+	local a, b, c = string.match(tostring(version), "^v?(%d+)%.(%d+)%.(%d+)")
+	return (tonumber(a) or 0) * 1e6 + (tonumber(b) or 0) * 1e3 + (tonumber(c) or 0)
 end
 
 -- Every request says which game it's about; RoGit keeps each game's branches apart.
@@ -603,6 +614,8 @@ connection.TextXAlignment = Enum.TextXAlignment.Right
 local placeTitle = text(top, 2, 18, BOLD, Color.MainText, false)
 placeTitle.TextTruncate = Enum.TextTruncate.AtEnd
 local placeDetail = text(top, 3, 12, REGULAR, Color.SubText)
+-- A newer RoGit, or RoGit and this plugin being different versions.
+local updateNote = text(top, 4, 12, MEDIUM, AMBER)
 
 -- What just happened, or what's going on, with buttons when there's something to decide.
 local messageBox = box(root, 2, 8)
@@ -1560,6 +1573,14 @@ render = function()
 		placeDetail.Text = "Open this game's start place to set up RoGit."
 	end
 	placeDetail.Visible = placeDetail.Text ~= ""
+	local update = ""
+	if state.connected and state.version and state.version ~= VERSION then
+		update = string.format("RoGit %s and this plugin (%s) are different versions. To fix it, run rogit update.", state.version, VERSION)
+	elseif state.connected and state.latest and versionRank(state.latest) > versionRank(VERSION) then
+		update = string.format("RoGit %s is out. To update, run rogit update.", state.latest)
+	end
+	updateNote.Text = update
+	updateNote.Visible = update ~= ""
 	local offer = state.offer
 	if state.problem then
 		message.Text, message.TextColor3 = escape(state.problem), RED
@@ -1669,12 +1690,6 @@ local function statusPath(): string
 	return "/api/rogit?place=" .. string.format("%d", game.PlaceId) .. file .. "&session=" .. SESSION
 end
 
--- A version ("1.2.3") as a number that sorts like the version.
-local function versionRank(version: any): number
-	local a, b, c = string.match(tostring(version), "^(%d+)%.(%d+)%.(%d+)")
-	return (tonumber(a) or 0) * 1e6 + (tonumber(b) or 0) * 1e3 + (tonumber(c) or 0)
-end
-
 -- Looks through the ports for RoGit (the newest, if an older one is still running). Returns its reply.
 local lastSearch = 0
 local function findServer(): (boolean, any)
@@ -1723,6 +1738,7 @@ local function refresh()
 	end
 	state.connected = ok
 	if ok then
+		state.version, state.latest = reply.version, reply.latest
 		state.game = reply.project and reply.project.game
 		if type(reply.game) == "number" and reply.game ~= 0 then
 			state.branchGame = reply.game

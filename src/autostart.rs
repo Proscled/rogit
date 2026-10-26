@@ -17,6 +17,13 @@ pub fn on() -> Result<(), String> {
 
 /// Stops starting RoGit when you log in. One that's running keeps running until you log out.
 pub fn off() -> Result<(), String> {
+    disable()?;
+    println!("RoGit won't start when you log in any more. Run rogit serve to start it yourself.");
+    Ok(())
+}
+
+/// Like `off`, without a word. On macOS this also stops the one running in the background.
+pub fn disable() -> Result<(), String> {
     if cfg!(windows) {
         let _ = Command::new("reg").args(["delete", RUN_KEY, "/v", "RoGit", "/f"]).output();
         let _ = fs::remove_file(project::home()?.join("start.vbs"));
@@ -25,7 +32,6 @@ pub fn off() -> Result<(), String> {
         let _ = Command::new("launchctl").args(["bootout", &format!("{}/{LABEL}", gui_domain()?)]).output();
         let _ = fs::remove_file(plist);
     }
-    println!("RoGit won't start when you log in any more. Run rogit serve to start it yourself.");
     Ok(())
 }
 

@@ -117,6 +117,8 @@
   .tabs button:hover { color: var(--text); }
   .tabs button[aria-selected="true"] { background: var(--raised); color: var(--text); }
   .tabs .version { margin-left: auto; align-self: center; font: 500 12.5px var(--mono); color: var(--faint); padding-right: 8px; }
+  .os-tabs { display: inline-flex; padding: 4px; margin: 0 0 24px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+  .os-tabs button { font-size: 15px; padding: 8px 18px; }
   .cmd {
     display: flex; align-items: center; gap: 8px; background: var(--code-bg); color: #e9eaee;
     border-radius: 10px; padding: 6px 6px 6px 16px; min-width: 0;
@@ -247,16 +249,16 @@
             <button role="tab" id="tab-mac" aria-controls="cmd-mac" aria-selected="false" data-os="mac">macOS</button>
             <span class="version" id="version"></span>
           </div>
-          <div class="cmd ps" id="cmd-win" role="tabpanel" aria-labelledby="tab-win">
+          <div class="cmd ps" id="cmd-win" role="tabpanel" aria-labelledby="tab-win" data-only="win">
             <code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code>
             <button class="copy" type="button">Copy</button>
           </div>
-          <div class="cmd" id="cmd-mac" role="tabpanel" aria-labelledby="tab-mac" hidden>
+          <div class="cmd" id="cmd-mac" role="tabpanel" aria-labelledby="tab-mac" data-only="mac" hidden>
             <code>curl -fsSL https://__SITE__/install.sh | sh</code>
             <button class="copy" type="button">Copy</button>
           </div>
-          <p class="note" id="note-win">Paste it in PowerShell (search for it in the Start menu). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
-          <p class="note" id="note-mac" hidden>Paste it in Terminal (in Applications → Utilities). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
+          <p class="note" data-only="win">Paste it in PowerShell (search for it in the Start menu). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
+          <p class="note" data-only="mac" hidden>Paste it in Terminal (in Applications → Utilities). It installs RoGit and its Studio plugin, and RoGit runs in the background from then on.</p>
         </div>
         <p class="more">Run it again to update. <a href="#install">Other ways to install</a></p>
       </div>
@@ -335,20 +337,61 @@
   <section id="install">
     <div class="wrap">
       <p class="kicker">Install</p>
-      <h2>Ways to install</h2>
-      <p class="intro">Every way ends the same: RoGit running in the background, and its plugin in Studio's plugins folder.</p>
-      <div class="options">
+      <h2>Install, update and uninstall</h2>
+      <div class="tabs os-tabs" role="tablist" aria-label="Your computer">
+        <button role="tab" aria-selected="true" data-os="win">Windows</button>
+        <button role="tab" aria-selected="false" data-os="mac">macOS</button>
+      </div>
+
+      <div class="options" data-only="win">
         <div>
           <h3>Installer <span class="tag">recommended</span></h3>
-          <p>Puts RoGit in <code>%LOCALAPPDATA%\rogit\bin</code> on Windows or <code>~/.rogit/bin</code> on macOS, installs the plugin, and starts RoGit whenever you log in.</p>
+          <p>Paste this in PowerShell (search for it in the Start menu). It puts RoGit in <code>%LOCALAPPDATA%\rogit\bin</code>, installs the plugin, and starts RoGit whenever you log in.</p>
           <div class="cmd ps"><code>powershell -ExecutionPolicy Bypass -c "irm https://__SITE__/install.ps1 | iex"</code><button class="copy" type="button">Copy</button></div>
-          <div class="cmd"><code>curl -fsSL https://__SITE__/install.sh | sh</code><button class="copy" type="button">Copy</button></div>
-          <p class="small">For a specific version, set <code>ROGIT_VERSION=v0.2.0</code> first.</p>
+          <p class="small">For a specific version, run <code>$env:ROGIT_VERSION = "v0.3.0"</code> first.</p>
+        </div>
+        <div>
+          <h3>Update and uninstall</h3>
+          <p>In PowerShell. The plugin says when there's a new version.</p>
+          <div class="cmd ps"><code>rogit update</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd ps"><code>rogit uninstall</code><button class="copy" type="button">Copy</button></div>
+          <p class="small">Uninstalling keeps your branches in <code>%LOCALAPPDATA%\rogit\games</code>.</p>
         </div>
         <div>
           <h3>Download</h3>
-          <p>Get the zip for your computer from the <a href="https://github.com/__REPO__/releases/latest">latest release</a>, put <code>rogit</code> somewhere on your PATH, then run <code>rogit plugin install</code> and <code>rogit autostart</code>.</p>
-          <p class="small">On macOS, a file downloaded with a browser is blocked until you run <code>xattr -d com.apple.quarantine rogit</code>. The installer doesn't need this.</p>
+          <p>Get <code>rogit-windows-x86_64.zip</code> from the <a href="https://github.com/__REPO__/releases/latest">latest release</a>, put <code>rogit.exe</code> in a folder on your PATH, then run:</p>
+          <div class="cmd ps"><code>rogit plugin install</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd ps"><code>rogit autostart</code><button class="copy" type="button">Copy</button></div>
+        </div>
+        <div>
+          <h3>From source</h3>
+          <p>With <a href="https://rustup.rs">Rust</a> installed:</p>
+          <div class="cmd ps"><code>cargo install --locked --git https://github.com/__REPO__</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd ps"><code>rogit plugin install</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd ps"><code>rogit autostart</code><button class="copy" type="button">Copy</button></div>
+        </div>
+      </div>
+
+      <div class="options" data-only="mac" hidden>
+        <div>
+          <h3>Installer <span class="tag">recommended</span></h3>
+          <p>Paste this in Terminal (in Applications → Utilities). It puts RoGit in <code>~/.rogit/bin</code>, installs the plugin, and starts RoGit whenever you log in.</p>
+          <div class="cmd"><code>curl -fsSL https://__SITE__/install.sh | sh</code><button class="copy" type="button">Copy</button></div>
+          <p class="small">For a specific version, put <code>ROGIT_VERSION=v0.3.0</code> before <code>sh</code>.</p>
+        </div>
+        <div>
+          <h3>Update and uninstall</h3>
+          <p>In Terminal. The plugin says when there's a new version.</p>
+          <div class="cmd"><code>rogit update</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd"><code>rogit uninstall</code><button class="copy" type="button">Copy</button></div>
+          <p class="small">Uninstalling keeps your branches in <code>~/.rogit/games</code>.</p>
+        </div>
+        <div>
+          <h3>Download</h3>
+          <p>Get <code>rogit-macos-aarch64.zip</code> (Apple silicon) or <code>rogit-macos-x86_64.zip</code> (Intel) from the <a href="https://github.com/__REPO__/releases/latest">latest release</a>, put <code>rogit</code> in a folder on your PATH, then run:</p>
+          <div class="cmd"><code>rogit plugin install</code><button class="copy" type="button">Copy</button></div>
+          <div class="cmd"><code>rogit autostart</code><button class="copy" type="button">Copy</button></div>
+          <p class="small">A file downloaded with a browser is blocked until you run <code>xattr -d com.apple.quarantine rogit</code>. The installer doesn't need this.</p>
         </div>
         <div>
           <h3>From source</h3>
@@ -388,18 +431,11 @@
         </details>
         <details>
           <summary>How do I update?</summary>
-          <div><p>Run the install command again. It replaces RoGit and the plugin, and restarts RoGit in the background.</p></div>
+          <div><p>Run <code>rogit update</code> in PowerShell (Windows) or Terminal (macOS), or the install command again. It updates RoGit and its plugin, and restarts RoGit. The plugin tells you when there's a new version.</p></div>
         </details>
         <details>
           <summary>How do I uninstall?</summary>
-          <div>
-            <p>First stop RoGit starting when you log in:</p>
-            <div class="cmd"><code>rogit autostart off</code><button class="copy" type="button">Copy</button></div>
-            <p>On Windows, delete <code>%LOCALAPPDATA%\rogit\bin</code> and <code>%LOCALAPPDATA%\Roblox\Plugins\RoGit.lua</code>, then remove the rogit folder from Path in <b>Edit environment variables for your account</b>.</p>
-            <p>On macOS, delete RoGit and the plugin, then remove the line <code>. "$HOME/.rogit/env"</code> from <code>~/.zshenv</code> (and <code>~/.bash_profile</code> or <code>~/.bashrc</code> if it's there):</p>
-            <div class="cmd"><code>rm -rf ~/.rogit/bin ~/Documents/Roblox/Plugins/RoGit.lua</code><button class="copy" type="button">Copy</button></div>
-            <p>Your branches stay in RoGit's <code>games</code> folder until you delete it.</p>
-          </div>
+          <div><p>Run <code>rogit uninstall</code>. It stops RoGit and removes it, its plugin and its PATH entry. Your branches stay in RoGit's <code>games</code> folder; delete that too if you don't need them.</p></div>
         </details>
       </div>
     </div>
@@ -418,14 +454,14 @@
 </footer>
 
 <script>
-  // Show the command for this computer.
-  const tabs = document.querySelectorAll('.tabs [role="tab"]');
+  // One choice of Windows or macOS for the whole page: every switch shows it, and every part for one of them follows.
+  const tabs = document.querySelectorAll('[role="tab"][data-os]');
   function choose(os) {
     for (const tab of tabs) {
-      const on = tab.dataset.os === os;
-      tab.setAttribute('aria-selected', on);
-      document.getElementById('cmd-' + tab.dataset.os).hidden = !on;
-      document.getElementById('note-' + tab.dataset.os).hidden = !on;
+      tab.setAttribute('aria-selected', tab.dataset.os === os);
+    }
+    for (const part of document.querySelectorAll('[data-only]')) {
+      part.hidden = part.dataset.only !== os;
     }
   }
   tabs.forEach(tab => tab.addEventListener('click', () => choose(tab.dataset.os)));

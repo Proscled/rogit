@@ -22,7 +22,8 @@ curl -fsSL https://proscled.github.io/rogit/install.sh | sh
 ```
 
 The installer puts `rogit` in `%LOCALAPPDATA%\rogit\bin` (Windows) or `~/.rogit/bin` (macOS), installs the Studio
-plugin, and starts RoGit in the background, from then on whenever you log in. Run it again to update. The
+plugin, and starts RoGit in the background, from then on whenever you log in. `rogit update` updates it (the plugin
+says when there's a new version) and `rogit uninstall` removes it; your branches stay. The
 [install page](https://proscled.github.io/rogit/#install) also covers plain downloads and building from source.
 
 ## Set up a game
@@ -72,6 +73,7 @@ Everything saved in the place, except:
 ## From the terminal
 
 - `rogit diff` lists every game's branches; `rogit diff <branch>` prints what a branch changed (`--json` for tools).
+- `rogit update` updates RoGit and its plugin; `rogit uninstall` removes both (your branches stay).
 - `rogit serve` runs RoGit yourself, if it isn't running in the background.
 - `rogit autostart off` stops RoGit starting when you log in; `rogit autostart` turns it back on.
 

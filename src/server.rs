@@ -38,8 +38,9 @@ struct State {
     restores: HashMap<String, (String, Value)>,
     /// When each Studio window (plugin session) first checked in, in Unix seconds.
     sessions: HashMap<String, u64>,
-    /// Whether a branch's unsaved copy differs from its saved file, by (file time, copy time).
-    unsaved: HashMap<String, ((u64, u64), bool)>,
+    /// Whether a branch's unsaved copy has work worth offering back (see `unsaved_work`), by (file time, copy time,
+    /// whether the window's copy was in memory).
+    unsaved: HashMap<String, ((u64, u64, bool), bool)>,
     /// What each branch's changes are measured from (its last commit, or where it last met main), kept in memory
     /// between refreshes.
     committed: HashMap<String, Committed>,
@@ -128,7 +129,7 @@ impl Games {
 pub fn serve(port: Option<u16>) -> Result<(), String> {
     // A second server would work on the same files as the first.
     if let Some((running, version)) = running() {
-        if newer_or_same(&version, env!("CARGO_PKG_VERSION")) {
+        if crate::setup::at_least(&version, env!("CARGO_PKG_VERSION")) {
             println!("RoGit is already running on http://127.0.0.1:{running}.");
             return Ok(());
         }
@@ -146,6 +147,7 @@ pub fn serve(port: Option<u16>) -> Result<(), String> {
         });
     };
     let mut games = Games::new(project::games()?);
+    watch_releases();
     println!("RoGit {} is running on http://127.0.0.1:{port}. Leave it running while you use RoGit in Studio.", env!("CARGO_PKG_VERSION"));
     for (_, project) in games.known() {
         if let Ok(Some(config)) = project.config() {
@@ -174,10 +176,21 @@ fn running() -> Option<(u16, String)> {
     })
 }
 
-/// Whether version `a` ("1.2.3") is at least `b`.
-fn newer_or_same(a: &str, b: &str) -> bool {
-    let parts = |v: &str| v.split('.').map(|n| n.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
-    parts(a) >= parts(b)
+/// The newest release of RoGit, as last found on GitHub, so the plugin can say when there's an update.
+static LATEST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Looks for a newer release now and every six hours, on its own thread.
+fn watch_releases() {
+    std::thread::spawn(|| loop {
+        if let Ok(latest) = crate::setup::latest_release() {
+            *LATEST.lock().unwrap() = Some(latest);
+        }
+        std::thread::sleep(Duration::from_secs(6 * 60 * 60));
+    });
+}
+
+fn latest() -> Option<String> {
+    LATEST.lock().ok().and_then(|latest| latest.clone())
 }
 
 /// Writes each open branch's copy in memory to disk as its autosave. A big place takes a fifth of a second to write,
@@ -213,7 +226,7 @@ fn handle(games: &mut Games, mut request: Request) {
         .or_else(|| file.strip_suffix(".rbxl").filter(|name| branches::valid_name(name)).and_then(|name| games.find_branch(name)));
     let result = match game {
         Some(id) => route(games.get(id), request.method(), path, query, &body),
-        None if path == "/api/rogit" => Ok(json!({ "server": "rogit", "version": env!("CARGO_PKG_VERSION"), "game": null })),
+        None if path == "/api/rogit" => Ok(json!({ "server": "rogit", "version": env!("CARGO_PKG_VERSION"), "latest": latest(), "game": null })),
         None => Err((400, "Open a published game's place in Studio, or one of its branches.".to_owned())),
     };
     let (code, value) = match result {
@@ -321,13 +334,6 @@ mod tests {
         assert_eq!((status["game"].clone(), status["branch"]["name"].clone()), (json!(20), json!("lobby")));
         assert_eq!(status["project"]["game"]["name"], json!("Obby"));
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn compares_versions() {
-        assert!(newer_or_same("0.2.0", "0.2.0"));
-        assert!(newer_or_same("0.10.0", "0.9.1"));
-        assert!(!newer_or_same("0.1.0", "0.2.0"));
     }
 
     #[test]
@@ -508,7 +514,14 @@ fn status(state: &mut State, query: &str) -> Value {
     let session = param(query, "session").unwrap_or("").to_owned();
     let opened = *state.sessions.entry(session).or_insert_with(unix_now);
     let (commits, unsaved) = match &branch {
-        Some(b) => (Some(state.branches.commits(&b.name)), unsaved_work(state, &b.name, opened)),
+        Some(b) => {
+            let unsaved = unsaved_work(state, &b.name, opened);
+            // Nothing to restore after all (the window had it): its autosave can carry on.
+            if unsaved.is_none() {
+                state.recovering.remove(&b.name);
+            }
+            (Some(state.branches.commits(&b.name)), unsaved)
+        }
         None => (None, None),
     };
     json!({
@@ -519,6 +532,7 @@ fn status(state: &mut State, query: &str) -> Value {
         "graph": graph(state),
         "server": "rogit",
         "version": env!("CARGO_PKG_VERSION"),
+        "latest": latest(),
         "game": state.id,
         "project": { "game": state.project.config().ok().flatten().map(|c| c.game) },
         "branches": state.branches.list(),
@@ -616,16 +630,22 @@ fn unsaved_work(state: &mut State, name: &str, opened: u64) -> Option<u64> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    if let Some((times, differs)) = state.unsaved.get(name) {
-        if *times == (saved, copy) {
+    let live = state.live.contains_key(name);
+    if let Some((checked, differs)) = state.unsaved.get(name) {
+        if *checked == (saved, copy, live) {
             return differs.then_some(copy);
         }
     }
-    let differs = match (crate::place::read(&state.branches.file(name)), state.branches.latest_place(name)) {
-        (Ok(file), Ok(latest)) => !diff::compare(&file, &latest).rows.is_empty(),
-        _ => false,
+    // Once the window has sent its copy, measured against the window itself: after RoGit restarts, an open window
+    // already has its work, and there's nothing to bring back. Until then, against the saved file.
+    let differs = match state.branches.latest_place(name) {
+        Ok(latest) => match state.live.get(name) {
+            Some(window) => !diff::compare(&latest, &window.dom).rows.is_empty(),
+            None => crate::place::read(&state.branches.file(name)).is_ok_and(|file| !diff::compare(&file, &latest).rows.is_empty()),
+        },
+        Err(_) => false,
     };
-    state.unsaved.insert(name.to_owned(), ((saved, copy), differs));
+    state.unsaved.insert(name.to_owned(), ((saved, copy, live), differs));
     differs.then_some(copy)
 }
 
