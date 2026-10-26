@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    timeout-minutes: 20
     strategy:
       matrix:
         os: [macos-latest, windows-latest]
@@ -17,6 +18,7 @@ jobs:
       - run: cargo test --locked
 
   plugin:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +30,7 @@ jobs:
 
   # Runs the installers from site/ against the build from this commit: a stand-in download hands them a fresh zip.
   installers:
+    timeout-minutes: 20
     strategy:
       matrix:
         os: [macos-latest, windows-latest]

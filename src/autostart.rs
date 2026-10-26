@@ -3,7 +3,7 @@
 
 use crate::project;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::{env, fs, thread, time::Duration};
 
 const LABEL: &str = "com.rogit.serve";
@@ -134,7 +134,14 @@ fn windows_on(exe: &Path) -> Result<(), String> {
     let _ = fs::remove_file(project::home()?.join("start.vbs"));
     // Replace whichever RoGit is running (an older version, after an update) with this one.
     stop_running();
-    Command::new(&background).spawn().map_err(|e| format!("Couldn't start RoGit in the background: {e}"))?;
+    // Detached from this program's input and output: anything reading the installer's output would otherwise wait
+    // for RoGit to stop.
+    Command::new(&background)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Couldn't start RoGit in the background: {e}"))?;
     println!("RoGit is running in the background and starts when you log in.");
     Ok(())
 }
