@@ -1,5 +1,5 @@
 //! Running `rogit serve` in the background whenever you're logged in, so nobody has to keep a terminal open: a
-//! LaunchAgent on macOS, and on Windows a Run entry that starts it without a window.
+//! LaunchAgent on macOS, and on Windows a Run entry for `rogit-background.exe`, which opens no window.
 
 use crate::project;
 use std::path::Path;
@@ -26,6 +26,7 @@ pub fn off() -> Result<(), String> {
 pub fn disable() -> Result<(), String> {
     if cfg!(windows) {
         let _ = Command::new("reg").args(["delete", RUN_KEY, "/v", "RoGit", "/f"]).output();
+        // Versions before 0.3.2 started RoGit with this script.
         let _ = fs::remove_file(project::home()?.join("start.vbs"));
     } else {
         let plist = launch_agent()?;
@@ -90,20 +91,28 @@ fn mac_on(exe: &Path) -> Result<(), String> {
     unreachable!()
 }
 
+/// Stops the RoGit running in the background on Windows (and one started by hand), but not this one.
+pub fn stop_running() {
+    let _ = Command::new("taskkill").args(["/F", "/IM", "rogit-background.exe"]).output();
+    let _ = Command::new("taskkill").args(["/F", "/IM", "rogit.exe", "/FI", &format!("PID ne {}", std::process::id())]).output();
+}
+
 fn windows_on(exe: &Path) -> Result<(), String> {
-    // wscript runs it without a console window, which rogit.exe would otherwise open at every login.
-    let vbs = project::home()?.join("start.vbs");
-    fs::create_dir_all(vbs.parent().unwrap()).map_err(|e| e.to_string())?;
-    let command = format!("\"{}\" serve", exe.display()).replace('"', "\"\"");
-    fs::write(&vbs, format!("CreateObject(\"WScript.Shell\").Run \"{command}\", 0, False\r\n")).map_err(|e| e.to_string())?;
-    let run = format!("wscript.exe \"{}\"", vbs.display());
+    // RoGit built as a Windows program, which opens no console window at every login. It comes with rogit.exe.
+    let background = exe.with_file_name("rogit-background.exe");
+    if !background.exists() {
+        return Err(format!("{} is missing. Install RoGit again.", background.display()));
+    }
+    let run = format!("\"{}\"", background.display());
     let added = Command::new("reg").args(["add", RUN_KEY, "/v", "RoGit", "/t", "REG_SZ", "/d", &run, "/f"]).output().map_err(|e| e.to_string())?;
     if !added.status.success() {
         return Err(format!("Couldn't set RoGit to start when you log in: {}", String::from_utf8_lossy(&added.stderr).trim()));
     }
+    // Versions before 0.3.2 started RoGit with this script.
+    let _ = fs::remove_file(project::home()?.join("start.vbs"));
     // Replace whichever RoGit is running (an older version, after an update) with this one.
-    let _ = Command::new("taskkill").args(["/F", "/IM", "rogit.exe", "/FI", &format!("PID ne {}", std::process::id())]).output();
-    Command::new("wscript.exe").arg(&vbs).spawn().map_err(|e| format!("Couldn't start RoGit in the background: {e}"))?;
+    stop_running();
+    Command::new(&background).spawn().map_err(|e| format!("Couldn't start RoGit in the background: {e}"))?;
     println!("RoGit is running in the background and starts when you log in.");
     Ok(())
 }

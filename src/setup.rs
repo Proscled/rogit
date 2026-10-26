@@ -79,7 +79,7 @@ pub fn uninstall() -> Result<(), String> {
     autostart::disable()?;
     if cfg!(windows) {
         // The one running in the background (disable only stops it starting at login).
-        let _ = Command::new("taskkill").args(["/F", "/IM", "rogit.exe", "/FI", &format!("PID ne {}", std::process::id())]).output();
+        autostart::stop_running();
     }
     let plugin = plugins_folder()?.join("RoGit.lua");
     if plugin.exists() {

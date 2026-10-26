@@ -44,18 +44,23 @@
             return
         }
         Expand-Archive -Path "$tmp\rogit.zip" -DestinationPath $tmp -Force
-        if (-not (Test-Path "$tmp\rogit.exe")) {
-            Write-Host "$asset doesn't contain rogit.exe." -ForegroundColor Red
-            return
+        # rogit.exe is the command; rogit-background.exe is RoGit running in the background, without a window.
+        $programs = @('rogit.exe', 'rogit-background.exe')
+        foreach ($program in $programs) {
+            if (-not (Test-Path "$tmp\$program")) {
+                Write-Host "$asset doesn't contain $program." -ForegroundColor Red
+                return
+            }
         }
-        # A running `rogit serve` keeps rogit.exe open. Windows still lets it be renamed, so the old copy moves aside
-        # and is cleaned up by the next install.
-        Get-ChildItem -Path $bin -Filter 'rogit.exe.old-*' | Remove-Item -Force -ErrorAction SilentlyContinue
-        if (Test-Path $exe) {
-            Rename-Item -Path $exe -NewName ('rogit.exe.old-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        foreach ($program in $programs) {
+            # A running RoGit keeps its program open. Windows still lets it be renamed, so the old copy moves aside
+            # and is cleaned up by the next install.
+            Get-ChildItem -Path $bin -Filter "$program.old-*" | Remove-Item -Force -ErrorAction SilentlyContinue
+            if (Test-Path "$bin\$program") {
+                Rename-Item -Path "$bin\$program" -NewName ("$program.old-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            }
+            Move-Item -Path "$tmp\$program" -Destination "$bin\$program"
         }
-        Move-Item -Path "$tmp\rogit.exe" -Destination $exe
-        Unblock-File -Path $exe
     } finally {
         Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }

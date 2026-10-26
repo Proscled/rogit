@@ -66,7 +66,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           # Failures become annotations, which anyone can read (the log needs admin rights).
           trap { Write-Output "::error::$_"; exit 1 }
-          Compress-Archive -Path target\release\rogit.exe -DestinationPath "$env:RUNNER_TEMP\rogit.zip"
+          Compress-Archive -Path target\release\rogit.exe, target\release\rogit-background.exe -DestinationPath "$env:RUNNER_TEMP\rogit.zip"
           function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing) Copy-Item "$env:RUNNER_TEMP\rogit.zip" $OutFile }
           Get-Content site\install.ps1 -Raw | Invoke-Expression
           $bin = "$env:LOCALAPPDATA\rogit\bin"
@@ -80,12 +80,13 @@ jobs:
           $reply = Wait-RoGit
           if ($reply.server -ne 'rogit') { throw "Unexpected reply: $reply" }
           $run = (Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).RoGit
-          if ($run -notlike 'wscript.exe *start.vbs*') { throw "RoGit doesn't start at login: $run" }
-          # Update while the background RoGit has rogit.exe open.
-          $before = (Get-Process rogit).Id
+          if ($run -ne "`"$bin\rogit-background.exe`"") { throw "RoGit doesn't start at login: $run" }
+          if (Test-Path "$env:LOCALAPPDATA\rogit\start.vbs") { throw 'A start script was written.' }
+          # Update while the background RoGit has its program open.
+          $before = (Get-Process rogit-background).Id
           Get-Content site\install.ps1 -Raw | Invoke-Expression
           Wait-RoGit | Out-Null
-          $after = (Get-Process rogit).Id
+          $after = (Get-Process rogit-background).Id
           if (@($after).Count -ne 1 -or $before -contains $after) { throw "The update didn't replace the running RoGit: $before -> $after" }
           $key = Get-Item HKCU:\Environment
           if ($key.GetValueKind('Path') -ne 'ExpandString') { throw 'PATH is no longer an expandable string.' }
@@ -100,7 +101,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'rogit uninstall failed.' }
           Start-Sleep -Seconds 6
           if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).RoGit) { throw 'RoGit still starts at login.' }
-          if (Get-Process rogit -ErrorAction SilentlyContinue) { throw 'RoGit is still running.' }
+          if (Get-Process rogit, rogit-background -ErrorAction SilentlyContinue) { throw 'RoGit is still running.' }
           $path = (Get-Item HKCU:\Environment).GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';'
           if ($path -contains $bin) { throw "rogit is still on PATH: $path" }
           if (Test-Path $bin) { throw "$bin is still there." }
