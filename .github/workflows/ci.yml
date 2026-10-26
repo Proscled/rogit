@@ -68,14 +68,20 @@ jobs:
           trap { Write-Output "::error::$_"; exit 1 }
           Compress-Archive -Path target\release\rogit.exe, target\release\rogit-background.exe -DestinationPath "$env:RUNNER_TEMP\rogit.zip"
           function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing) Copy-Item "$env:RUNNER_TEMP\rogit.zip" $OutFile }
-          Get-Content site\install.ps1 -Raw | Invoke-Expression
           $bin = "$env:LOCALAPPDATA\rogit\bin"
+          # What the installer printed, for the error message if something's wrong.
+          $installed = (Get-Content site\install.ps1 -Raw | Invoke-Expression) *>&1 | Out-String
+          Write-Output $installed
           # RoGit runs in the background and starts at login.
           function Wait-RoGit {
-            for ($i = 0; $i -lt 20; $i++) {
-              try { return Invoke-RestMethod http://127.0.0.1:34875/api/rogit } catch { Start-Sleep -Milliseconds 500 }
+            $until = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $until) {
+              try { return Invoke-RestMethod -TimeoutSec 5 http://127.0.0.1:34875/api/rogit } catch { Start-Sleep -Milliseconds 500 }
             }
-            throw 'RoGit is not running in the background.'
+            $running = (Get-Process rogit* -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Id)" }) -join ', '
+            $entry = (Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -ErrorAction SilentlyContinue).RoGit
+            $files = (Get-ChildItem $bin -ErrorAction SilentlyContinue).Name -join ', '
+            throw "RoGit is not running in the background. Running: [$running]. Login entry: [$entry]. Files: [$files]. Installer said: $($installed -replace '\s+', ' ')"
           }
           $reply = Wait-RoGit
           if ($reply.server -ne 'rogit') { throw "Unexpected reply: $reply" }
@@ -87,7 +93,8 @@ jobs:
           if (Test-Path "$env:LOCALAPPDATA\rogit\start.vbs") { throw 'A start script was written.' }
           # Update while the background RoGit has its program open.
           $before = (Get-Process rogit-background).Id
-          Get-Content site\install.ps1 -Raw | Invoke-Expression
+          $installed = (Get-Content site\install.ps1 -Raw | Invoke-Expression) *>&1 | Out-String
+          Write-Output $installed
           Wait-RoGit | Out-Null
           $after = (Get-Process rogit-background).Id
           if (@($after).Count -ne 1 -or $before -contains $after) { throw "The update didn't replace the running RoGit: $before -> $after" }
