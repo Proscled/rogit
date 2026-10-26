@@ -644,7 +644,7 @@ mod tests {
         let after = copies(&branches);
         assert_eq!(before.1.len(), after.len());
         for ((name, old), (_, new)) in before.1.iter().zip(&after) {
-            assert!(crate::diff::compare(old, new).rows.is_empty(), "{name} changed");
+            assert!(crate::diff::compare(old, new, crate::diff::Rules { scripts: true }).rows.is_empty(), "{name} changed");
         }
         assert_eq!(before.2, branches.latest_time("new-map"), "the autosave keeps its time");
         println!("{:.1} MB before, {:.1} MB after", before.0 as f64 / 1048576.0, size() as f64 / 1048576.0);

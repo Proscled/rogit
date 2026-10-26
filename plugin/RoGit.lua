@@ -33,7 +33,7 @@ local SERVICES = {
 	"Chat", "LocalizationService", "TestService", "SocialService", "VoiceChatService",
 }
 
-type Game = { name: string, universe_id: number, main_place_id: number }
+type Game = { name: string, universe_id: number, main_place_id: number, scripts: boolean? }
 type Branch = { name: string, created: number, has_starting_point: boolean, merged: number?, updated: number?, pinned: boolean? }
 type State = {
 	connected: boolean,
@@ -68,9 +68,19 @@ type State = {
 	-- The branch this window shows, if it was archived.
 	archived: string?,
 	autosaved: number?,
+	-- Before Init: whether to track scripts too.
+	trackScripts: boolean?,
 }
 
 local state: State = { connected = false, branches = {}, commits = {}, graph = {}, staged = {} }
+
+-- Whether RoGit tracks scripts in this game: a choice made at Init (for games whose scripts aren't kept in files).
+local function tracksScripts(): boolean
+	if state.game then
+		return state.game.scripts == true
+	end
+	return state.trackScripts == true
+end
 
 -- Talking to RoGit ---------------------------------------------------------------------------------
 
@@ -141,11 +151,12 @@ local idOwners: { [string]: Instance }? = nil
 -- that's been worked in. Only a window that just opened can be missing unsaved work.
 local FRESH_WINDOW = not ChangeHistoryService:GetCanUndo()
 
--- Collects the objects RoGit tracks: everything saved in the place except scripts and Folders that contain a script
--- anywhere inside.
+-- Collects the objects RoGit tracks: everything saved in the place, except (unless the game tracks scripts) scripts
+-- and Folders that contain a script anywhere inside.
 local function trackedObjects(): ({ Instance }, number)
 	local list: { Instance } = {}
 	local visited = 0
+	local scripts = tracksScripts()
 
 	local function visit(parent: Instance): boolean
 		local hasScript = false
@@ -154,12 +165,12 @@ local function trackedObjects(): ({ Instance }, number)
 			if visited % 10000 == 0 then
 				task.wait()
 			end
-			if child:IsA("LuaSourceContainer") then
+			if child:IsA("LuaSourceContainer") and not scripts then
 				hasScript = true
 			elseif child.Archivable and not child:IsA("Camera") then
 				local mark = #list
 				table.insert(list, child)
-				if visit(child) then
+				if visit(child) and not scripts then
 					hasScript = true
 					if child:IsA("Folder") then
 						for i = #list, mark + 1, -1 do
@@ -637,6 +648,10 @@ local dismissButton = button(unsavedButtons, 2, "Dismiss", "quiet")
 
 local actions = box(root, 4, 6)
 local initButton = button(actions, 1, "Init", "primary", true)
+-- Whether RoGit tracks scripts too: chosen before Init, and changeable in main.
+local scriptsToggle = button(actions, 2, "", "secondary", true)
+local scriptsHint = text(actions, 3, 12, REGULAR, Color.SubText)
+scriptsHint.Text = "Turn this on if you write scripts in Studio. Leave it off if your scripts are files (Rojo, Argon)."
 
 local newSection, newHeading, newBody = section(root, 5)
 newHeading.Text = "NEW BRANCH"
@@ -1566,8 +1581,7 @@ render = function()
 	elseif state.isMain then
 		mode = "init"
 		placeKind.Text, placeTitle.Text = "SET UP", escape(state.experience or game.Name)
-		placeDetail.Text = "Init gives every object a small hidden ID, so RoGit can follow it between branches. "
-			.. "Scripts are left alone."
+		placeDetail.Text = "Init gives every object a small hidden ID, so RoGit can follow it between branches."
 	else
 		placeKind.Text, placeTitle.Text = "NOT THE START PLACE", escape(state.experience or game.Name)
 		placeDetail.Text = "Open this game's start place to set up RoGit."
@@ -1608,6 +1622,9 @@ render = function()
 	unsavedCard.Visible = mode == "branch" and idle and state.unsaved ~= nil and FRESH_WINDOW
 	unsavedText.Text = if state.unsaved then "Unsaved work from " .. formatTime(state.unsaved) else ""
 	initButton.Visible = mode == "init" and idle
+	scriptsToggle.Text = if tracksScripts() then "Track scripts: on" else "Track scripts: off"
+	scriptsToggle.Visible = (mode == "init" or mode == "main") and idle
+	scriptsHint.Visible = scriptsToggle.Visible
 	newSection.Visible = mode == "main" and idle
 	branchesSection.Visible = mode == "main" and #state.branches > 0
 	renderChanges()
@@ -1789,11 +1806,31 @@ end
 
 initButton.Activated:Connect(function()
 	run("Checking with RoGit…", function()
-		call("POST", "/api/init", { game = game.GameId, place = game.PlaceId })
+		local reply = call("POST", "/api/init", { game = game.GameId, place = game.PlaceId, scripts = state.trackScripts == true })
+		state.game = reply.game
 		step("Giving every object an ID…")
 		local report = tagObjects()
 		request("POST", "/api/init/done", report)
 		state.notice = string.format("Done: %d objects have an ID. Save main to keep them.", report.tagged)
+	end)
+	refresh()
+end)
+
+scriptsToggle.Activated:Connect(function()
+	if not state.game then
+		state.trackScripts = not state.trackScripts
+		render()
+		return
+	end
+	local on = not tracksScripts()
+	run(if on then "Tracking scripts…" else "Leaving scripts alone…", function()
+		state.game = call("POST", "/api/scripts", { scripts = on }).game
+		if on then
+			local report = tagObjects()
+			state.notice = string.format("RoGit tracks scripts now. %d objects have an ID; save main to keep them.", report.tagged)
+		else
+			state.notice = "RoGit leaves scripts alone now."
+		end
 	end)
 	refresh()
 end)
@@ -2216,7 +2253,20 @@ do
 			local target, template = find(op.target), templates[op.template]
 			local geometry = false
 			for _, property in op.properties do
-				if property == "Attributes" then
+				if property == "Source" and target:IsA("LuaSourceContainer") then
+					-- Through the script editor, so a script that's open there shows the new text.
+					local source = (template :: any).Source
+					local ok = pcall(function()
+						game:GetService("ScriptEditorService"):UpdateSourceAsync(target, function()
+							return source
+						end)
+					end) or pcall(function()
+						(target :: any).Source = source
+					end)
+					if not ok then
+						table.insert(problems, target:GetFullName() .. ".Source couldn't be set")
+					end
+				elseif property == "Attributes" then
 					copyAttributes(template, target)
 				elseif property == "Tags" then
 					copyTags(template, target)
@@ -2507,11 +2557,11 @@ local function startWatching()
 		watch.last = os.clock()
 	end
 
-	-- Only edits to the place count: Studio changes plenty of its own things (outlines, panels) all the time. RoGit
-	-- leaves scripts alone, so their edits don't count, but adding or removing a script changes its parent (a Folder
+	-- Only edits to the place count: Studio changes plenty of its own things (outlines, panels) all the time. Unless
+	-- the game tracks scripts, their edits don't count, but adding or removing a script changes its parent (a Folder
 	-- with a script inside isn't tracked).
 	local function touched(object: Instance)
-		if object.ClassName == "Camera" or object:IsA("LuaSourceContainer") or not relevant(object) then
+		if object.ClassName == "Camera" or (object:IsA("LuaSourceContainer") and not tracksScripts()) or not relevant(object) then
 			return
 		end
 		if trackedSet[object] then
@@ -2564,7 +2614,7 @@ local function startWatching()
 	end
 
 	local function added(object: Instance)
-		if object:IsA("LuaSourceContainer") then
+		if object:IsA("LuaSourceContainer") and not tracksScripts() then
 			if object.Parent then
 				touched(object.Parent)
 			end
@@ -2607,7 +2657,7 @@ local function startWatching()
 		idOwners = owners
 	end
 	local function removing(object: Instance)
-		if object:IsA("LuaSourceContainer") then
+		if object:IsA("LuaSourceContainer") and not tracksScripts() then
 			if object.Parent then
 				touched(object.Parent)
 			end
@@ -2628,6 +2678,15 @@ local function startWatching()
 	end
 	game.DescendantAdded:Connect(added)
 	game.DescendantRemoving:Connect(removing)
+	-- Typing in a script. (Its Source may only catch up when the editor saves it, which the next copy picks up.)
+	pcall(function()
+		game:GetService("ScriptEditorService").TextDocumentDidChange:Connect(function(document)
+			local script = document:GetScript()
+			if script then
+				touched(script)
+			end
+		end)
+	end)
 	-- Studio may not let plugins hear every property change. Then RoGit listens to what's selected, which is where
 	-- nearly every edit happens (moving, scaling, the Properties panel), and copies the whole place now and then.
 	local hearsEverything = pcall(function()

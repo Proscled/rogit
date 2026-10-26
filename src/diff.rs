@@ -22,8 +22,10 @@ pub(crate) const SERVICES: [&str; 18] = [
     "Chat", "LocalizationService", "TestService", "SocialService", "VoiceChatService",
 ];
 /// Properties that Studio changes by itself, or that only one kind of copy contains.
-pub(crate) const IGNORED: [&str; 9] = [
+pub(crate) const IGNORED: [&str; 10] = [
     "UniqueId", "HistoryId", "Capabilities", "DefinesCapabilities", "SourceAssetId", "PhysicsGrid", "NeedsPivotMigration",
+    // Studio gives every script one of these, and a new one to every copy.
+    "ScriptGuid",
     // Studio keeps this in step with the model's pivot; it can't be set and moves whenever the model moves.
     "ModelMeshCFrame",
     // Studio's own camera, which isn't part of a branch.
@@ -31,6 +33,13 @@ pub(crate) const IGNORED: [&str; 9] = [
 ];
 /// Changes that only move or turn an object. A moved model shows once, with these folded in from inside it.
 const SPATIAL: [&str; 3] = ["Position", "Rotation", "Pivot"];
+
+/// What RoGit tracks in a game, set up at Init.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Rules {
+    /// Scripts, and Folders that hold scripts, too. Off for games whose scripts live in files (Rojo and the like).
+    pub scripts: bool,
+}
 
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -150,10 +159,10 @@ pub(crate) fn tag(inst: &Instance) -> Option<String> {
     })
 }
 
-/// Lists what RoGit tracks, using the same rules as the plugin: everything in the saved services except scripts and
-/// Folders that contain a script anywhere inside. Objects are keyed by their RoGit ID; objects without one (or with a
-/// copied one) are keyed by their path.
-pub(crate) fn index(dom: &WeakDom) -> Index {
+/// Lists what RoGit tracks, using the same rules as the plugin: everything in the saved services, except (unless the
+/// game tracks scripts) scripts and Folders that contain a script anywhere inside. Objects are keyed by their RoGit ID;
+/// objects without one (or with a copied one) are keyed by their path.
+pub(crate) fn index(dom: &WeakDom, rules: Rules) -> Index {
     let mut index = Index::default();
     let mut untagged: HashMap<String, usize> = HashMap::new();
     for &service_ref in dom.root().children() {
@@ -163,17 +172,19 @@ pub(crate) fn index(dom: &WeakDom) -> Index {
         }
         let key = format!("service:{}", service.name);
         index.push(Entry { key: key.clone(), own_key: key.clone(), referent: service_ref, parent: None, path: service.name.clone() });
-        visit(dom, service_ref, &service.name, &key, &mut untagged, &mut index);
+        visit(dom, service_ref, &service.name, &key, &mut untagged, &mut index, rules);
     }
     index
 }
 
-fn visit(dom: &WeakDom, parent: Ref, parent_path: &str, parent_key: &str, untagged: &mut HashMap<String, usize>, index: &mut Index) -> bool {
+fn visit(
+    dom: &WeakDom, parent: Ref, parent_path: &str, parent_key: &str, untagged: &mut HashMap<String, usize>, index: &mut Index, rules: Rules,
+) -> bool {
     let mut has_script = false;
     for &child_ref in dom.get_by_ref(parent).unwrap().children() {
         let child = dom.get_by_ref(child_ref).unwrap();
         let path = format!("{parent_path}/{}", child.name);
-        if is_script(child) {
+        if is_script(child) && !rules.scripts {
             has_script = true;
             continue;
         }
@@ -191,7 +202,7 @@ fn visit(dom: &WeakDom, parent: Ref, parent_path: &str, parent_key: &str, untagg
         };
         let mark = index.entries.len();
         index.push(Entry { key: key.clone(), own_key: key.clone(), referent: child_ref, parent: Some(parent_key.to_owned()), path: path.clone() });
-        if visit(dom, child_ref, &path, &key, untagged, index) {
+        if visit(dom, child_ref, &path, &key, untagged, index, rules) && !rules.scripts {
             has_script = true;
             if child.class.as_str() == "Folder" {
                 index.truncate(mark);
@@ -331,6 +342,44 @@ pub(crate) fn label(property: &str, rotated: bool) -> String {
     .to_owned()
 }
 
+/// Text a property holds, for scripts' Source (place files may store it as raw bytes).
+fn text(value: &Variant) -> Option<std::borrow::Cow<'_, str>> {
+    match value {
+        Variant::String(s) => Some(s.as_str().into()),
+        Variant::BinaryString(b) => Some(String::from_utf8_lossy(b.as_ref())),
+        _ => None,
+    }
+}
+
+/// A script's Source, which reads as lines added and removed rather than the whole text.
+pub(crate) fn source<'a>(name: &str, value: &'a Variant) -> Option<std::borrow::Cow<'a, str>> {
+    if name == "Source" { text(value) } else { None }
+}
+
+/// How a script's Source changed: lines added and removed.
+pub(crate) fn lines_changed(old: &str, new: &str) -> String {
+    let (mut added, mut removed) = (0, 0);
+    for hunk in diffy::create_patch(old, new).hunks() {
+        for line in hunk.lines() {
+            match line {
+                diffy::Line::Insert(_) => added += 1,
+                diffy::Line::Delete(_) => removed += 1,
+                diffy::Line::Context(_) => {}
+            }
+        }
+    }
+    format!("+{added} −{removed} lines")
+}
+
+/// A property change as the review shows it.
+pub(crate) fn change_of(name: &str, class: &str, before: &Variant, after: &Variant, refs: (&Index, &Index)) -> Change {
+    if let (Some(old), Some(new)) = (source(name, before), source(name, after)) {
+        return Change::new("Source", "", lines_changed(&old, &new));
+    }
+    let rotated = rotation_differs(before, after);
+    Change::values(label(name, rotated), show(before, class, name, refs.0, rotated), show(after, class, name, refs.1, rotated))
+}
+
 pub(crate) fn rotation_differs(a: &Variant, b: &Variant) -> bool {
     match (a, b) {
         (Variant::CFrame(x), Variant::CFrame(y)) => close3(&x.position, &y.position) && !close_cframe(x, y),
@@ -360,8 +409,7 @@ fn changes(start: (&WeakDom, &Index, Ref), current: (&WeakDom, &Index, Ref)) -> 
     }
     changed.sort_unstable_by_key(|(name, _, _)| *name);
     for (name, before, after) in changed {
-        let rotated = rotation_differs(before, after);
-        out.push(Change::values(label(name, rotated), show(before, class, name, start.1, rotated), show(after, class, name, current.1, rotated)));
+        out.push(change_of(name, class, before, after, (start.1, current.1)));
     }
     out
 }
@@ -610,13 +658,13 @@ pub(crate) fn par_map_by<T: Sync, R: Send>(items: &[T], at_least: usize, f: impl
 }
 
 /// Everything that changed between the starting point and the branch now.
-pub fn compare(start: &WeakDom, current: &WeakDom) -> Review {
-    compare_with(start, &index(start), current)
+pub fn compare(start: &WeakDom, current: &WeakDom, rules: Rules) -> Review {
+    compare_with(start, &index(start, rules), current, rules)
 }
 
 /// Like `compare`, with the starting point's index made once and kept (a big place takes a while to index).
-pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom) -> Review {
-    let mut new = index(current);
+pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom, rules: Rules) -> Review {
+    let mut new = index(current, rules);
     adopt_new_ids(start, &old, current, &mut new);
     let mut tree = Tree::default();
     let mut summary = Summary::default();
@@ -702,7 +750,7 @@ mod tests {
         let gate = current.descendants().find(|i| i.name == "Gate").unwrap().referent();
         current.transfer_within(gate, current.root_ref());
         current.transfer_within(gate, map);
-        let review = compare(&start, &current);
+        let review = compare(&start, &current, Rules::default());
         assert_eq!(review.summary, Summary::default());
     }
 
@@ -736,7 +784,7 @@ mod tests {
         // Rename the tower and nudge its size by less than rounding.
         let tower = current.descendants().find(|i| i.name == "Tower").unwrap().referent();
         current.get_by_ref_mut(tower).unwrap().name = "Watchtower".into();
-        let review = compare(&start, &current);
+        let review = compare(&start, &current, Rules::default());
         assert_eq!(review.summary, Summary { added: 1, removed: 1, changed: 2 });
         let row = |name: &str| review.rows.iter().find(|r| r.name == name).unwrap();
         assert_eq!(row("Gate").status, Status::Changed);
@@ -762,7 +810,7 @@ mod tests {
         let mut attributes = Attributes::new();
         attributes.insert(TAG.to_owned(), Variant::BinaryString(b"late".to_vec().into()));
         current.get_by_ref_mut(effects).unwrap().properties.insert("Attributes".into(), Variant::Attributes(attributes));
-        let review = compare(&start, &current);
+        let review = compare(&start, &current, Rules::default());
         assert_eq!(review.summary, Summary::default());
     }
 
@@ -785,7 +833,7 @@ mod tests {
                 dom.get_by_ref_mut(r).unwrap().properties.insert(property.into(), value);
             }
         }
-        let review = compare(&start, &current);
+        let review = compare(&start, &current, Rules::default());
         assert_eq!(review.summary.changed, 1);
         let shed = review.rows.iter().find(|r| r.name == "Shed").unwrap();
         assert_eq!(shed.changes[0].name, "Pivot");
@@ -805,7 +853,7 @@ mod tests {
                 dom.get_by_ref_mut(r).unwrap().properties.insert("CFrame".into(), at(x));
             }
         }
-        let review = compare(&start, &current);
+        let review = compare(&start, &current, Rules::default());
         let names: Vec<&str> = review.rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["Workspace", "Map"]);
         assert_eq!(review.rows[1].changes, vec![Change::new("Moved inside", "", "3 objects")]);
@@ -822,7 +870,24 @@ mod tests {
         attributes.insert("RBX_LightingCompatibilityMigrated".to_owned(), Variant::Bool(true));
         attributes.insert(UPDATE.to_owned(), Variant::String("u1".into()));
         current.get_by_ref_mut(gate).unwrap().properties.insert("Attributes".into(), Variant::Attributes(attributes));
-        assert_eq!(compare(&start, &current).summary, Summary::default());
+        assert_eq!(compare(&start, &current, Rules::default()).summary, Summary::default());
+    }
+
+    #[test]
+    fn tracked_scripts_show_lines_changed() {
+        let place = |source: &str| {
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let service = dom.insert(dom.root_ref(), InstanceBuilder::new("ServerScriptService").with_name("ServerScriptService"));
+            let folder = dom.insert(service, tagged("Folder", "Game", "game"));
+            dom.insert(folder, tagged("Script", "Round", "round").with_property("Source", Variant::String(source.into())));
+            dom
+        };
+        let (start, current) = (place("local a = 1\nlocal b = 2\n"), place("local a = 1\nlocal b = 3\nprint(a + b)\n"));
+        assert!(compare(&start, &current, Rules::default()).rows.is_empty(), "scripts aren't tracked by default");
+        let review = compare(&start, &current, Rules { scripts: true });
+        let row = review.rows.iter().find(|r| r.name == "Round").unwrap();
+        assert_eq!(row.changes, vec![Change::new("Source", "", "+2 −1 lines")]);
+        assert!(review.rows.iter().any(|r| r.name == "Game" && r.status == Status::Context));
     }
 
     #[test]
@@ -833,7 +898,7 @@ mod tests {
             dom.insert(workspace, tagged("Terrain", "Terrain", "terrain").with_property("SmoothGrid", Variant::BinaryString(data.to_vec().into())));
             dom
         };
-        let review = compare(&terrain(b"before"), &terrain(b"after"));
+        let review = compare(&terrain(b"before"), &terrain(b"after"), Rules::default());
         let row = review.rows.iter().find(|r| r.name == "Terrain").unwrap();
         assert_eq!(row.changes, vec![Change::new("Voxels", "", "changed")]);
     }
@@ -860,7 +925,7 @@ mod tests {
 
     #[test]
     fn identical_places_have_no_changes() {
-        let review = compare(&place(0.5, "Tower", true, false), &place(0.5, "Tower", true, false));
+        let review = compare(&place(0.5, "Tower", true, false), &place(0.5, "Tower", true, false), Rules::default());
         assert_eq!(review.summary, Summary::default());
         assert!(review.rows.is_empty());
     }
@@ -880,17 +945,17 @@ mod bench {
         let current = crate::place::read(std::path::Path::new(&path)).unwrap();
         let read = started.elapsed();
         let started = std::time::Instant::now();
-        let index_only = index(&start).entries.len();
+        let index_only = index(&start, Rules::default()).entries.len();
         let indexed = started.elapsed();
         let started = std::time::Instant::now();
-        let review = compare(&start, &current);
+        let review = compare(&start, &current, Rules::default());
         println!(
             "{} objects tracked: read both {:?}, index one {:?}, compare {:?} ({} rows)",
             index_only, read, indexed, started.elapsed(), review.rows.len()
         );
-        let old = index(&start);
+        let old = index(&start, Rules::default());
         let t = std::time::Instant::now();
-        let mut new = index(&current);
+        let mut new = index(&current, Rules::default());
         let index_time = t.elapsed();
         let t = std::time::Instant::now();
         adopt_new_ids(&start, &old, &current, &mut new);
@@ -905,7 +970,7 @@ mod bench {
         println!("PHASES index {index_time:?}, adopt {adopt_time:?}, property compare {:?} ({n} changes)", t.elapsed());
         for _ in 0..3 {
             let t = std::time::Instant::now();
-            compare_with(&start, &old, &current);
+            compare_with(&start, &old, &current, Rules::default());
             println!("PHASES compare_with (each refresh) {:?}", t.elapsed());
         }
         let t = std::time::Instant::now();
@@ -915,7 +980,7 @@ mod bench {
         let copy = crate::live::copy_of(&current).unwrap();
         let copy_time = t.elapsed();
         let t = std::time::Instant::now();
-        let plan = crate::merge::plan(&start, &current, &copy, crate::merge::Direction::Merge).unwrap();
+        let plan = crate::merge::plan(&start, &current, &copy, crate::merge::Direction::Merge, Rules::default()).unwrap();
         println!("PHASES write {write_time:?}, copy {copy_time:?}, merge plan {:?} ({} ops)", t.elapsed(), plan.operations.len());
     }
 }

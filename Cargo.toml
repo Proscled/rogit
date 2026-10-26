@@ -1,6 +1,6 @@
 [package]
 name = "rogit"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2024"
 description = "Branches for your Roblox places' assets, with a Studio plugin. Scripts stay with Rojo."
 license = "MPL-2.0"
@@ -24,6 +24,7 @@ toml = "1.1.8"
 ureq = "3.5.0"
 zstd = "0.13.3"
 zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+diffy = "0.5.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }

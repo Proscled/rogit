@@ -1,15 +1,15 @@
 //! Committing only some changes, like `git add` before `git commit`: the branch as it is, with every change that
 //! isn't staged put back the way the last commit had it.
 
-use crate::diff::{self, Index, Row, Status};
+use crate::diff::{self, Index, Row, Rules, Status};
 use rbx_dom_weak::WeakDom;
 use rbx_dom_weak::types::Variant;
 use std::collections::HashSet;
 
 /// `snapshot` is a copy of the branch as it is now; `rows` are its changes since `previous` (the last commit).
-pub fn partial(previous: &WeakDom, mut snapshot: WeakDom, rows: &[Row], staged: &HashSet<String>) -> WeakDom {
-    let old = diff::index(previous);
-    let mut new = diff::index(&snapshot);
+pub fn partial(previous: &WeakDom, mut snapshot: WeakDom, rows: &[Row], staged: &HashSet<String>, rules: Rules) -> WeakDom {
+    let old = diff::index(previous, rules);
+    let mut new = diff::index(&snapshot, rules);
     diff::adopt_new_ids(previous, &old, &snapshot, &mut new);
     let shown: HashSet<&str> = rows.iter().filter(|r| r.status != Status::Context).map(|r| r.key.as_str()).collect();
     let unstaged: Vec<&Row> = rows.iter().filter(|r| r.status != Status::Context && !staged.contains(&r.key)).collect();
@@ -100,15 +100,15 @@ mod tests {
     fn only_staged_changes_are_committed() {
         let previous = place(0.0, 1.0, true, false);
         let live = || place(1.0, 5.0, false, true);
-        let rows = diff::compare(&previous, &live()).rows;
+        let rows = diff::compare(&previous, &live(), Rules::default()).rows;
         let staged: HashSet<String> = ["gate".to_owned()].into();
 
-        let commit = partial(&previous, live(), &rows, &staged);
-        let committed = diff::compare(&previous, &commit);
+        let commit = partial(&previous, live(), &rows, &staged, Rules::default());
+        let committed = diff::compare(&previous, &commit, Rules::default());
         assert_eq!(committed.summary, diff::Summary { added: 0, removed: 0, changed: 1 });
         assert_eq!(committed.rows.iter().find(|r| r.status != Status::Context).unwrap().name, "Gate");
         // What's left uncommitted: the tower, the new crate and the removed shed.
-        let left = diff::compare(&commit, &live());
+        let left = diff::compare(&commit, &live(), Rules::default());
         assert_eq!(left.summary, diff::Summary { added: 1, removed: 1, changed: 1 });
     }
 
@@ -117,11 +117,11 @@ mod tests {
         // Discarding is the same move the other way round: keep every change except the discarded ones.
         let previous = place(0.0, 1.0, true, false);
         let live = || place(1.0, 5.0, false, true);
-        let rows = diff::compare(&previous, &live()).rows;
+        let rows = diff::compare(&previous, &live(), Rules::default()).rows;
         let keep: HashSet<String> = ["tower".to_owned(), "shed".to_owned()].into();
 
-        let wanted = partial(&previous, live(), &rows, &keep);
-        let left = diff::compare(&previous, &wanted);
+        let wanted = partial(&previous, live(), &rows, &keep, Rules::default());
+        let left = diff::compare(&previous, &wanted, Rules::default());
         let names: Vec<(&str, Status)> =
             left.rows.iter().filter(|r| r.status != Status::Context).map(|r| (r.name.as_str(), r.status)).collect();
         assert_eq!(names, [("Shed", Status::Removed), ("Tower", Status::Changed)]);

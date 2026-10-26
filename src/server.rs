@@ -77,6 +77,11 @@ impl State {
     fn tidy_later(&mut self) {
         self.tidied = self.tidy_failed;
     }
+
+    /// What RoGit tracks in this game.
+    fn rules(&self) -> diff::Rules {
+        diff::Rules { scripts: self.project.config().ok().flatten().is_some_and(|c| c.game.scripts) }
+    }
 }
 
 /// A branch's last commit (or where it last met main), indexed once.
@@ -85,6 +90,8 @@ struct Committed {
     which: String,
     dom: WeakDom,
     index: diff::Index,
+    /// What the index tracks: it's made again if the game's choice changes.
+    rules: diff::Rules,
     /// What it is, for the plugin: `{ kind, message?, time }`.
     since: Value,
 }
@@ -311,6 +318,7 @@ fn route(state: &mut State, method: &Method, path: &str, query: &str, body: &str
         (Method::Get, "/api/place") => place(state, query),
         (Method::Post, "/api/init") => init(state, &body),
         (Method::Post, "/api/init/done") => Ok(init_done(&body)),
+        (Method::Post, "/api/scripts") => track_scripts(state, &body),
         (Method::Post, "/api/upload") => upload(state, query, &body),
         (Method::Post, "/api/branches") => create_branch(state, &body),
         (Method::Post, "/api/branches/start") => starting_point(state, &body),
@@ -382,7 +390,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rogit-games-{}", std::process::id()));
         let mut games = Games::new(root.clone());
         for (id, name) in [(10, "Tycoon"), (20, "Obby")] {
-            games.get(id).project.init(Game { name: name.into(), universe_id: id, main_place_id: id + 1 }).unwrap();
+            games.get(id).project.init(Game { name: name.into(), universe_id: id, main_place_id: id + 1, scripts: false }).unwrap();
         }
         // A branch of the obby, made the way rogit serve makes one.
         let store = &games.get(20).branches;
@@ -407,6 +415,33 @@ mod tests {
 
     /// Plays the plugin's part on a big place (ROGIT_BENCH_PLACE, a .rbxl): a branch's full copy, an edit sent as a
     /// patch, an empty patch, a commit and a merge, printing how long rogit serve takes for each.
+    /// Makes a game that tracks scripts, with a branch to open in Studio, in `ROGIT_FIXTURE` (a games folder).
+    #[test]
+    #[ignore]
+    fn makes_a_game_that_tracks_scripts() {
+        let Ok(games) = std::env::var("ROGIT_FIXTURE") else { return };
+        let root = std::path::Path::new(&games).join("1");
+        Project::new(root.clone()).init(Game { name: "Script Test".into(), universe_id: 1, main_place_id: 2, scripts: true }).unwrap();
+        let branches = Branches::new(root);
+        let upload = branches.upload_dir("fixture01");
+        std::fs::create_dir_all(&upload).unwrap();
+        let mut dom = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel"));
+        let part = dom.insert(dom.root_ref(), rbx_dom_weak::InstanceBuilder::new("Part").with_name("Floor"));
+        rbx_binary::to_writer(std::fs::File::create(upload.join("Workspace.rbxm")).unwrap(), &dom, &[part]).unwrap();
+        let mut dom = WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel"));
+        let folder = dom.insert(dom.root_ref(), rbx_dom_weak::InstanceBuilder::new("Folder").with_name("Game"));
+        let source = "local length = 60\nlocal players = 8\n\nprint(\"start\")\ntask.wait(length)\nprint(\"end\")\n";
+        let script = rbx_dom_weak::InstanceBuilder::new("Script").with_name("Round").with_property("Source", rbx_dom_weak::types::Variant::String(source.into()));
+        dom.insert(folder, script);
+        rbx_binary::to_writer(std::fs::File::create(upload.join("ServerScriptService.rbxm")).unwrap(), &dom, &[folder]).unwrap();
+        let manifest = json!({ "services": [
+            { "name": "Workspace", "className": "Workspace", "settings": {}, "attributes": {} },
+            { "name": "ServerScriptService", "className": "ServerScriptService", "settings": {}, "attributes": {} },
+        ]});
+        branches.create("scripts-test", "fixture01", &manifest, 1).unwrap();
+        println!("{}", branches.file("scripts-test").display());
+    }
+
     /// `ROGIT_BENCH_PLACE=… cargo test --release replays_the_plugin -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -415,7 +450,7 @@ mod tests {
         let place = crate::place::read(std::path::Path::new(&path)).unwrap();
         let root = std::env::temp_dir().join(format!("rogit-replay-{}", std::process::id()));
         let project = Project::new(root.clone());
-        project.init(Game { name: "Bench".into(), universe_id: 1, main_place_id: 2 }).unwrap();
+        project.init(Game { name: "Bench".into(), universe_id: 1, main_place_id: 2, scripts: false }).unwrap();
         let mut state = State::new(1, project);
 
         // Studio's session IDs, made up: one per object, listed in the plugin's walk order.
@@ -629,9 +664,24 @@ fn init(state: &mut State, body: &str) -> Reply {
     if experience.start_place_id != place {
         return Err((409, format!("Init only works in the start place of {}.", experience.name)));
     }
-    let game = Game { name: experience.name, universe_id: game, main_place_id: place };
+    // Init again keeps the choice about scripts unless the plugin makes it again.
+    let scripts = request["scripts"].as_bool().unwrap_or_else(|| state.rules().scripts);
+    let game = Game { name: experience.name, universe_id: game, main_place_id: place, scripts };
     let config = state.project.init(game).map_err(|e| (500, format!("Couldn't write RoGit's files for this game: {e}")))?;
-    println!("Set up {}", config.game.name);
+    state.committed.clear();
+    println!("Set up {}{}", config.game.name, if scripts { ", tracking scripts" } else { "" });
+    Ok(json!({ "game": config.game }))
+}
+
+/// Turns tracking scripts on or off for the game.
+fn track_scripts(state: &mut State, body: &str) -> Reply {
+    let scripts = json_body(body)?["scripts"].as_bool().ok_or((400, "Say whether to track scripts.".to_owned()))?;
+    let mut game = require_game(state)?;
+    game.scripts = scripts;
+    let config = state.project.init(game).map_err(|e| (500, format!("Couldn't save the choice: {e}")))?;
+    // What changes are measured from is listed again with the new choice.
+    state.committed.clear();
+    println!("{} {}", if scripts { "Tracking scripts in" } else { "Not tracking scripts in" }, config.game.name);
     Ok(json!({ "game": config.game }))
 }
 
@@ -699,6 +749,7 @@ fn unsaved_work(state: &mut State, name: &str, opened: u64) -> Option<u64> {
         .map(|d| d.as_secs())
         .unwrap_or_default();
     let live = state.live.contains_key(name);
+    let rules = state.rules();
     if let Some((checked, differs)) = state.unsaved.get(name) {
         if *checked == (saved, copy, live) {
             return differs.then_some(copy);
@@ -708,8 +759,8 @@ fn unsaved_work(state: &mut State, name: &str, opened: u64) -> Option<u64> {
     // already has its work, and there's nothing to bring back. Until then, against the saved file.
     let differs = match state.branches.latest_place(name) {
         Ok(latest) => match state.live.get(name) {
-            Some(window) => !diff::compare(&latest, &window.dom).rows.is_empty(),
-            None => crate::place::read(&state.branches.file(name)).is_ok_and(|file| !diff::compare(&file, &latest).rows.is_empty()),
+            Some(window) => !diff::compare(&latest, &window.dom, rules).rows.is_empty(),
+            None => crate::place::read(&state.branches.file(name)).is_ok_and(|file| !diff::compare(&file, &latest, rules).rows.is_empty()),
         },
         Err(_) => false,
     };
@@ -783,7 +834,7 @@ fn plan_merge(state: &mut State, body: &str) -> Reply {
         (None, _) => 0,
         (Some(_), Some(live)) => live.uncommitted,
         (Some(_), None) => match state.branches.newest(&name) {
-            Ok((newest, _, _)) => diff::compare(&branch, &newest).rows.iter().filter(|r| r.status != diff::Status::Context).count(),
+            Ok((newest, _, _)) => diff::compare(&branch, &newest, state.rules()).rows.iter().filter(|r| r.status != diff::Status::Context).count(),
             Err(_) => 0,
         },
     };
@@ -792,7 +843,7 @@ fn plan_merge(state: &mut State, body: &str) -> Reply {
         .base(&name, merge::last_merge(&main, &name).as_deref(), merge::last_update(&branch).as_deref())
         .map_err(|e| (409, e))?;
     step("uncommitted count and base", &mut timer);
-    let plan = merge::plan(&base, &branch, &main, Direction::Merge).map_err(|e| (500, e))?;
+    let plan = merge::plan(&base, &branch, &main, Direction::Merge, state.rules()).map_err(|e| (500, e))?;
     step("plan", &mut timer);
     let s = &plan.summary;
     println!(
@@ -869,12 +920,13 @@ fn main_copy(state: &mut State, body: &str) -> Reply {
         return Ok(json!({ "branch": name }));
     }
     let main = take_upload(state, capture, &request["manifest"])?;
+    let rules = state.rules();
     let update = state.updates.get_mut(&name).unwrap();
     let planned = state
         .branches
         .base(&name, merge::last_merge(&main, &name).as_deref(), merge::last_update(&update.branch).as_deref())
         .and_then(|(base, since, since_time)| {
-            merge::plan(&base, &main, &update.branch, Direction::Update).map(|plan| (plan, since, since_time))
+            merge::plan(&base, &main, &update.branch, Direction::Update, rules).map(|plan| (plan, since, since_time))
         });
     match planned {
         Ok((plan, since, since_time)) => {
@@ -1028,10 +1080,11 @@ fn load_committed(state: &mut State, name: &str, record: Option<String>) -> Resu
         Some(last) => last.id.clone(),
         None => format!("base:{}", record.clone().unwrap_or_default()),
     };
-    if state.committed.get(name).is_none_or(|c| c.which != which) {
+    let rules = state.rules();
+    if state.committed.get(name).is_none_or(|c| c.which != which || c.rules != rules) {
         let (dom, since) = committed(state, name, record.as_deref())?;
-        let index = diff::index(&dom);
-        state.committed.insert(name.to_owned(), Committed { which, dom, index, since });
+        let index = diff::index(&dom, rules);
+        state.committed.insert(name.to_owned(), Committed { which, dom, index, rules, since });
     }
     Ok(())
 }
@@ -1039,7 +1092,7 @@ fn load_committed(state: &mut State, name: &str, record: Option<String>) -> Resu
 /// The changes in `current` since what `load_committed` loaded.
 fn uncommitted(state: &State, name: &str, current: &WeakDom) -> diff::Review {
     let base = &state.committed[name];
-    diff::compare_with(&base.dom, &base.index, current)
+    diff::compare_with(&base.dom, &base.index, current, base.rules)
 }
 
 /// How many changes a review lists (not counting the rows that only show where they are).
@@ -1182,9 +1235,10 @@ fn commit(state: &mut State, body: &str) -> Reply {
     } else {
         let previous = &state.committed[&name].dom;
         let copy = crate::live::copy_of(&current).map_err(|e| (500, e))?;
-        let snapshot = crate::stage::partial(previous, copy, &all.rows, &staged);
-        let summary = diff::compare_with(previous, &state.committed[&name].index, &snapshot).summary;
-        let left = diff::compare(&snapshot, &current);
+        let rules = state.committed[&name].rules;
+        let snapshot = crate::stage::partial(previous, copy, &all.rows, &staged, rules);
+        let summary = diff::compare_with(previous, &state.committed[&name].index, &snapshot, rules).summary;
+        let left = diff::compare(&snapshot, &current, rules);
         (snapshot, summary, left)
     };
     if summary == diff::Summary::default() {
@@ -1198,9 +1252,10 @@ fn commit(state: &mut State, body: &str) -> Reply {
     // the copy's bytes are the file.
     let bytes = bytes.filter(|_| staged.is_empty());
     let branches = &state.branches;
+    let rules = state.rules();
     let index = std::thread::scope(|scope| {
         let written = scope.spawn(|| branches.add_commit(&name, &snapshot, bytes.as_deref(), &commit));
-        let index = diff::index(&snapshot);
+        let index = diff::index(&snapshot, rules);
         written.join().unwrap().map(|()| index)
     })
     .map_err(|e| (500, e))?;
@@ -1218,7 +1273,7 @@ fn commit(state: &mut State, body: &str) -> Reply {
     }
     // The new commit is what changes are measured from now; keep it in memory instead of reading it back.
     let since = json!({ "kind": "commit", "message": commit.message, "time": commit.time });
-    state.committed.insert(name.clone(), Committed { which: commit.id.clone(), dom: snapshot, index, since: since.clone() });
+    state.committed.insert(name.clone(), Committed { which: commit.id.clone(), dom: snapshot, index, rules, since: since.clone() });
     println!("Committed {name}: \"{}\" ({} ms)", commit.message, started.elapsed().as_millis());
     Ok(json!({ "commit": commit, "commits": state.branches.commits(&name), "changes": left, "staged": [], "since": since }))
 }
@@ -1247,12 +1302,12 @@ fn commit_everything(state: &mut State, name: &str, message: String, auto: bool,
         let _ = state.history.add(event, None);
     }
     let since = json!({ "kind": "commit", "message": commit.message, "time": commit.time });
-    let (which, read_since) = (commit.id.clone(), since.clone());
+    let (which, read_since, rules) = (commit.id.clone(), since.clone(), state.rules());
     state.committed.remove(name);
     let reading = std::thread::spawn(move || {
         let dom = rbx_binary::from_reader(&bytes[..]).map_err(|e| format!("Couldn't read the commit back: {e}"))?;
-        let index = diff::index(&dom);
-        Ok(Committed { which, dom, index, since: read_since })
+        let index = diff::index(&dom, rules);
+        Ok(Committed { which, dom, index, rules, since: read_since })
     });
     state.committing.insert(name.to_owned(), reading);
     let live = state.live.get_mut(name).unwrap();
@@ -1300,20 +1355,20 @@ fn view_commit(state: &mut State, body: &str) -> Reply {
         None => state.branches.starting_point(name),
     }
     .map_err(|e| (500, e))?;
-    Ok(json!({ "review": diff::compare(&before, &this), "commit": commits[position] }))
+    Ok(json!({ "review": diff::compare(&before, &this, state.rules()), "commit": commits[position] }))
 }
 
 /// Plans bringing an earlier copy of the branch back into the branch as it is now (`current`). The reply carries
 /// the copy's update record, which the plugin sets too, so later merges and updates measure from the right place.
 fn plan_restore_of(state: &mut State, name: &str, kind: &str, copy: &WeakDom, current: &WeakDom) -> Reply {
-    let (reply, rows) = restore_plan(name, kind, copy, current)?;
+    let (reply, rows) = restore_plan(name, kind, copy, current, state.rules())?;
     state.restores.insert(name.to_owned(), (kind.to_owned(), rows));
     Ok(reply)
 }
 
 /// The plan for bringing `copy` back into the branch as it is (`current`), and its rows for the history.
-fn restore_plan(name: &str, kind: &str, copy: &WeakDom, current: &WeakDom) -> Result<(Value, Value), (u16, String)> {
-    let plan = merge::plan(current, copy, current, Direction::Restore).map_err(|e| (500, e))?;
+fn restore_plan(name: &str, kind: &str, copy: &WeakDom, current: &WeakDom, rules: diff::Rules) -> Result<(Value, Value), (u16, String)> {
+    let plan = merge::plan(current, copy, current, Direction::Restore, rules).map_err(|e| (500, e))?;
     let rows = json!({ "rows": plan.rows, "truncated": plan.truncated });
     let s = &plan.summary;
     println!("Planned {kind} of {name}: {} added, {} removed, {} changed", s.added, s.removed, s.changed);
@@ -1336,7 +1391,7 @@ fn plan_revert(state: &mut State, body: &str) -> Reply {
             _ => Some(state.branches.commit_place(&name, &id).map_err(|e| (404, e))?),
         };
         let copy = read.as_ref().unwrap_or_else(|| &state.committed[&name].dom);
-        let (reply, rows) = restore_plan(&name, "revert", copy, &state.live[&name].dom)?;
+        let (reply, rows) = restore_plan(&name, "revert", copy, &state.live[&name].dom, state.rules())?;
         state.restores.insert(name, ("revert".to_owned(), rows));
         return Ok(reply);
     }
@@ -1368,8 +1423,9 @@ fn plan_discard(state: &mut State, body: &str) -> Reply {
     let keep: HashSet<String> =
         rows.iter().filter(|r| r.status != diff::Status::Context && !discard.contains(&r.key)).map(|r| r.key.clone()).collect();
     let copy = crate::live::copy_of(current).map_err(|e| (500, e))?;
-    let wanted = crate::stage::partial(&state.committed[&name].dom, copy, &rows, &keep);
-    let plan = merge::plan(current, &wanted, current, Direction::Restore).map_err(|e| (500, e))?;
+    let rules = state.committed[&name].rules;
+    let wanted = crate::stage::partial(&state.committed[&name].dom, copy, &rows, &keep, rules);
+    let plan = merge::plan(current, &wanted, current, Direction::Restore, rules).map_err(|e| (500, e))?;
     Ok(json!({ "plan": plan }))
 }
 
