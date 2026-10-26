@@ -79,6 +79,9 @@ jobs:
           }
           $reply = Wait-RoGit
           if ($reply.server -ne 'rogit') { throw "Unexpected reply: $reply" }
+          # rogit works right away in the window that installed it.
+          rogit --version
+          if ($LASTEXITCODE -ne 0) { throw 'rogit is not on PATH in the installing window.' }
           $run = (Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).RoGit
           if ($run -ne "`"$bin\rogit-background.exe`"") { throw "RoGit doesn't start at login: $run" }
           if (Test-Path "$env:LOCALAPPDATA\rogit\start.vbs") { throw 'A start script was written.' }

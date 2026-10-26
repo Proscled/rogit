@@ -38,7 +38,14 @@
         & "$tmp\rogit.exe" self-install
         if ($LASTEXITCODE -ne 0) {
             Write-Host "RoGit couldn't install itself (see above)." -ForegroundColor Red
+            return
         }
+        # rogit.exe saved the new PATH for windows opened from now on; this one gets it too, so rogit works here now.
+        $bin = Join-Path $env:LOCALAPPDATA 'rogit\bin'
+        if (($env:Path -split ';') -notcontains $bin) {
+            $env:Path = "$bin;$env:Path"
+        }
+        Write-Host 'rogit works in this PowerShell window too.'
     } finally {
         Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }

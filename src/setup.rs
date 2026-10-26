@@ -53,7 +53,19 @@ pub fn self_install() -> Result<(), String> {
     println!();
     println!("RoGit {} is installed in {}.", env!("CARGO_PKG_VERSION"), bin.display());
     if !changed.is_empty() {
-        println!("Added it to your PATH ({}). Terminals opened from now on find rogit.", changed.join(", "));
+        println!("Added it to your PATH ({}).", changed.join(", "));
+    }
+    // A terminal reads PATH when it starts, and the installer can't change the one it runs in.
+    let found_here = env::var_os("PATH").is_some_and(|path| env::split_paths(&path).any(|folder| folder == bin));
+    if !found_here {
+        if cfg!(windows) {
+            println!("Terminals opened from now on find rogit; VS Code's terminals do once you restart VS Code.");
+        } else {
+            println!("Terminals opened from now on find rogit. To use it in this one, run:");
+            println!();
+            println!("    source ~/.rogit/env");
+            println!();
+        }
     }
     if !started {
         println!("Start RoGit with: rogit serve");
