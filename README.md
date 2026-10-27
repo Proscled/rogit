@@ -71,6 +71,19 @@ Everything saved in the place, except:
 - scripts, and any Folder with a script inside it;
 - Studio's own camera and the `RBX_` attributes Roblox keeps for itself.
 
+## Limitations
+
+- **One computer.** Branches live in RoGit's folder on the computer that made them. Teammates, even in Team Create,
+  can't see or open your branches, and RoGit doesn't back them up anywhere.
+- **The start place only.** RoGit branches a game's start place. Other places in the same game can't have branches.
+- **Published games only.** Init needs a game that has been published; a place that never was can't be set up.
+- **The IDs stay.** Init gives every tracked object in main a `RoGitId` attribute. RoGit has no command to take them
+  out again; they don't change how your game runs.
+- **Settings plugins can't read.** Plugins can't read a few service settings (Lighting's Technology, for example), so
+  they aren't copied into branches: a branch has Studio's defaults for them, and merges leave them alone in main.
+- **Warnings on Windows.** RoGit's Windows programs aren't signed yet, so Windows or your antivirus may warn about
+  them. The site's [help](https://proscled.github.io/rogit/#help) says what to do.
+
 ## From the terminal
 
 - `rogit diff` lists every game's branches; `rogit diff <branch>` prints what a branch changed (`--json` for tools).
