@@ -277,7 +277,7 @@
         </li>
         <li>
           <h3>Init in Studio</h3>
-          <p>Open your game's start place, then <b>Plugins → RoGit</b>. Turn on <b>Track scripts</b> if you write scripts in Studio, then click <b>Init</b>. Save the place afterwards. Once per game.</p>
+          <p>Open your game's start place. In the RoGit panel on the left, click <b>Init</b>. Save the place afterwards. Once per game.</p>
         </li>
         <li>
           <h3>Make a branch</h3>
@@ -325,7 +325,7 @@
 
       <div class="grid">
         <div><h3>Stays on your computer</h3><p>Branches are place files in RoGit's folder on your computer. No account, API key or cloud.</p></div>
-        <div><h3>Scripts your way</h3><p>Write scripts in Studio, and they branch and merge line by line. Keep them in files with Rojo, and RoGit leaves them alone.</p></div>
+        <div><h3>Scripts left alone</h3><p>RoGit doesn't touch scripts, or folders that hold scripts. Keep them however you like.</p></div>
         <div><h3>Fast in big games</h3><p>After one copy of the place, only the objects you change are sent.</p></div>
         <div><h3>Terrain, meshes, unions</h3><p>Terrain voxels, material colors, MeshParts and unions merge like everything else.</p></div>
         <div><h3>A graph of it all</h3><p>Every branch, commit, merge and pull in one graph. Click one to see what it changed.</p></div>
@@ -419,7 +419,7 @@
         </details>
         <details>
           <summary>What about my scripts?</summary>
-          <div><p>You choose when you set up a game. With <b>Track scripts</b> on, scripts are part of branches: their changes show as lines added and removed, and a merge keeps both sides' edits to a script, like Git, unless they edited the same lines. With it off (best for Rojo or Argon users), RoGit leaves scripts alone, and any folder that holds a script. You can change it later in main.</p></div>
+          <div><p>RoGit leaves scripts alone, and any folder that holds a script. Branches and merges are about everything else in the place, so keep scripts however you like.</p></div>
         </details>
         <details>
           <summary>The terminal says rogit isn't found or isn't recognized</summary>
@@ -473,16 +473,16 @@
   // Windows unless this is clearly a Mac: most Roblox developers are on Windows.
   choose(/mac/i.test(platform) ? 'mac' : 'win');
 
-  // Copy buttons.
+  // Copy buttons. They select the command too: blockers like uBlock Origin can stop the copy without an error, and then Ctrl+C still works.
   document.querySelectorAll('.copy').forEach(button => button.addEventListener('click', async () => {
     const code = button.parentElement.querySelector('code');
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
     try {
       await navigator.clipboard.writeText(code.textContent);
     } catch {
-      const range = document.createRange();
-      range.selectNodeContents(code);
-      getSelection().removeAllRanges();
-      getSelection().addRange(range);
       return;
     }
     button.textContent = 'Copied';

@@ -16,6 +16,35 @@ if not RunService:IsEdit() then
 	return
 end
 
+-- RoGit pauses while a playtest runs: this window's place stays open underneath it, and nothing should be copied from
+-- it or changed in it until Stop. RunService:IsEdit() stays true meanwhile; EditModeActive is false from Play to Stop,
+-- paused or not.
+local PAUSED = "RoGit is paused while you playtest. Stop the playtest to carry on."
+local playtest = {
+	service = game:GetService("StudioTestService"),
+	-- Goes up at every Play and Stop (and when the plugin unloads), so work started before one is dropped after it.
+	generation = 0,
+	alive = true,
+}
+function playtest.isEditing(): boolean
+	return playtest.alive and RunService:IsEdit() and playtest.service.EditModeActive
+end
+function playtest.isCurrent(generation: number): boolean
+	return playtest.isEditing() and generation == playtest.generation
+end
+function playtest.check(generation: number?)
+	assert(playtest.isCurrent(generation or playtest.generation), PAUSED)
+end
+-- Counting Play and Stop, not just reading EditModeActive, also catches a copy that waited through a whole playtest.
+local generationConnection = playtest.service:GetPropertyChangedSignal("EditModeActive"):Connect(function()
+	playtest.generation += 1
+end)
+plugin.Unloading:Connect(function()
+	playtest.alive = false
+	playtest.generation += 1
+	generationConnection:Disconnect()
+end)
+
 -- This plugin's version; `rogit plugin install` (and so the installer) fills it in.
 local VERSION = "__ROGIT_VERSION__"
 -- RoGit takes the first free one of these ports.
@@ -33,7 +62,7 @@ local SERVICES = {
 	"Chat", "LocalizationService", "TestService", "SocialService", "VoiceChatService",
 }
 
-type Game = { name: string, universe_id: number, main_place_id: number, scripts: boolean? }
+type Game = { name: string, universe_id: number, main_place_id: number }
 type Branch = { name: string, created: number, has_starting_point: boolean, merged: number?, updated: number?, pinned: boolean? }
 type State = {
 	connected: boolean,
@@ -68,19 +97,9 @@ type State = {
 	-- The branch this window shows, if it was archived.
 	archived: string?,
 	autosaved: number?,
-	-- Before Init: whether to track scripts too.
-	trackScripts: boolean?,
 }
 
 local state: State = { connected = false, branches = {}, commits = {}, graph = {}, staged = {} }
-
--- Whether RoGit tracks scripts in this game: a choice made at Init (for games whose scripts aren't kept in files).
-local function tracksScripts(): boolean
-	if state.game then
-		return state.game.scripts == true
-	end
-	return state.trackScripts == true
-end
 
 -- Talking to RoGit ---------------------------------------------------------------------------------
 
@@ -105,7 +124,11 @@ local function withGame(path: string): string
 	return path .. (if string.find(path, "?", 1, true) then "&" else "?") .. string.format("game=%d", gameId())
 end
 
-local function request(method: string, path: string, body: any?, raw: string?): (boolean, any)
+local function request(method: string, path: string, body: any?, raw: string?, generation: number?): (boolean, any)
+	local epoch = generation or playtest.generation
+	if not playtest.isCurrent(epoch) then
+		return false, PAUSED
+	end
 	local options: any = { Url = serverBase .. withGame(path), Method = method }
 	if raw ~= nil then
 		options.Body = raw
@@ -115,6 +138,9 @@ local function request(method: string, path: string, body: any?, raw: string?): 
 		options.Headers = { ["Content-Type"] = "application/json" }
 	end
 	local ok, response = pcall(HttpService.RequestAsync, HttpService, options)
+	if not playtest.isCurrent(epoch) then
+		return false, PAUSED
+	end
 	if not ok then
 		return false, nil
 	end
@@ -151,12 +177,13 @@ local idOwners: { [string]: Instance }? = nil
 -- that's been worked in. Only a window that just opened can be missing unsaved work.
 local FRESH_WINDOW = not ChangeHistoryService:GetCanUndo()
 
--- Collects the objects RoGit tracks: everything saved in the place, except (unless the game tracks scripts) scripts
--- and Folders that contain a script anywhere inside.
+-- Collects the objects RoGit tracks: everything saved in the place except scripts and Folders that contain a script
+-- anywhere inside.
 local function trackedObjects(): ({ Instance }, number)
+	local epoch = playtest.generation
+	playtest.check(epoch)
 	local list: { Instance } = {}
 	local visited = 0
-	local scripts = tracksScripts()
 
 	local function visit(parent: Instance): boolean
 		local hasScript = false
@@ -164,13 +191,14 @@ local function trackedObjects(): ({ Instance }, number)
 			visited += 1
 			if visited % 10000 == 0 then
 				task.wait()
+				playtest.check(epoch)
 			end
-			if child:IsA("LuaSourceContainer") and not scripts then
+			if child:IsA("LuaSourceContainer") then
 				hasScript = true
 			elseif child.Archivable and not child:IsA("Camera") then
 				local mark = #list
 				table.insert(list, child)
-				if visit(child) and not scripts then
+				if visit(child) then
 					hasScript = true
 					if child:IsA("Folder") then
 						for i = #list, mark + 1, -1 do
@@ -270,12 +298,12 @@ local function serviceSettings(service: Instance): { [string]: any }
 end
 
 -- Starts sending one service's copy in 4 MiB parts. `uploads` tracks the parts still on their way, across services.
-local function sendParts(capture: string, service: string, text: string, uploads: { pending: number, failure: string? })
+local function sendParts(capture: string, service: string, text: string, uploads: { pending: number, failure: string? }, epoch: number)
 	for i = 1, math.max(1, math.ceil(#text / PART_CHARS)) do
 		uploads.pending += 1
 		local part = string.sub(text, (i - 1) * PART_CHARS + 1, i * PART_CHARS)
 		task.spawn(function()
-			local ok, reply = request("POST", string.format("/api/upload?capture=%s&file=%s&part=%d", capture, service, i - 1), nil, part)
+			local ok, reply = request("POST", string.format("/api/upload?capture=%s&file=%s&part=%d", capture, service, i - 1), nil, part, epoch)
 			if not ok then
 				uploads.failure = reply or "Lost the connection to RoGit."
 			end
@@ -298,9 +326,12 @@ end
 -- Copies every saved service (its children in Roblox's binary format, plus its settings) to rogit serve, with every
 -- object's ID when `withIds` is set.
 local function copyPlace(capture: string, withIds: boolean?): any
+	local epoch = playtest.generation
+	playtest.check(epoch)
 	local services = {}
 	local uploads: { pending: number, failure: string? } = { pending = 0, failure = nil }
 	for _, name in SERVICES do
+		playtest.check(epoch)
 		local ok, service = pcall(game.GetService, game, name)
 		if not (ok and service) then
 			continue
@@ -313,10 +344,11 @@ local function copyPlace(capture: string, withIds: boolean?): any
 		end
 		if #children > 0 then
 			local serialized, data = pcall(SerializationService.SerializeInstancesAsync, SerializationService, children)
+			playtest.check(epoch)
 			if not serialized then
 				error(string.format("Studio couldn't copy %s: %s", name, tostring(data)), 0)
 			end
-			sendParts(capture, name, buffer.tostring(EncodingService:Base64Encode(data)), uploads)
+			sendParts(capture, name, buffer.tostring(EncodingService:Base64Encode(data)), uploads, epoch)
 		end
 		local attributes = {}
 		for key, value in service:GetAttributes() do
@@ -333,7 +365,9 @@ local function copyPlace(capture: string, withIds: boolean?): any
 	end
 	while uploads.pending > 0 do
 		task.wait()
+		playtest.check(epoch)
 	end
+	playtest.check(epoch)
 	if uploads.failure then
 		error(uploads.failure, 0)
 	end
@@ -591,9 +625,10 @@ local toolbar = plugin:CreateToolbar("RoGit")
 local toggle = toolbar:CreateButton("RoGit", "Open the RoGit panel", "")
 toggle.ClickableWhenViewportHidden = true
 
+-- Open in every window, docked on the left the first time. After that Studio keeps it wherever it was moved to.
 local widget = plugin:CreateDockWidgetPluginGui(
 	"RoGitPanel",
-	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 300, 440, 260, 240)
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Left, true, true, 300, 440, 260, 240)
 )
 widget.Title = "RoGit"
 toggle.Click:Connect(function()
@@ -648,10 +683,6 @@ local dismissButton = button(unsavedButtons, 2, "Dismiss", "quiet")
 
 local actions = box(root, 4, 6)
 local initButton = button(actions, 1, "Init", "primary", true)
--- Whether RoGit tracks scripts too: chosen before Init, and changeable in main.
-local scriptsToggle = button(actions, 2, "", "secondary", true)
-local scriptsHint = text(actions, 3, 12, REGULAR, Color.SubText)
-scriptsHint.Text = "Turn this on if you write scripts in Studio. Leave it off if your scripts are files (Rojo, Argon)."
 
 local newSection, newHeading, newBody = section(root, 5)
 newHeading.Text = "NEW BRANCH"
@@ -1581,7 +1612,8 @@ render = function()
 	elseif state.isMain then
 		mode = "init"
 		placeKind.Text, placeTitle.Text = "SET UP", escape(state.experience or game.Name)
-		placeDetail.Text = "Init gives every object a small hidden ID, so RoGit can follow it between branches."
+		placeDetail.Text = "Init gives every object a small hidden ID, so RoGit can follow it between branches. "
+			.. "Scripts are left alone."
 	else
 		placeKind.Text, placeTitle.Text = "NOT THE START PLACE", escape(state.experience or game.Name)
 		placeDetail.Text = "Open this game's start place to set up RoGit."
@@ -1596,7 +1628,9 @@ render = function()
 	updateNote.Text = update
 	updateNote.Visible = update ~= ""
 	local offer = state.offer
-	if state.problem then
+	if not playtest.isEditing() then
+		message.Text, message.TextColor3 = escape(PAUSED), themeColor(Color.SubText)
+	elseif state.problem then
 		message.Text, message.TextColor3 = escape(state.problem), RED
 	elseif state.busy then
 		message.Text, message.TextColor3 = escape(state.busy), themeColor(Color.SubText)
@@ -1618,13 +1652,10 @@ render = function()
 	messageActions.Visible = offer ~= nil and not state.busy
 	message.Visible = message.Text ~= ""
 	messageBox.Visible = message.Visible or messageActions.Visible
-	local idle = not state.busy
+	local idle = playtest.isEditing() and not state.busy
 	unsavedCard.Visible = mode == "branch" and idle and state.unsaved ~= nil and FRESH_WINDOW
 	unsavedText.Text = if state.unsaved then "Unsaved work from " .. formatTime(state.unsaved) else ""
 	initButton.Visible = mode == "init" and idle
-	scriptsToggle.Text = if tracksScripts() then "Track scripts: on" else "Track scripts: off"
-	scriptsToggle.Visible = (mode == "init" or mode == "main") and idle
-	scriptsHint.Visible = scriptsToggle.Visible
 	newSection.Visible = mode == "main" and idle
 	branchesSection.Visible = mode == "main" and #state.branches > 0
 	renderChanges()
@@ -1652,6 +1683,9 @@ end)
 local recordingStart = false
 
 local function run(first: string, action: () -> ())
+	if not playtest.isEditing() then
+		return
+	end
 	if state.busy then
 		return
 	end
@@ -1721,14 +1755,22 @@ end
 -- Looks through the ports for RoGit (the newest, if an older one is still running). Returns its reply.
 local lastSearch = 0
 local function findServer(): (boolean, any)
+	local epoch = playtest.generation
+	if not playtest.isCurrent(epoch) then
+		return false, PAUSED
+	end
 	lastSearch = os.clock()
 	local found: { [number]: any } = {}
 	local waiting = #PORTS
 	for i, port in PORTS do
 		task.spawn(function()
+			if not playtest.isCurrent(epoch) then
+				waiting -= 1
+				return
+			end
 			local base = "http://127.0.0.1:" .. port
 			local ok, response = pcall(HttpService.RequestAsync, HttpService, { Url = base .. withGame(statusPath()), Method = "GET" })
-			if ok and response.Success then
+			if playtest.isCurrent(epoch) and ok and response.Success then
 				local decoded, reply = pcall(HttpService.JSONDecode, HttpService, response.Body)
 				if decoded and reply.server == "rogit" then
 					found[i] = { base = base, reply = reply }
@@ -1739,6 +1781,12 @@ local function findServer(): (boolean, any)
 	end
 	while waiting > 0 do
 		task.wait()
+		if not playtest.isCurrent(epoch) then
+			return false, PAUSED
+		end
+	end
+	if not playtest.isCurrent(epoch) then
+		return false, PAUSED
 	end
 	local best = nil
 	for i = 1, #PORTS do
@@ -1755,10 +1803,20 @@ local function findServer(): (boolean, any)
 end
 
 local function refresh()
+	local epoch = playtest.generation
+	if not playtest.isCurrent(epoch) then
+		return
+	end
 	local ok, reply = request("GET", statusPath())
+	if not playtest.isCurrent(epoch) then
+		return
+	end
 	-- RoGit isn't where it was (or never was): look through the ports now and then.
 	if not ok and os.clock() - lastSearch > 5 then
 		ok, reply = findServer()
+	end
+	if not playtest.isCurrent(epoch) then
+		return
 	end
 	if ok and not state.connected then
 		-- RoGit (re)started: check this place again.
@@ -1779,6 +1837,9 @@ local function refresh()
 		state.archived = reply.archived
 		if not state.game and state.isMain == nil and game.PlaceId ~= 0 and game.GameId ~= 0 then
 			local found, place = request("GET", string.format("/api/place?game=%d&place=%d", game.GameId, game.PlaceId))
+			if not playtest.isCurrent(epoch) then
+				return
+			end
 			if found then
 				state.isMain, state.experience, state.problem = place.isMain, place.experience, nil
 			elseif place then
@@ -1817,31 +1878,11 @@ end
 
 initButton.Activated:Connect(function()
 	run("Checking with RoGit…", function()
-		local reply = call("POST", "/api/init", { game = game.GameId, place = game.PlaceId, scripts = state.trackScripts == true })
-		state.game = reply.game
+		call("POST", "/api/init", { game = game.GameId, place = game.PlaceId })
 		step("Giving every object an ID…")
 		local report = tagObjects()
 		request("POST", "/api/init/done", report)
 		state.notice = string.format("Done: %d objects have an ID. Save main to keep them.", report.tagged)
-	end)
-	refresh()
-end)
-
-scriptsToggle.Activated:Connect(function()
-	if not state.game then
-		state.trackScripts = not state.trackScripts
-		render()
-		return
-	end
-	local on = not tracksScripts()
-	run(if on then "Tracking scripts…" else "Leaving scripts alone…", function()
-		state.game = call("POST", "/api/scripts", { scripts = on }).game
-		if on then
-			local report = tagObjects()
-			state.notice = string.format("RoGit tracks scripts now. %d objects have an ID; save main to keep them.", report.tagged)
-		else
-			state.notice = "RoGit leaves scripts alone now."
-		end
 	end)
 	refresh()
 end)
@@ -1951,6 +1992,7 @@ local function startUpdate()
 	end
 	dropView()
 	run("Copying the branch…", function()
+		local epoch = playtest.generation
 		tagObjects()
 		local capture, manifest = copy()
 		call("POST", "/api/branches/update", { name = branch.name, capture = capture, manifest = manifest })
@@ -1958,6 +2000,7 @@ local function startUpdate()
 		local path = "/api/branches/update?name=" .. HttpService:UrlEncode(branch.name)
 		while true do
 			task.wait(0.5)
+			playtest.check(epoch)
 			local reply = call("GET", path)
 			if not reply.waiting then
 				showView({
@@ -2257,6 +2300,8 @@ do
 	end
 
 	local function applyOperation(op: any, templates: { [number]: Instance }, ids: { [string]: Instance }, problems: { string })
+		local epoch = playtest.generation
+		playtest.check(epoch)
 		local function find(key: string): Instance
 			return findObject(key, ids) or error("Couldn't find " .. key .. " in this place.", 0)
 		end
@@ -2264,20 +2309,8 @@ do
 			local target, template = find(op.target), templates[op.template]
 			local geometry = false
 			for _, property in op.properties do
-				if property == "Source" and target:IsA("LuaSourceContainer") then
-					-- Through the script editor, so a script that's open there shows the new text.
-					local source = (template :: any).Source
-					local ok = pcall(function()
-						game:GetService("ScriptEditorService"):UpdateSourceAsync(target, function()
-							return source
-						end)
-					end) or pcall(function()
-						(target :: any).Source = source
-					end)
-					if not ok then
-						table.insert(problems, target:GetFullName() .. ".Source couldn't be set")
-					end
-				elseif property == "Attributes" then
+				playtest.check(epoch)
+				if property == "Attributes" then
 					copyAttributes(template, target)
 				elseif property == "Tags" then
 					copyTags(template, target)
@@ -2308,6 +2341,7 @@ do
 					end
 				end
 			end
+			playtest.check(epoch)
 			for property, key in op.refs do
 				(target :: any)[property] = if key == "" then nil else find(key)
 			end
@@ -2367,10 +2401,19 @@ do
 	-- Applies a plan's operations; conflicts apply only where `choices` says "use". Returns how many applied, how many
 	-- were skipped by choice, and what went wrong. The caller wraps this in one undo step.
 	runPlan = function(plan: any, choices: { [number]: string }): (number, number, { string })
+		local epoch = playtest.generation
+		playtest.check(epoch)
 		local templates: { [number]: Instance } = {}
 		if plan.bundle ~= "" then
 			local data = EncodingService:Base64Decode(buffer.fromstring(plan.bundle))
-			for _, object in SerializationService:DeserializeInstancesAsync(data) do
+			local decoded = SerializationService:DeserializeInstancesAsync(data)
+			if not playtest.isCurrent(epoch) then
+				for _, object in decoded do
+					object:Destroy()
+				end
+				return 0, 0, { PAUSED }
+			end
+			for _, object in decoded do
 				local index = tonumber(object:GetAttribute(OP_TAG))
 				if index then
 					object:SetAttribute(OP_TAG, nil)
@@ -2394,6 +2437,10 @@ do
 			end
 		end
 		for _, op in ordered do
+			if not playtest.isCurrent(epoch) then
+				table.insert(problems, PAUSED)
+				break
+			end
 			if op.conflict and choices[op.conflict] ~= "use" then
 				skipped += 1
 				continue
@@ -2568,11 +2615,14 @@ local function startWatching()
 		watch.last = os.clock()
 	end
 
-	-- Only edits to the place count: Studio changes plenty of its own things (outlines, panels) all the time. Unless
-	-- the game tracks scripts, their edits don't count, but adding or removing a script changes its parent (a Folder
+	-- Only edits to the place count: Studio changes plenty of its own things (outlines, panels) all the time. RoGit
+	-- leaves scripts alone, so their edits don't count, but adding or removing a script changes its parent (a Folder
 	-- with a script inside isn't tracked).
 	local function touched(object: Instance)
-		if object.ClassName == "Camera" or (object:IsA("LuaSourceContainer") and not tracksScripts()) or not relevant(object) then
+		if not playtest.isEditing() then
+			return
+		end
+		if object.ClassName == "Camera" or object:IsA("LuaSourceContainer") or not relevant(object) then
 			return
 		end
 		if trackedSet[object] then
@@ -2625,7 +2675,10 @@ local function startWatching()
 	end
 
 	local function added(object: Instance)
-		if object:IsA("LuaSourceContainer") and not tracksScripts() then
+		if not playtest.isEditing() then
+			return
+		end
+		if object:IsA("LuaSourceContainer") then
 			if object.Parent then
 				touched(object.Parent)
 			end
@@ -2668,7 +2721,10 @@ local function startWatching()
 		idOwners = owners
 	end
 	local function removing(object: Instance)
-		if object:IsA("LuaSourceContainer") and not tracksScripts() then
+		if not playtest.isEditing() then
+			return
+		end
+		if object:IsA("LuaSourceContainer") then
 			if object.Parent then
 				touched(object.Parent)
 			end
@@ -2687,28 +2743,18 @@ local function startWatching()
 		end
 		noteEdit()
 	end
-	game.DescendantAdded:Connect(added)
-	game.DescendantRemoving:Connect(removing)
-	-- Typing in a script. (Its Source may only catch up when the editor saves it, which the next copy picks up.)
-	pcall(function()
-		game:GetService("ScriptEditorService").TextDocumentDidChange:Connect(function(document)
-			local script = document:GetScript()
-			if script then
-				touched(script)
-			end
-		end)
-	end)
-	-- Studio may not let plugins hear every property change. Then RoGit listens to what's selected, which is where
-	-- nearly every edit happens (moving, scaling, the Properties panel), and copies the whole place now and then.
-	local hearsEverything = pcall(function()
-		game.ItemChanged:Connect(touched)
-	end)
+	-- RoGit doesn't listen from Play to Stop.
+	local observerConnections: { RBXScriptConnection } = {}
 	local selectionConnections: { RBXScriptConnection } = {}
+	local hearsEverything = false
 	local function watchSelection()
 		for _, connection in selectionConnections do
 			connection:Disconnect()
 		end
 		table.clear(selectionConnections)
+		if not playtest.isEditing() then
+			return
+		end
 		for _, object in Selection:Get() do
 			local objects = object:GetDescendants()
 			table.insert(objects, object)
@@ -2722,18 +2768,43 @@ local function startWatching()
 			end
 		end
 	end
-	if not hearsEverything then
-		Selection.SelectionChanged:Connect(watchSelection)
-		watchSelection()
-	end
 	local function changedByUndo()
+		if not playtest.isEditing() then
+			return
+		end
 		if not hearsEverything then
 			pending.full = true
 		end
 		noteEdit()
 	end
-	ChangeHistoryService.OnUndo:Connect(changedByUndo)
-	ChangeHistoryService.OnRedo:Connect(changedByUndo)
+	local function disconnectObservers()
+		for _, connection in observerConnections do
+			connection:Disconnect()
+		end
+		for _, connection in selectionConnections do
+			connection:Disconnect()
+		end
+		table.clear(observerConnections)
+		table.clear(selectionConnections)
+	end
+	local function connectObservers()
+		if not playtest.isEditing() or #observerConnections > 0 then
+			return
+		end
+		table.insert(observerConnections, game.DescendantAdded:Connect(added))
+		table.insert(observerConnections, game.DescendantRemoving:Connect(removing))
+		-- Studio may not let plugins hear every property change. Then RoGit listens to what's selected, which is where
+		-- nearly every edit happens (moving, scaling, the Properties panel), and copies the whole place now and then.
+		hearsEverything = pcall(function()
+			table.insert(observerConnections, game.ItemChanged:Connect(touched))
+		end)
+		if not hearsEverything then
+			table.insert(observerConnections, Selection.SelectionChanged:Connect(watchSelection))
+			watchSelection()
+		end
+		table.insert(observerConnections, ChangeHistoryService.OnUndo:Connect(changedByUndo))
+		table.insert(observerConnections, ChangeHistoryService.OnRedo:Connect(changedByUndo))
+	end
 
 	-- Attributes and tags don't fire change events. They're edited on the selection (Properties, Tag Editor), so RoGit
 	-- looks at the selected objects a few times a second.
@@ -2764,7 +2835,7 @@ local function startWatching()
 	end
 
 	-- Terrain voxels don't fire change events either; the number of filled cells is cheap to check.
-	local terrainCells = workspace.Terrain:CountCells()
+	local terrainCells = if playtest.isEditing() then workspace.Terrain:CountCells() else 0
 	local function checkTerrain()
 		local cells = workspace.Terrain:CountCells()
 		if cells ~= terrainCells then
@@ -2819,6 +2890,8 @@ local function startWatching()
 	-- Sends what changed since last time: a full copy when rogit serve has none, otherwise just the changed objects.
 	-- Returns whether rogit serve's copy is current afterwards.
 	local function sendChanges(): boolean
+		local epoch = playtest.generation
+		playtest.check(epoch)
 		local branch = state.branch :: Branch
 		if pending.full then
 			pending.full = false
@@ -2827,6 +2900,7 @@ local function startWatching()
 			table.clear(pending.services)
 			local capture = newId(16)
 			local manifest = copyPlace(capture, true)
+			playtest.check(epoch)
 			local reply = call("POST", "/api/branches/changes", { name = branch.name, capture = capture, manifest = manifest, session = SESSION })
 			watch.lastFull = os.clock()
 			-- If the IDs don't line up with the copy, every refresh stays a full copy.
@@ -2897,15 +2971,18 @@ local function startWatching()
 		if #upserts > 0 then
 			capture = newId(16)
 			local data = SerializationService:SerializeInstancesAsync(tops)
+			playtest.check(epoch)
 			local uploads: { pending: number, failure: string? } = { pending = 0, failure = nil }
-			sendParts(capture, "Patch", buffer.tostring(EncodingService:Base64Encode(data)), uploads)
+			sendParts(capture, "Patch", buffer.tostring(EncodingService:Base64Encode(data)), uploads, epoch)
 			while uploads.pending > 0 do
 				task.wait()
+				playtest.check(epoch)
 			end
 			if uploads.failure then
 				error(uploads.failure, 0)
 			end
 		end
+		playtest.check(epoch)
 		local reply = call("POST", "/api/branches/patch", {
 			name = branch.name, capture = capture, upserts = upserts, removes = removes, services = settings, refs = refs,
 		})
@@ -2920,8 +2997,11 @@ local function startWatching()
 	-- Sends anything not sent yet, and the terrain (which can change unseen), so rogit serve's copy is exact. Returns
 	-- whether it is; if not, the caller sends a full copy.
 	flushChanges = function(): boolean
+		local epoch = playtest.generation
+		playtest.check(epoch)
 		while watch.sending do
 			task.wait()
+			playtest.check(epoch)
 		end
 		if pending.full or state.branch == nil then
 			return false
@@ -2930,14 +3010,41 @@ local function startWatching()
 		watch.sending = true
 		local ok, current = pcall(sendChanges)
 		watch.sending = false
+		if not ok or not playtest.isCurrent(epoch) then
+			-- The changes it was sending are gone from the queue: the next refresh sends a full copy instead.
+			pending.full = true
+			watch.dirty = true
+			playtest.check(epoch)
+			return false
+		end
 		watch.dirty = false
-		return ok and current
+		return current
 	end
 
-	render()
+	local function updatePlaytestState()
+		disconnectObservers()
+		if playtest.isEditing() then
+			-- Back from a playtest (or just loaded). RoGit wasn't listening, so the next refresh sends a full copy.
+			pending.full = true
+			idOwners = nil
+			table.clear(relevance)
+			connectObservers()
+			noteEdit()
+			if state.problem == PAUSED then
+				state.problem = nil
+			end
+		end
+		render()
+	end
+	local modeConnection = playtest.service:GetPropertyChangedSignal("EditModeActive"):Connect(updatePlaytestState)
+	plugin.Unloading:Connect(function()
+		disconnectObservers()
+		modeConnection:Disconnect()
+	end)
+	updatePlaytestState()
 	task.spawn(function()
-		while true do
-			if not state.busy then
+		while playtest.alive do
+			if playtest.isEditing() and not state.busy then
 				refresh()
 			end
 			task.wait(POLL_SECONDS)
@@ -2945,8 +3052,11 @@ local function startWatching()
 	end)
 	task.spawn(function()
 		local ticks = 0
-		while true do
+		while playtest.alive do
 			task.wait(0.1)
+			if not playtest.isEditing() then
+				continue
+			end
 			ticks += 1
 			local branch = state.branch
 			local inBranch = branch ~= nil and branch.has_starting_point and not state.archived and state.connected
@@ -2977,14 +3087,18 @@ local function startWatching()
 			if due and not state.busy and not watch.sending then
 				watch.dirty, watch.sending = false, true
 				local started = os.clock()
+				local epoch = playtest.generation
 				local ok, failure = pcall(sendChanges)
 				watch.sending = false
 				watch.seconds = os.clock() - started
 				if ok then
 					render()
 				else
+					pending.full = true
 					watch.dirty = true
-					warn("RoGit couldn't refresh the changes: " .. tostring(failure))
+					if playtest.isCurrent(epoch) then
+						warn("RoGit couldn't refresh the changes: " .. tostring(failure))
+					end
 				end
 			end
 		end

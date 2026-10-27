@@ -1,7 +1,7 @@
 # RoGit
 
 Branches for your Roblox places: maps, models, UI, meshes and terrain. Make a branch, build in it, see what changed,
-and merge it back into your game, like Git. Scripts can come along too, or stay in files (Rojo and the like).
+and merge it back into your game, like Git. Scripts aren't part of branches; keep them however you like.
 
 RoGit has two pieces: the Studio plugin, where you use it, and RoGit itself, which runs in the background on your
 computer and keeps every game's branches. It runs on Windows and macOS. Everything stays on your computer; there's no
@@ -28,10 +28,8 @@ says when there's a new version) and `rogit uninstall` removes it; your branches
 
 ## Set up a game
 
-1. In Studio, open your game's start place and the RoGit panel (Plugins → RoGit).
-2. If you write your scripts in Studio, turn on **Track scripts**. Leave it off if your scripts are files (Rojo,
-   Argon): then RoGit leaves them alone. You can change this later in main.
-3. Click **Init**. RoGit gives every object a small hidden ID attribute, so it can follow it between branches. Save
+1. In Studio, open your game's start place. The RoGit panel opens on the left (or use Plugins → RoGit).
+2. Click **Init**. RoGit gives every object a small hidden ID attribute, so it can follow it between branches. Save
    the place afterwards.
 
 That's all; do it once per game. RoGit keeps each game's branches in `%LOCALAPPDATA%\rogit\games` (`~/.rogit/games`
@@ -70,11 +68,8 @@ archives. Click a commit, merge or pull to see what it changed; open a commit in
 
 Everything saved in the place, except:
 
-- scripts, and any Folder with a script inside it, unless the game tracks scripts;
+- scripts, and any Folder with a script inside it;
 - Studio's own camera and the `RBX_` attributes Roblox keeps for itself.
-
-A tracked script's changes show as lines added and removed. When a merge or a pull finds a script edited on both
-sides, it keeps both sides' edits, like Git; only edits to the same lines need a choice.
 
 ## From the terminal
 

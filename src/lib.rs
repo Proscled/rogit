@@ -86,12 +86,11 @@ fn games() -> Result<Vec<(project::Game, branches::Branches)>, String> {
 }
 
 /// The branches of the game that has a branch called `name`.
-/// The game with a branch called `name`, and its branches.
-fn branches_with(name: &str) -> Result<(project::Game, branches::Branches), String> {
+fn branches_with(name: &str) -> Result<branches::Branches, String> {
     let mut found: Vec<(project::Game, branches::Branches)> = games()?.into_iter().filter(|(_, b)| b.get(name).is_some()).collect();
     match found.len() {
         0 => Err(format!("There's no branch called {name}.")),
-        1 => Ok(found.remove(0)),
+        1 => Ok(found.remove(0).1),
         _ => Err(format!(
             "Several games have a branch called {name}: {}.",
             found.iter().map(|(game, _)| game.name.as_str()).collect::<Vec<_>>().join(", ")
@@ -117,12 +116,12 @@ fn diff(name: Option<&str>, as_json: bool) -> Result<(), String> {
         }
         return Ok(());
     };
-    let (game, branches) = branches_with(name)?;
+    let branches = branches_with(name)?;
     // Like a merge: the saved branch file, or the copy from the last review in Studio if that's newer. Compared,
     // like a review, with the last update from main or else the starting point.
     let (current, source, time) = branches.newest(name)?;
     let (base, _, _) = branches.base(name, None, merge::last_update(&current).as_deref())?;
-    let review = diff::compare(&base, &current, diff::Rules { scripts: game.scripts });
+    let review = diff::compare(&base, &current);
     if as_json {
         println!("{}", serde_json::to_string(&review).map_err(|e| e.to_string())?);
         return Ok(());
@@ -132,11 +131,11 @@ fn diff(name: Option<&str>, as_json: bool) -> Result<(), String> {
 }
 
 fn plan_merge(name: &str, main: &str) -> Result<(), String> {
-    let (game, branches) = branches_with(name)?;
+    let branches = branches_with(name)?;
     let main = place::read(std::path::Path::new(main))?;
     let (branch, _, _) = branches.newest(name)?;
     let (base, _, _) = branches.base(name, merge::last_merge(&main, name).as_deref(), merge::last_update(&branch).as_deref())?;
-    let plan = merge::plan(&base, &branch, &main, merge::Direction::Merge, diff::Rules { scripts: game.scripts })?;
+    let plan = merge::plan(&base, &branch, &main, merge::Direction::Merge)?;
     println!("{}", serde_json::to_string(&plan).map_err(|e| e.to_string())?);
     Ok(())
 }

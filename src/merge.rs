@@ -3,7 +3,7 @@
 //! branch. The result is a list of operations for the plugin plus a bundle (an rbxm) holding the source's versions
 //! of changed and new objects.
 
-use crate::diff::{self, Change, IGNORED, Index, Row, Rules, Status, Tree};
+use crate::diff::{self, Change, IGNORED, Index, Row, Status, Tree};
 use base64::Engine;
 use rbx_dom_weak::types::{Attributes, Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, Ustr, WeakDom};
@@ -82,7 +82,7 @@ pub struct Summary {
     pub removed: usize,
     pub changed: usize,
     pub conflicts: usize,
-    /// Scripts inside added objects, left out because the game doesn't track scripts.
+    /// Scripts inside added or removed objects. Added ones are left out: RoGit never brings scripts over.
     pub scripts_left_out: usize,
 }
 
@@ -210,7 +210,6 @@ struct Builder<'a> {
     source: Place<'a>,
     target: Place<'a>,
     direction: Direction,
-    rules: Rules,
     bundle: WeakDom,
     templates: usize,
     markers: usize,
@@ -241,11 +240,6 @@ impl Builder<'_> {
 
     /// The source's version of one object, without its children or references.
     fn template(&mut self, key: &str) -> usize {
-        self.template_with(key, None)
-    }
-
-    /// Like `template`, with a script's Source replaced (by both sides' edits, merged).
-    fn template_with(&mut self, key: &str, source: Option<String>) -> usize {
         let entry = self.source.index.get(key).unwrap();
         let inst = self.source.dom.get_by_ref(entry.referent).unwrap();
         let mut builder = InstanceBuilder::new(inst.class).with_name(inst.name.clone());
@@ -254,9 +248,6 @@ impl Builder<'_> {
                 builder = builder.with_property(*name, value.clone());
             }
         }
-        if let Some(source) = source {
-            builder = builder.with_property("Source", Variant::String(source));
-        }
         let referent = self.bundle.insert(self.bundle.root_ref(), builder);
         self.templates += 1;
         with_attribute(&mut self.bundle, referent, OP_TAG, &self.templates.to_string());
@@ -264,7 +255,7 @@ impl Builder<'_> {
     }
 
     /// The source's whole new object, with references to objects outside it recorded as fixups. Scripts are left
-    /// out unless the game tracks them.
+    /// out: RoGit never brings scripts over.
     fn subtree(&mut self, key: &str) -> (usize, Vec<Fixup>) {
         let original = self.source.index.get(key).unwrap().referent;
         let copy = self.source.dom.clone_into_external(original, &mut self.bundle);
@@ -276,7 +267,7 @@ impl Builder<'_> {
         let mut pairs = vec![(original, copy)];
         while let Some((from, to)) = pairs.pop() {
             let source = self.source.dom.get_by_ref(from).unwrap();
-            if diff::is_script(source) && !self.rules.scripts {
+            if diff::is_script(source) {
                 scripts.push(to);
                 continue;
             }
@@ -359,7 +350,7 @@ impl Builder<'_> {
         for property in property_names([&self.base, &self.source, &self.target], key) {
             let name = &property;
             // Work out the change with borrowed values; only owned results leave this block.
-            let (label, mut change, target_changed, encoded, ref_target, merged) = {
+            let (label, mut change, target_changed, encoded, ref_target) = {
                 let (Some(base), Some(theirs), Some(ours)) =
                     (self.base.property(key, name), self.source.property(key, name), self.target.property(key, name))
                 else {
@@ -376,26 +367,16 @@ impl Builder<'_> {
                 if is_service && encoded.is_none() {
                     continue;
                 }
-                let change = diff::change_of(name.as_str(), &class, ours, theirs, (&self.target.index, &self.source.index));
-                let label = change.name.clone();
+                let rotated = diff::rotation_differs(ours, theirs);
+                let label = diff::label(name.as_str(), rotated);
+                let change = Change::values(
+                    label.clone(),
+                    diff::show(ours, &class, name.as_str(), &self.target.index, rotated),
+                    diff::show(theirs, &class, name.as_str(), &self.source.index, rotated),
+                );
                 let ref_target = matches!(theirs, Variant::Ref(_)).then(|| self.ref_target(theirs));
-                // A script edited on both sides, in different places: both sides' edits are kept, like Git does.
-                let sources = (diff::source(name, base), diff::source(name, ours), diff::source(name, theirs));
-                let merged = match sources {
-                    (Some(base), Some(ours), Some(theirs)) if target_changed => {
-                        diffy::merge(&base, &ours, &theirs).ok().map(|text| (diff::lines_changed(&ours, &text), text))
-                    }
-                    _ => None,
-                };
-                (label, change, target_changed, encoded, ref_target, merged)
+                (label, change, target_changed, encoded, ref_target)
             };
-            if let Some((lines, text)) = merged {
-                let template = self.template_with(key, Some(text));
-                let properties = vec![name.to_string()];
-                self.operations.push(Op::Set { target: target.clone(), properties, template, refs: Map::new(), conflict: None });
-                rows.push(Change::new("Source", "", format!("{lines}, with both sides' edits")));
-                continue;
-            }
             if target_changed {
                 let id = self.conflict(key, format!("{label} was changed on both sides."));
                 change.conflict = Some(id);
@@ -489,7 +470,7 @@ impl Builder<'_> {
         self.operations.push(Op::Remove { target, conflict });
         self.summary.removed += 1;
         let inside = keys.len() - 1;
-        let scripts = if self.rules.scripts { 0 } else { self.target.scripts_inside(key) };
+        let scripts = self.target.scripts_inside(key);
         let mut contents = Vec::new();
         if inside > 0 {
             contents.push(Change::new("Contains", "", format!("{inside} objects")));
@@ -528,12 +509,12 @@ fn workspace_attribute(dom: &WeakDom, name: &str) -> Option<String> {
 
 /// Plans bringing what `source` changed since `base` into `target`: the branch into main for a merge, main into the
 /// branch for an update.
-pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, direction: Direction, rules: Rules) -> Result<Plan, String> {
+pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, direction: Direction) -> Result<Plan, String> {
     // The three places are indexed at the same time; on a big game each takes about a tenth of a second.
     let (base_index, mut source_index, mut target_index) = std::thread::scope(|scope| {
-        let source = scope.spawn(|| diff::index(source, rules));
-        let target = scope.spawn(|| diff::index(target, rules));
-        (diff::index(base, rules), source.join().unwrap(), target.join().unwrap())
+        let source = scope.spawn(|| diff::index(source));
+        let target = scope.spawn(|| diff::index(target));
+        (diff::index(base), source.join().unwrap(), target.join().unwrap())
     });
     diff::adopt_new_ids(base, &base_index, source, &mut source_index);
     diff::adopt_new_ids(base, &base_index, target, &mut target_index);
@@ -542,7 +523,6 @@ pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, direction: Direc
         source: Place { dom: source, index: source_index, children: Default::default() },
         target: Place { dom: target, index: target_index, children: Default::default() },
         direction,
-        rules,
         bundle: WeakDom::new(InstanceBuilder::new("Folder")),
         templates: 0,
         markers: 0,
@@ -659,7 +639,7 @@ mod tests {
         let mut main = place();
         set(&mut main, "Tower", "Size", Variant::Vector3(Vector3::new(9.0, 9.0, 9.0)));
 
-        let plan = plan(&start, &branch, &main, Direction::Merge, Rules::default()).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.summary, Summary { added: 1, removed: 1, changed: 1, conflicts: 0, scripts_left_out: 1 });
         assert!(plan.operations.iter().any(|op| matches!(op, Op::Set { target, properties, .. } if target == "gate" && properties == &["Color"])));
         assert!(plan.operations.iter().any(|op| matches!(op, Op::Remove { target, conflict: None } if target == "shed")));
@@ -673,78 +653,6 @@ mod tests {
         assert_eq!(lamp.children().len(), 1, "the script is left out");
     }
 
-    /// The place, plus ServerScriptService > Game (a Folder) > Round (a script).
-    fn with_script(source: &str) -> WeakDom {
-        let mut dom = place();
-        let service = dom.insert(dom.root_ref(), InstanceBuilder::new("ServerScriptService").with_name("ServerScriptService"));
-        let folder = dom.insert(service, tagged("Folder", "Game", "game"));
-        dom.insert(folder, tagged("Script", "Round", "round").with_property("Source", Variant::String(source.to_owned())));
-        dom
-    }
-
-    const ROUND: &str = "local length = 60\nlocal players = 8\n\nprint(\"start\")\nwait(length)\nprint(\"end\")\n";
-    const TRACKED: Rules = Rules { scripts: true };
-
-    fn bundled_source(plan: &Plan, template: usize) -> String {
-        let bundle = base64::engine::general_purpose::STANDARD.decode(&plan.bundle).unwrap();
-        let bundle = rbx_binary::from_reader(&bundle[..]).unwrap();
-        let tagged = bundle.descendants().find(|i| match i.properties.get(&"Attributes".into()) {
-            Some(Variant::Attributes(a)) => matches!(a.get(OP_TAG), Some(Variant::String(op)) if *op == template.to_string())
-                || matches!(a.get(OP_TAG), Some(Variant::BinaryString(op)) if AsRef::<[u8]>::as_ref(op) == template.to_string().as_bytes()),
-            _ => false,
-        });
-        match tagged.unwrap().properties.get(&"Source".into()).unwrap() {
-            Variant::String(s) => s.clone(),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn tracked_scripts_merge_and_keep_both_sides_edits() {
-        let start = with_script(ROUND);
-        let branch = with_script(&ROUND.replace("length = 60", "length = 90"));
-        let main = with_script(&ROUND.replace("print(\"end\")", "print(\"done\")"));
-
-        // Without tracking, scripts aren't part of the merge at all.
-        assert_eq!(plan(&start, &branch, &main, Direction::Merge, Rules::default()).unwrap().summary.changed, 0);
-
-        let plan = plan(&start, &branch, &main, Direction::Merge, TRACKED).unwrap();
-        assert_eq!((plan.summary.changed, plan.summary.conflicts), (1, 0));
-        let row = plan.rows.iter().find(|r| r.name == "Round").unwrap();
-        assert_eq!(row.changes, vec![Change::new("Source", "", "+1 −1 lines, with both sides' edits")]);
-        let Some(Op::Set { target, properties, template, conflict: None, .. }) = plan.operations.iter().find(|op| matches!(op, Op::Set { .. })) else {
-            panic!("no Set")
-        };
-        assert_eq!((target.as_str(), properties.as_slice()), ("round", &["Source".to_owned()][..]));
-        let merged = bundled_source(&plan, *template);
-        assert!(merged.contains("length = 90") && merged.contains("print(\"done\")"), "{merged}");
-    }
-
-    #[test]
-    fn the_same_lines_edited_on_both_sides_are_a_conflict() {
-        let start = with_script(ROUND);
-        let branch = with_script(&ROUND.replace("length = 60", "length = 90"));
-        let main = with_script(&ROUND.replace("length = 60", "length = 30"));
-        let plan = plan(&start, &branch, &main, Direction::Merge, TRACKED).unwrap();
-        assert_eq!(plan.summary.conflicts, 1);
-        let row = plan.rows.iter().find(|r| r.name == "Round").unwrap();
-        assert_eq!((row.changes[0].new.as_str(), row.changes[0].conflict.is_some()), ("+1 −1 lines", true));
-    }
-
-    #[test]
-    fn tracked_scripts_come_along_in_new_objects() {
-        let start = with_script(ROUND);
-        let mut branch = with_script(ROUND);
-        let map = branch.descendants().find(|i| i.name == "Map").unwrap().referent();
-        let lamp = branch.insert(map, InstanceBuilder::new("Model").with_name("Lamp"));
-        branch.insert(lamp, InstanceBuilder::new("Script").with_name("Flicker").with_property("Source", Variant::String("-- on".into())));
-        let plan = plan(&start, &branch, &with_script(ROUND), Direction::Merge, TRACKED).unwrap();
-        assert_eq!((plan.summary.added, plan.summary.scripts_left_out), (1, 0));
-        let bundle = base64::engine::general_purpose::STANDARD.decode(&plan.bundle).unwrap();
-        let bundle = rbx_binary::from_reader(&bundle[..]).unwrap();
-        assert!(bundle.descendants().any(|i| i.name == "Flicker"));
-    }
-
     #[test]
     fn the_same_property_changed_on_both_sides_is_a_conflict() {
         let start = place();
@@ -755,7 +663,7 @@ mod tests {
         set(&mut main, "Roof", "Size", Variant::Vector3(Vector3::new(8.0, 1.0, 8.0)));
         remove(&mut branch, "Shed");
 
-        let plan = plan(&start, &branch, &main, Direction::Merge, Rules::default()).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.summary.conflicts, 2);
         let gate = plan.rows.iter().find(|r| r.name == "Gate").unwrap();
         assert_eq!(gate.changes[0].old, "0, 0, 255");
@@ -773,7 +681,7 @@ mod tests {
         for dom in [&mut branch, &mut main] {
             set(dom, "Gate", "Color", Variant::Color3(Color3::new(1.0, 0.0, 0.0)));
         }
-        let plan = plan(&start, &branch, &main, Direction::Merge, Rules::default()).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.summary, Summary::default());
         assert!(plan.operations.is_empty());
     }
@@ -801,11 +709,11 @@ mod tests {
 
         assert_eq!(last_merge(&main, "test-1").as_deref(), Some("m1"));
         assert_eq!(last_merge(&main, "other"), None);
-        let again = plan(&merged, &branch, &main, Direction::Merge, Rules::default()).unwrap();
+        let again = plan(&merged, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(again.summary, Summary { changed: 1, ..Summary::default() });
         assert!(matches!(&again.operations[..], [Op::Set { target, conflict: None, .. }] if target == "gate"));
         // Measured from the starting point instead, the gate would look changed on both sides.
-        let from_start = plan(&place(), &branch, &main, Direction::Merge, Rules::default()).unwrap();
+        let from_start = plan(&place(), &branch, &main, Direction::Merge).unwrap();
         assert_eq!(from_start.summary.conflicts, 1);
     }
 
@@ -820,7 +728,7 @@ mod tests {
         set(&mut branch, "Tower", "Size", Variant::Vector3(Vector3::new(9.0, 9.0, 9.0)));
         set(&mut branch, "Roof", "Size", Variant::Vector3(Vector3::new(6.0, 1.0, 6.0)));
 
-        let plan = plan(&start, &main, &branch, Direction::Update, Rules::default()).unwrap();
+        let plan = plan(&start, &main, &branch, Direction::Update).unwrap();
         assert!(plan.operations.iter().any(|op| matches!(op, Op::Set { target, conflict: None, .. } if target == "gate")));
         // The branch's own work stays.
         assert!(!plan.operations.iter().any(|op| matches!(op, Op::Set { target, .. } if target == "tower")));
@@ -843,7 +751,7 @@ mod tests {
         let branch = placed(at(10.0, 0.0), at(10.0, 0.0));
         let main = placed(at(0.0, 5.0), at(0.0, 5.0));
 
-        let plan = plan(&start, &branch, &main, Direction::Merge, Rules::default()).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.conflicts.len(), 1, "one choice for the whole move");
         let id = plan.conflicts[0].id;
         let conflicts: Vec<Option<usize>> = plan.operations.iter().map(|op| match op {
@@ -864,7 +772,7 @@ mod tests {
         let map = branch.descendants().find(|i| i.name == "Map").unwrap().referent();
         branch.insert(map, tagged("Part", "Gate", "gate"));
         let main = place();
-        let plan = plan(&start, &branch, &main, Direction::Merge, Rules::default()).unwrap();
+        let plan = plan(&start, &branch, &main, Direction::Merge).unwrap();
         assert_eq!(plan.summary.added, 1);
         let bundle = base64::engine::general_purpose::STANDARD.decode(&plan.bundle).unwrap();
         let bundle = rbx_binary::from_reader(&bundle[..]).unwrap();
@@ -874,7 +782,7 @@ mod tests {
 
     #[test]
     fn an_object_main_already_has_is_not_added_twice() {
-        let plan = plan(&place(), &first_round(), &first_round(), Direction::Merge, Rules::default()).unwrap();
+        let plan = plan(&place(), &first_round(), &first_round(), Direction::Merge).unwrap();
         assert!(!plan.operations.iter().any(|op| matches!(op, Op::Add { .. })));
     }
 }

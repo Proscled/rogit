@@ -279,7 +279,7 @@ mod tests {
         let original = place(20_000, None);
         store.keep_place(&original, &dir.join("a.copy")).unwrap();
         let back = store.read(&dir.join("a.copy")).unwrap();
-        assert!(crate::diff::compare(&original, &back, crate::diff::Rules::default()).rows.is_empty());
+        assert!(crate::diff::compare(&original, &back).rows.is_empty());
         assert_eq!(back.descendants().count(), original.descendants().count());
         fs::remove_dir_all(dir).unwrap();
     }

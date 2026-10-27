@@ -19,9 +19,6 @@ pub struct Game {
     pub name: String,
     pub universe_id: u64,
     pub main_place_id: u64,
-    /// Whether RoGit tracks scripts too (chosen at Init): for games whose scripts aren't kept in files.
-    #[serde(default)]
-    pub scripts: bool,
 }
 
 /// RoGit's own folder: `~/.rogit`, or `%LOCALAPPDATA%\rogit` on Windows (the installers put rogit itself in its
@@ -83,7 +80,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rogit-test-{}", std::process::id())).join("games").join("1");
         let project = Project::new(root.clone());
         assert_eq!(project.config().unwrap(), None);
-        let game = Game { name: "Test".into(), universe_id: 1, main_place_id: 2, scripts: false };
+        let game = Game { name: "Test".into(), universe_id: 1, main_place_id: 2 };
         project.init(game.clone()).unwrap();
         project.init(game.clone()).unwrap();
         assert_eq!(project.config().unwrap(), Some(Config { game }));
