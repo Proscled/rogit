@@ -1702,8 +1702,19 @@ openBranch = function(name: string)
 	render()
 end
 
+-- The open local file's name. Rojo renames the place to its project's name when it syncs; a branch file still says
+-- which branch it is on its Workspace.
+local function fileName(): string
+	if string.sub(game.Name, -5) == ".rbxl" then
+		return game.Name
+	end
+	local tag = workspace:GetAttribute("RoGitBranch")
+	local branch = if type(tag) == "string" then string.match(tag, "^%d+:(.+)$") else nil
+	return if branch then branch .. ".rbxl" else game.Name
+end
+
 local function statusPath(): string
-	local file = if game.PlaceId == 0 then "&file=" .. HttpService:UrlEncode(game.Name) else ""
+	local file = if game.PlaceId == 0 then "&file=" .. HttpService:UrlEncode(fileName()) else ""
 	return "/api/rogit?place=" .. string.format("%d", game.PlaceId) .. file .. "&session=" .. SESSION
 end
 
