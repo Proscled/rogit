@@ -68,7 +68,8 @@ archives. Click a commit, merge or pull to see what it changed; open a commit in
 
 Everything saved in the place, except:
 
-- scripts, and any Folder with a script inside it;
+- scripts (with anything inside them), and code Folders: Folders that hold scripts and nothing else but Folders. A
+  Folder of models or UI with a script somewhere in it is still tracked; only the script is left out;
 - Studio's own camera and the `RBX_` attributes Roblox keeps for itself.
 
 ## Limitations

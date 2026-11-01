@@ -2,6 +2,7 @@
 //! of it happens here, in rogit itself; the install scripts only download a release and run `rogit self-install`.
 
 use crate::{autostart, project};
+use rbx_dom_weak::{InstanceBuilder, WeakDom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,13 +22,36 @@ fn plugins_folder() -> Result<PathBuf, String> {
     }
 }
 
-/// Writes the plugin into Studio's plugins folder, marked with this version so it can tell when RoGit and it differ.
+/// The plugin's file in Studio's plugins folder, and the single script it was before it had modules.
+const PLUGIN_FILE: &str = "RoGit.rbxm";
+const OLD_PLUGIN_FILE: &str = "RoGit.lua";
+
+/// The plugin as a model file: a Script with its ModuleScripts inside, marked with this version so it can tell when
+/// RoGit and it differ.
+fn plugin_model() -> Result<Vec<u8>, String> {
+    let source = |text: &str| text.replace("__ROGIT_VERSION__", env!("CARGO_PKG_VERSION"));
+    let ((name, main), modules) = crate::PLUGIN.split_first().ok_or("The plugin is empty.")?;
+    let mut dom = WeakDom::new(InstanceBuilder::new("Folder"));
+    let script = dom.insert(dom.root_ref(), InstanceBuilder::new("Script").with_name(*name).with_property("Source", source(main)));
+    for (name, text) in modules {
+        dom.insert(script, InstanceBuilder::new("ModuleScript").with_name(*name).with_property("Source", source(text)));
+    }
+    let mut bytes = Vec::new();
+    rbx_binary::to_writer(&mut bytes, &dom, &[script]).map_err(|e| format!("Couldn't build the plugin: {e}"))?;
+    Ok(bytes)
+}
+
+/// Writes the plugin into Studio's plugins folder, in place of any older one.
 pub fn install_plugin() -> Result<(), String> {
     let folder = plugins_folder()?;
     fs::create_dir_all(&folder).map_err(|e| format!("Couldn't create {}: {e}", folder.display()))?;
-    let target = folder.join("RoGit.lua");
-    let plugin = crate::PLUGIN.replace("__ROGIT_VERSION__", env!("CARGO_PKG_VERSION"));
-    fs::write(&target, plugin).map_err(|e| format!("Couldn't write {}: {e}", target.display()))?;
+    let target = folder.join(PLUGIN_FILE);
+    fs::write(&target, plugin_model()?).map_err(|e| format!("Couldn't write {}: {e}", target.display()))?;
+    // Studio would run both.
+    let old = folder.join(OLD_PLUGIN_FILE);
+    if old.exists() {
+        fs::remove_file(&old).map_err(|e| format!("Couldn't remove the old plugin {}: {e}", old.display()))?;
+    }
     println!("Installed the RoGit plugin to {}. Studio picks it up automatically.", target.display());
     Ok(())
 }
@@ -164,9 +188,11 @@ pub fn uninstall() -> Result<(), String> {
     let home = project::home()?;
     autostart::disable()?;
     autostart::stop_running();
-    let plugin = plugins_folder()?.join("RoGit.lua");
-    if plugin.exists() {
-        fs::remove_file(&plugin).map_err(|e| format!("Couldn't remove {}: {e}", plugin.display()))?;
+    for file in [PLUGIN_FILE, OLD_PLUGIN_FILE] {
+        let plugin = plugins_folder()?.join(file);
+        if plugin.exists() {
+            fs::remove_file(&plugin).map_err(|e| format!("Couldn't remove {}: {e}", plugin.display()))?;
+        }
     }
     let bin = home.join("bin");
     remove_from_path(&bin)?;

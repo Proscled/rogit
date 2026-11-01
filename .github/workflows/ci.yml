@@ -21,11 +21,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check that the plugin parses
+      - name: Check that the plugin's scripts parse
         run: |
           curl -sSL -o stylua.zip https://github.com/JohnnyMorganz/StyLua/releases/download/v2.5.2/stylua-linux-x86_64.zip
           unzip -q stylua.zip
-          ./stylua --syntax luau - < plugin/RoGit.lua > /dev/null
+          for file in plugin/*.lua; do ./stylua --syntax luau - < "$file" > /dev/null; done
 
   # Runs the installers from site/ against the build from this commit: a stand-in download hands them a fresh zip.
   installers:
@@ -53,12 +53,12 @@ jobs:
           PATH="$RUNNER_TEMP/fake:$PATH" sh site/install.sh
           test "$(grep -c rogit/env ~/.zshenv)" = 1
           zsh -c 'rogit --version'
-          test -f ~/Documents/Roblox/Plugins/RoGit.lua
+          test -f ~/Documents/Roblox/Plugins/RoGit.rbxm
           # Uninstalling takes back everything the installer did, and keeps branches.
           mkdir -p ~/.rogit/games/1 && touch ~/.rogit/games/1/game.toml
           ~/.rogit/bin/rogit uninstall
           if grep -q rogit/env ~/.zshenv; then echo 'PATH line left in .zshenv'; exit 1; fi
-          test ! -e ~/.rogit/bin && test ! -e ~/.rogit/env && test ! -e ~/Documents/Roblox/Plugins/RoGit.lua
+          test ! -e ~/.rogit/bin && test ! -e ~/.rogit/env && test ! -e ~/Documents/Roblox/Plugins/RoGit.rbxm
           test -f ~/.rogit/games/1/game.toml
       - name: Install on Windows
         if: runner.os == 'Windows'
@@ -106,7 +106,7 @@ jobs:
           $path = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';'
           if (@($path | Where-Object { $_ -eq $bin }).Count -ne 1) { throw "rogit's folder should be on PATH once: $path" }
           & "$bin\rogit.exe" --version
-          if (-not (Test-Path "$env:LOCALAPPDATA\Roblox\Plugins\RoGit.lua")) { throw "The plugin wasn't installed." }
+          if (-not (Test-Path "$env:LOCALAPPDATA\Roblox\Plugins\RoGit.rbxm")) { throw "The plugin wasn't installed." }
           # Uninstalling takes back everything the installer did, and keeps branches.
           New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\rogit\games\1" | Out-Null
           Set-Content "$env:LOCALAPPDATA\rogit\games\1\game.toml" ''
@@ -118,5 +118,5 @@ jobs:
           $path = (Get-Item HKCU:\Environment).GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';'
           if ($path -contains $bin) { throw "rogit is still on PATH: $path" }
           if (Test-Path $bin) { throw "$bin is still there." }
-          if (Test-Path "$env:LOCALAPPDATA\Roblox\Plugins\RoGit.lua") { throw 'The plugin is still installed.' }
+          if (Test-Path "$env:LOCALAPPDATA\Roblox\Plugins\RoGit.rbxm") { throw 'The plugin is still installed.' }
           if (-not (Test-Path "$env:LOCALAPPDATA\rogit\games\1\game.toml")) { throw 'Uninstalling removed branches.' }

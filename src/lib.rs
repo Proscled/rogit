@@ -21,7 +21,20 @@ use std::io::{self, IsTerminal};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
-const PLUGIN: &str = include_str!("../plugin/RoGit.lua");
+/// The Studio plugin: its Script first, then the ModuleScripts inside it.
+const PLUGIN: &[(&str, &str)] = &[
+    ("RoGit", include_str!("../plugin/RoGit.server.lua")),
+    ("App", include_str!("../plugin/App.lua")),
+    ("Core", include_str!("../plugin/Core.lua")),
+    ("Look", include_str!("../plugin/Look.lua")),
+    ("Place", include_str!("../plugin/Place.lua")),
+    ("Apply", include_str!("../plugin/Apply.lua")),
+    ("Preview", include_str!("../plugin/Preview.lua")),
+    ("Review", include_str!("../plugin/Review.lua")),
+    ("Panel", include_str!("../plugin/Panel.lua")),
+    ("Actions", include_str!("../plugin/Actions.lua")),
+    ("Watch", include_str!("../plugin/Watch.lua")),
+];
 
 const HELP: &str = "RoGit: branches for your Roblox places.
 
@@ -207,7 +220,7 @@ mod plugin_checks {
                     out.push(c);
                 }
                 Some(_) => {}
-                None if c == '"' || c == '\'' => {
+                None if c == '"' || c == '\'' || c == '`' => {
                     quote = Some(c);
                     out.push(c);
                 }
@@ -218,10 +231,10 @@ mod plugin_checks {
         out
     }
 
-    /// Names declared by top-level `local` lines, with their line numbers.
-    fn top_level_locals() -> Vec<(String, usize)> {
+    /// Names declared by a file's top-level `local` lines, with their line numbers.
+    fn top_level_locals(source: &str) -> Vec<(String, usize)> {
         let mut names = Vec::new();
-        for (number, line) in PLUGIN.lines().enumerate() {
+        for (number, line) in source.lines().enumerate() {
             let Some(rest) = line.strip_prefix("local ") else { continue };
             let rest = rest.strip_prefix("function ").unwrap_or(rest);
             let declared = rest.split(['=', '(', ':']).next().unwrap_or_default();
@@ -237,16 +250,19 @@ mod plugin_checks {
 
     #[test]
     fn stays_within_luaus_local_limit() {
-        // Luau allows 200 locals in one scope; past that the plugin doesn't load at all. Sections that keep their
-        // locals to themselves live in `do` blocks or functions.
-        let count = top_level_locals().len();
-        assert!(count <= 185, "the plugin has {count} top-level locals; move a section into a do block");
+        // Luau allows 200 locals in one scope; past that the plugin doesn't load at all. A part that needs more is
+        // split into another module, or keeps some in `do` blocks or functions.
+        for (file, source) in PLUGIN {
+            let count = top_level_locals(source).len();
+            assert!(count <= 185, "{file} has {count} top-level locals; move a section into another module");
+        }
     }
 
-    /// Every name bound anywhere (inner locals, function parameters, loop variables) and the first line it's bound on.
-    fn bindings() -> HashMap<String, usize> {
+    /// Every name bound anywhere in a file (inner locals, function parameters, loop variables, types) and the first
+    /// line it's bound on.
+    fn bindings(source: &str) -> HashMap<String, usize> {
         let mut first = HashMap::new();
-        for (number, line) in PLUGIN.lines().enumerate() {
+        for (number, line) in source.lines().enumerate() {
             let line = code(line);
             let mut bind = |names: &str| {
                 for name in names.split(',') {
@@ -269,6 +285,10 @@ mod plugin_checks {
             if let Some(rest) = line.trim_start().strip_prefix("for ") {
                 bind(rest.split([' ', '=']).take_while(|w| *w != "in").collect::<Vec<_>>().join(",").as_str());
             }
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("export type ").or_else(|| trimmed.strip_prefix("type ")) {
+                bind(rest.split([' ', '=', '<']).next().unwrap_or_default());
+            }
         }
         first
     }
@@ -276,22 +296,159 @@ mod plugin_checks {
     #[test]
     fn uses_no_top_level_name_before_declaring_it() {
         // Using a local before its declaration reads a global of the same name instead (nil), silently.
-        let declared: HashMap<String, usize> =
-            top_level_locals().into_iter().fold(HashMap::new(), |mut first, (name, line)| {
-                first.entry(name).or_insert(line);
-                first
-            });
-        let bound = bindings();
-        for (number, line) in PLUGIN.lines().enumerate() {
+        for (file, source) in PLUGIN {
+            let declared: HashMap<String, usize> =
+                top_level_locals(source).into_iter().fold(HashMap::new(), |mut first, (name, line)| {
+                    first.entry(name).or_insert(line);
+                    first
+                });
+            let bound = bindings(source);
+            for (number, line) in source.lines().enumerate() {
+                let line = code(line);
+                let words = line.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == ':'));
+                for word in words {
+                    // `a.b` and `a:b` use `a`; what comes after the dot is a field.
+                    let name = word.split(['.', ':']).next().unwrap_or_default();
+                    let Some(&at) = declared.get(name) else { continue };
+                    // A parameter or inner local of the same name bound earlier is a different variable.
+                    let shadowed = bound.get(name).is_some_and(|&b| b < at && b <= number);
+                    assert!(
+                        number >= at || shadowed,
+                        "{file} line {}: `{name}` is used before its declaration on line {}",
+                        number + 1,
+                        at + 1
+                    );
+                }
+            }
+        }
+    }
+
+    const KEYWORDS: &[&str] = &[
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in", "local", "nil", "not", "or",
+        "repeat", "return", "then", "true", "until", "while", "continue", "type", "export", "typeof",
+    ];
+
+    /// What the plugin may use without declaring it: Luau's and Roblox's globals, and the types it names.
+    const GLOBALS: &[&str] = &[
+        "game", "workspace", "script", "require", "settings", "assert", "error", "warn", "pcall", "tonumber", "tostring",
+        "setmetatable", "string", "table", "math", "os", "task", "buffer", "any", "boolean", "number", "Random", "Instance",
+        "Enum", "Font", "Color3", "UDim", "UDim2", "Vector2", "Vector3", "Vector3int16", "CFrame", "NumberRange",
+        "DateTime", "TweenInfo", "DockWidgetPluginGuiInfo", "RBXScriptConnection", "StudioTheme", "Plugin",
+        "DockWidgetPluginGui", "Frame", "TextBox", "TextButton", "TextLabel", "Terrain", "BasePart", "Model", "Camera",
+    ];
+
+    /// Every name a file uses (not a field or a method, not a table key) and the first line it's used on.
+    fn uses(source: &str) -> HashMap<String, usize> {
+        let mut first = HashMap::new();
+        let mut depth: i32 = 0;
+        for (number, line) in source.lines().enumerate() {
             let line = code(line);
-            let words = line.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == ':'));
-            for word in words {
-                // `a.b` and `a:b` use `a`; what comes after the dot is a field.
-                let name = word.split(['.', ':']).next().unwrap_or_default();
-                let Some(&at) = declared.get(name) else { continue };
-                // A parameter or inner local of the same name bound earlier is a different variable.
-                let shadowed = bound.get(name).is_some_and(|&b| b < at && b <= number);
-                assert!(number >= at || shadowed, "line {}: `{name}` is used before its declaration on line {}", number + 1, at + 1);
+            let chars: Vec<char> = line.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let c = chars[i];
+                let starts = (c.is_alphabetic() || c == '_') && (i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'));
+                if !starts {
+                    i += 1;
+                    continue;
+                }
+                let begin = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let name: String = chars[begin..i].iter().collect();
+                let before: String = chars[..begin].iter().collect::<String>().trim_end().to_owned();
+                let after: String = chars[i..].iter().collect();
+                let next = after.trim_start();
+                let field = (before.ends_with('.') && !before.ends_with(".."))
+                    || (before.ends_with(':') && !before.ends_with("::"));
+                // `name: Type` is a typed binding or a field of a table type.
+                let typed = after.starts_with(':') && !after.starts_with("::") && after[1..].chars().next().is_none_or(|c| c == ' ')
+                    || next.starts_with("?:");
+                // `name =` inside braces is a table key; outside, an assignment, which uses the name.
+                let braces = depth + before.matches('{').count() as i32 - before.matches('}').count() as i32;
+                let key = next.starts_with('=') && !next.starts_with("==") && braces > 0;
+                if !(KEYWORDS.contains(&name.as_str()) || field || typed || key) {
+                    first.entry(name).or_insert(number);
+                }
+            }
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        }
+        first
+    }
+
+    #[test]
+    fn declares_every_name_it_uses() {
+        // A name that's neither declared nor a global reads as nil, and Studio only says so when that line runs. After
+        // moving code between modules, this is usually something the module forgot to take from another.
+        for (file, source) in PLUGIN {
+            let bound = bindings(source);
+            for (name, line) in uses(source) {
+                // Only the plugin's Script is given `plugin`; its modules get it from App.
+                let global = GLOBALS.contains(&name.as_str()) || (name == "plugin" && *file == "RoGit");
+                assert!(bound.contains_key(&name) || global, "{file} line {}: `{name}` isn't declared", line + 1);
+            }
+        }
+    }
+
+    /// What a module gives the others: its returned table's keys, the fields it sets on its own table, and its
+    /// exported types. App's fields are its type's.
+    fn exports(module: &str, source: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let prefix = format!("{module}.");
+        let own_table = format!("local {module} = {{");
+        // Inside App's type, or inside a table whose keys are given (the returned one, or the module's own).
+        let (mut in_type, mut in_table) = (false, false);
+        let keys = |text: &str, names: &mut Vec<String>| {
+            for pair in text.trim().trim_end_matches(['}', ',']).split(", ") {
+                if let Some((key, _)) = pair.split_once(" = ") {
+                    if key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        names.push(key.to_owned());
+                    }
+                }
+            }
+        };
+        for line in source.lines() {
+            let line = code(line);
+            if let Some(rest) = line.strip_prefix("export type ") {
+                names.push(rest.split([' ', '=']).next().unwrap_or_default().to_owned());
+                in_type = module == "App";
+            } else if line.starts_with('}') {
+                in_type = false;
+                in_table = false;
+            } else if in_type {
+                names.push(line.trim().split(':').next().unwrap_or_default().to_owned());
+            } else if in_table {
+                keys(&line, &mut names);
+            } else if let Some(rest) = line.strip_prefix("return {") {
+                keys(rest, &mut names);
+                in_table = !rest.trim_end().ends_with('}');
+            } else if line.starts_with(&own_table) {
+                in_table = true;
+            } else if line.starts_with(&prefix) {
+                let targets = line.split(" = ").next().unwrap_or_default();
+                names.extend(targets.split(", ").filter_map(|t| t.strip_prefix(&prefix)).map(str::to_owned));
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn takes_only_what_modules_give() {
+        let given: HashMap<&str, Vec<String>> = PLUGIN.iter().map(|(name, source)| (*name, exports(name, source))).collect();
+        for (file, source) in PLUGIN {
+            for (number, line) in source.lines().enumerate() {
+                let line = code(line);
+                for (module, names) in &given {
+                    for (at, _) in line.match_indices(&format!("{module}.")) {
+                        let before = line[..at].chars().last();
+                        if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                            continue;
+                        }
+                        let field: String = line[at + module.len() + 1..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                        assert!(names.contains(&field), "{file} line {}: {module} has no `{field}`", number + 1);
+                    }
+                }
             }
         }
     }

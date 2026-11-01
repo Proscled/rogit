@@ -6,7 +6,7 @@
 use crate::diff::{self, Change, IGNORED, Index, Row, Status, Tree};
 use base64::Engine;
 use rbx_dom_weak::types::{Attributes, Ref, Variant};
-use rbx_dom_weak::{InstanceBuilder, Ustr, WeakDom};
+use rbx_dom_weak::{Instance, InstanceBuilder, Ustr, WeakDom};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -26,8 +26,9 @@ pub enum Op {
     Settings { service: String, values: Map<String, Value>, conflict: Option<usize> },
     Rename { target: String, name: String, conflict: Option<usize> },
     Move { target: String, parent: String, conflict: Option<usize> },
-    /// Put the bundle template (a whole new object with everything inside) under `parent`.
-    Add { parent: String, template: usize, fixups: Vec<Fixup>, conflict: Option<usize> },
+    /// Put the bundle template (a whole new object with everything inside) under `parent`. `key` is its review row's
+    /// key, so the plugin can show it before it exists.
+    Add { key: String, parent: String, template: usize, fixups: Vec<Fixup>, conflict: Option<usize> },
     Remove { target: String, conflict: Option<usize> },
 }
 
@@ -226,9 +227,10 @@ impl Builder<'_> {
         id
     }
 
-    /// The target's key for an object (what Studio finds it by), from the shared key.
+    /// The target's key for an object (what Studio finds it by), from the shared key. Code Folders count: new things
+    /// can go into them.
     fn target_key(&self, key: &str) -> Option<String> {
-        self.target.index.get(key).map(|e| e.own_key.clone())
+        self.target.index.get(key).map(|e| e.own_key.clone()).or_else(|| self.target.index.code.get(key).cloned())
     }
 
     /// A reference property's target, as the target's key ("" for none or for something it doesn't have).
@@ -327,6 +329,10 @@ impl Builder<'_> {
         if !self.source_changed(key) {
             return;
         }
+        // A code Folder in the target is left alone.
+        if self.target.index.get(key).is_none() && self.target.index.code.contains_key(key) {
+            return;
+        }
         let Some(target) = self.target_key(key) else {
             // The target removed what the source changed: put the source's version back only if asked.
             let Some(parent) = self.source.index.get(key).and_then(|e| e.parent.clone()).and_then(|p| self.target_key(&p)) else {
@@ -335,7 +341,7 @@ impl Builder<'_> {
             let (from, into) = (self.direction.source(), self.direction.target());
             let id = self.conflict(key, format!("{} was changed in {from} but removed in {into}.", self.source.name(key)));
             let (template, fixups) = self.subtree(key);
-            self.operations.push(Op::Add { parent, template, fixups, conflict: Some(id) });
+            self.operations.push(Op::Add { key: key.to_owned(), parent, template, fixups, conflict: Some(id) });
             self.summary.changed += 1;
             self.tree.add(self.source.dom, &self.source.index, key, Status::Changed, vec![]);
             self.tree.mark_conflict(key, id);
@@ -444,14 +450,15 @@ impl Builder<'_> {
         };
         let inside = self.source.inside(key).len();
         let (template, fixups) = self.subtree(key);
-        self.operations.push(Op::Add { parent, template, fixups, conflict: None });
+        self.operations.push(Op::Add { key: key.to_owned(), parent, template, fixups, conflict: None });
         self.summary.added += 1;
         let contents = if inside > 0 { vec![Change::new("Contains", "", format!("{inside} objects"))] } else { vec![] };
         self.tree.add(self.source.dom, &self.source.index, key, Status::Added, contents);
     }
 
     fn removed(&mut self, key: &str) {
-        let Some(target) = self.target_key(key) else { return };
+        // Only what the target tracks: if it's a code Folder there now, its scripts stay.
+        let Some(target) = self.target.index.get(key).map(|e| e.own_key.clone()) else { return };
         // If the target changed the object (or anything in it) since the base, removing it needs a choice.
         let mut keys = vec![key.to_owned()];
         keys.extend(self.target.inside(key));
@@ -507,6 +514,66 @@ fn workspace_attribute(dom: &WeakDom, name: &str) -> Option<String> {
     }
 }
 
+/// An object new on both sides at the same path, with the same class and the same values, is one object: the target
+/// got it from a merge of this branch that wasn't recorded (so this merge starts from further back), and has since
+/// given it a RoGit ID of its own. The target's key becomes the source's, so it isn't added a second time.
+fn pair_new_objects(base: &Index, source: (&WeakDom, &Index), target: (&WeakDom, &mut Index)) {
+    let (source_dom, source_index) = source;
+    let (target_dom, target_index) = target;
+    let is_new = |key: &str| base.get(key).is_none() && !base.code.contains_key(key);
+    let mut waiting: HashMap<(&str, &str), Vec<&diff::Entry>> = HashMap::new();
+    for entry in source_index.entries.iter().filter(|e| is_new(&e.key) && target_index.get(&e.key).is_none()) {
+        let class = source_dom.get_by_ref(entry.referent).map(|i| i.class.as_str()).unwrap_or_default();
+        waiting.entry((entry.path.as_str(), class)).or_default().push(entry);
+    }
+    if waiting.is_empty() {
+        return;
+    }
+    // Values only: references point at keys, which differ until the pairing is done.
+    let alike = |a: &Instance, b: &Instance| {
+        a.properties.iter().filter(|(name, value)| !IGNORED.contains(&name.as_str()) && !matches!(value, Variant::Ref(_))).all(|(name, value)| {
+            b.properties.get(name).is_none_or(|other| diff::same(value, other, (source_index, &*target_index)))
+        })
+    };
+    let mut renamed: HashMap<String, String> = HashMap::new();
+    for entry in target_index.entries.iter().filter(|e| is_new(&e.key) && source_index.get(&e.key).is_none()) {
+        let Some(ours) = target_dom.get_by_ref(entry.referent) else { continue };
+        let Some(candidates) = waiting.get_mut(&(entry.path.as_str(), ours.class.as_str())) else { continue };
+        let found = candidates.iter().position(|theirs| source_dom.get_by_ref(theirs.referent).is_some_and(|theirs| alike(theirs, ours)));
+        if let Some(at) = found {
+            renamed.insert(entry.key.clone(), candidates.remove(at).key.clone());
+        }
+    }
+    // Only whole objects pair: a model whose parts differ is a different model, and is added beside the target's.
+    let children = |index: &Index| {
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for entry in &index.entries {
+            if let Some(parent) = &entry.parent {
+                children.entry(parent.clone()).or_default().push(entry.key.clone());
+            }
+        }
+        children
+    };
+    let inside = |children: &HashMap<String, Vec<String>>, key: &str| {
+        let mut out = Vec::new();
+        let mut stack = vec![key.to_owned()];
+        while let Some(k) = stack.pop() {
+            for child in children.get(&k).into_iter().flatten() {
+                out.push(child.clone());
+                stack.push(child.clone());
+            }
+        }
+        out
+    };
+    let (theirs, ours) = (children(source_index), children(target_index));
+    let paired: HashSet<String> = renamed.values().cloned().collect();
+    renamed.retain(|our_key, their_key| {
+        let their_inside = inside(&theirs, their_key);
+        their_inside.len() == inside(&ours, our_key).len() && their_inside.iter().all(|k| paired.contains(k))
+    });
+    target_index.rekey(&renamed);
+}
+
 /// Plans bringing what `source` changed since `base` into `target`: the branch into main for a merge, main into the
 /// branch for an update.
 pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, direction: Direction) -> Result<Plan, String> {
@@ -518,6 +585,7 @@ pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, direction: Direc
     });
     diff::adopt_new_ids(base, &base_index, source, &mut source_index);
     diff::adopt_new_ids(base, &base_index, target, &mut target_index);
+    pair_new_objects(&base_index, (source, &source_index), (target, &mut target_index));
     let mut b = Builder {
         base: Place { dom: base, index: base_index, children: Default::default() },
         source: Place { dom: source, index: source_index, children: Default::default() },
@@ -541,11 +609,24 @@ pub fn plan(base: &WeakDom, source: &WeakDom, target: &WeakDom, direction: Direc
         }
         true
     };
-    let added: HashSet<String> =
-        b.source.index.entries.iter().filter(|e| b.base.index.get(&e.key).is_none()).map(|e| e.key.clone()).collect();
-    let removed: HashSet<String> =
-        b.base.index.entries.iter().filter(|e| b.source.index.get(&e.key).is_none()).map(|e| e.key.clone()).collect();
-    let changed: Vec<String> = b.source.index.entries.iter().filter(|e| !added.contains(&e.key)).map(|e| e.key.clone()).collect();
+    // A code Folder that gained things, or lost them, was there all along: it's neither new nor removed.
+    let added: HashSet<String> = b
+        .source
+        .index
+        .entries
+        .iter()
+        .filter(|e| b.base.index.get(&e.key).is_none() && !b.base.index.code.contains_key(&e.key))
+        .map(|e| e.key.clone())
+        .collect();
+    let removed: HashSet<String> = b
+        .base
+        .index
+        .entries
+        .iter()
+        .filter(|e| b.source.index.get(&e.key).is_none() && !b.source.index.code.contains_key(&e.key))
+        .map(|e| e.key.clone())
+        .collect();
+    let changed: Vec<String> = b.source.index.entries.iter().filter(|e| b.base.index.get(&e.key).is_some()).map(|e| e.key.clone()).collect();
     for key in changed {
         b.changed(&key);
     }
@@ -784,5 +865,60 @@ mod tests {
     fn an_object_main_already_has_is_not_added_twice() {
         let plan = plan(&place(), &first_round(), &first_round(), Direction::Merge).unwrap();
         assert!(!plan.operations.iter().any(|op| matches!(op, Op::Add { .. })));
+    }
+
+    /// `place()` plus a new untagged model at Workspace/Map/Guard, with a part of the given color; `ids` tags both.
+    fn with_guard(color: f32, ids: Option<(&str, &str)>) -> WeakDom {
+        let mut dom = place();
+        let map = dom.descendants().find(|i| i.name == "Map").unwrap().referent();
+        let (model, part) = match ids {
+            Some((model, part)) => (tagged("Model", "Guard", model), tagged("Part", "Body", part)),
+            None => (InstanceBuilder::new("Model").with_name("Guard"), InstanceBuilder::new("Part").with_name("Body")),
+        };
+        let guard = dom.insert(map, model);
+        dom.insert(guard, part.with_property("Color", Variant::Color3(Color3::new(color, 0.0, 0.0))));
+        dom
+    }
+
+    #[test]
+    fn something_merged_before_and_given_an_id_in_main_is_not_added_again() {
+        // The first merge brought the guard over without an ID and wasn't recorded; main gave it one since.
+        let again = plan(&place(), &with_guard(1.0, None), &with_guard(1.0, Some(("g1", "b1"))), Direction::Merge).unwrap();
+        assert!(!again.operations.iter().any(|op| matches!(op, Op::Add { .. })), "{:?}", again.operations);
+        // A different object that happens to have the same name and place is still added.
+        let other = plan(&place(), &with_guard(1.0, None), &with_guard(0.2, Some(("g1", "b1"))), Direction::Merge).unwrap();
+        assert_eq!(other.operations.iter().filter(|op| matches!(op, Op::Add { .. })).count(), 1);
+    }
+
+    /// ReplicatedStorage > Assets, a Folder of things with a stray script; `flake` adds a part to it, `keep_snow`
+    /// keeps the only other thing in it.
+    fn with_assets(flake: bool, keep_snow: bool) -> WeakDom {
+        let mut dom = place();
+        let storage = dom.insert(dom.root_ref(), InstanceBuilder::new("ReplicatedStorage").with_name("ReplicatedStorage"));
+        let assets = dom.insert(storage, tagged("Folder", "Assets", "assets"));
+        dom.insert(assets, InstanceBuilder::new("Script").with_name("Animate"));
+        if keep_snow {
+            dom.insert(assets, tagged("Part", "Snow", "snow"));
+        }
+        if flake {
+            dom.insert(assets, tagged("Part", "Flake", "flake"));
+        }
+        dom
+    }
+
+    #[test]
+    fn things_in_a_folder_with_a_script_are_merged() {
+        let plan = plan(&with_assets(false, true), &with_assets(true, true), &with_assets(false, true), Direction::Merge).unwrap();
+        assert!(matches!(plan.operations.as_slice(), [Op::Add { parent, .. }] if parent == "assets"), "{:?}", plan.operations);
+    }
+
+    #[test]
+    fn a_folder_that_turned_into_code_keeps_its_scripts() {
+        // The branch removed the folder's only part, so it holds just its script: only the part goes.
+        let removal = plan(&with_assets(false, true), &with_assets(false, false), &with_assets(false, true), Direction::Merge).unwrap();
+        assert!(matches!(removal.operations.as_slice(), [Op::Remove { target, .. }] if target == "snow"), "{:?}", removal.operations);
+        // And in main: a branch adding to the folder still finds it.
+        let addition = plan(&with_assets(false, true), &with_assets(true, true), &with_assets(false, false), Direction::Merge).unwrap();
+        assert!(matches!(addition.operations.as_slice(), [Op::Add { parent, .. }] if parent == "assets"), "{:?}", addition.operations);
     }
 }

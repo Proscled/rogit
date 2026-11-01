@@ -22,10 +22,12 @@ pub(crate) const SERVICES: [&str; 18] = [
     "Chat", "LocalizationService", "TestService", "SocialService", "VoiceChatService",
 ];
 /// Properties that Studio changes by itself, or that only one kind of copy contains.
-pub(crate) const IGNORED: [&str; 9] = [
+pub(crate) const IGNORED: [&str; 10] = [
     "UniqueId", "HistoryId", "Capabilities", "DefinesCapabilities", "SourceAssetId", "PhysicsGrid", "NeedsPivotMigration",
     // Studio keeps this in step with the model's pivot; it can't be set and moves whenever the model moves.
     "ModelMeshCFrame",
+    // Terrain's material settings: saved in place files, but plugins can't read or set them.
+    "Materials",
     // Studio's own camera, which isn't part of a branch.
     "CurrentCamera",
 ];
@@ -107,6 +109,9 @@ pub(crate) struct Index {
     pub entries: Vec<Entry>,
     pub by_key: HashMap<String, usize>,
     pub by_ref: HashMap<Ref, String>,
+    /// Code Folders (scripts and Folders only), which RoGit leaves alone, by key, with the key Studio finds each by.
+    /// They're still there, so they don't read as removed, and new things can go into them.
+    pub code: HashMap<String, String>,
 }
 
 impl Index {
@@ -120,10 +125,12 @@ impl Index {
         self.entries.push(entry);
     }
 
-    fn truncate(&mut self, len: usize) {
+    /// Moves everything from `len` on (a code Folder and the Folders inside it) out of the tracked entries.
+    fn set_aside(&mut self, len: usize) {
         for entry in self.entries.drain(len..) {
             self.by_key.remove(&entry.key);
             self.by_ref.remove(&entry.referent);
+            self.code.insert(entry.key, entry.own_key);
         }
     }
 }
@@ -150,9 +157,10 @@ pub(crate) fn tag(inst: &Instance) -> Option<String> {
     })
 }
 
-/// Lists what RoGit tracks, using the same rules as the plugin: everything in the saved services except scripts and
-/// Folders that contain a script anywhere inside. Objects are keyed by their RoGit ID; objects without one (or with a
-/// copied one) are keyed by their path.
+/// Lists what RoGit tracks, using the same rules as the plugin: everything in the saved services except scripts
+/// (with anything inside them) and code Folders, which hold scripts and nothing but Folders besides. A Folder of
+/// models or UI with a stray script in it is tracked; only its scripts are left out. Objects are keyed by their
+/// RoGit ID; objects without one (or with a copied one) are keyed by their path.
 pub(crate) fn index(dom: &WeakDom) -> Index {
     let mut index = Index::default();
     let mut untagged: HashMap<String, usize> = HashMap::new();
@@ -168,13 +176,20 @@ pub(crate) fn index(dom: &WeakDom) -> Index {
     index
 }
 
-fn visit(dom: &WeakDom, parent: Ref, parent_path: &str, parent_key: &str, untagged: &mut HashMap<String, usize>, index: &mut Index) -> bool {
-    let mut has_script = false;
+/// What an object holds, besides Folders: scripts, other things, or both.
+#[derive(Default)]
+struct Holds {
+    scripts: bool,
+    things: bool,
+}
+
+fn visit(dom: &WeakDom, parent: Ref, parent_path: &str, parent_key: &str, untagged: &mut HashMap<String, usize>, index: &mut Index) -> Holds {
+    let mut holds = Holds::default();
     for &child_ref in dom.get_by_ref(parent).unwrap().children() {
         let child = dom.get_by_ref(child_ref).unwrap();
         let path = format!("{parent_path}/{}", child.name);
         if is_script(child) {
-            has_script = true;
+            holds.scripts = true;
             continue;
         }
         // Studio's camera moves whenever you look around; it isn't part of a branch.
@@ -191,14 +206,17 @@ fn visit(dom: &WeakDom, parent: Ref, parent_path: &str, parent_key: &str, untagg
         };
         let mark = index.entries.len();
         index.push(Entry { key: key.clone(), own_key: key.clone(), referent: child_ref, parent: Some(parent_key.to_owned()), path: path.clone() });
-        if visit(dom, child_ref, &path, &key, untagged, index) {
-            has_script = true;
-            if child.class.as_str() == "Folder" {
-                index.truncate(mark);
-            }
+        let inside = visit(dom, child_ref, &path, &key, untagged, index);
+        holds.scripts |= inside.scripts;
+        if child.class.as_str() != "Folder" {
+            holds.things = true;
+        } else if inside.scripts && !inside.things {
+            index.set_aside(mark);
+        } else {
+            holds.things |= inside.things;
         }
     }
-    has_script
+    holds
 }
 
 // Comparing values ---------------------------------------------------------------------------------
@@ -576,19 +594,27 @@ pub(crate) fn adopt_new_ids(start: &WeakDom, old: &Index, current: &WeakDom, new
             }
         }
     }
-    if renamed.is_empty() {
-        return;
-    }
-    let entries = std::mem::take(&mut new.entries);
-    *new = Index::default();
-    for mut entry in entries {
-        if let Some(key) = renamed.get(&entry.key) {
-            entry.key = key.clone();
+    new.rekey(&renamed);
+}
+
+impl Index {
+    /// Gives entries the keys in `renamed` (old key → new one), keeping the keys Studio finds them by.
+    pub(crate) fn rekey(&mut self, renamed: &HashMap<String, String>) {
+        if renamed.is_empty() {
+            return;
         }
-        if let Some(parent) = entry.parent.as_ref().and_then(|p| renamed.get(p)) {
-            entry.parent = Some(parent.clone());
+        let entries = std::mem::take(&mut self.entries);
+        let code = std::mem::take(&mut self.code);
+        *self = Index { code, ..Index::default() };
+        for mut entry in entries {
+            if let Some(key) = renamed.get(&entry.key) {
+                entry.key = key.clone();
+            }
+            if let Some(parent) = entry.parent.as_ref().and_then(|p| renamed.get(p)) {
+                entry.parent = Some(parent.clone());
+            }
+            self.push(entry);
         }
-        new.push(entry);
     }
 }
 
@@ -620,8 +646,11 @@ pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom) -> R
     adopt_new_ids(start, &old, current, &mut new);
     let mut tree = Tree::default();
     let mut summary = Summary::default();
-    let added: HashSet<&str> = new.entries.iter().filter(|e| old.get(&e.key).is_none()).map(|e| e.key.as_str()).collect();
-    let removed: HashSet<&str> = old.entries.iter().filter(|e| new.get(&e.key).is_none()).map(|e| e.key.as_str()).collect();
+    // A code Folder that gained things, or lost them, was there all along: it's neither new nor removed.
+    let added: HashSet<&str> =
+        new.entries.iter().filter(|e| old.get(&e.key).is_none() && !old.code.contains_key(&e.key)).map(|e| e.key.as_str()).collect();
+    let removed: HashSet<&str> =
+        old.entries.iter().filter(|e| new.get(&e.key).is_none() && !new.code.contains_key(&e.key)).map(|e| e.key.as_str()).collect();
     // A new model counts once, not once per part inside it.
     let mut inside: HashMap<String, usize> = HashMap::new();
     let top = |index: &Index, set: &HashSet<&str>, key: &str| -> Option<String> {
@@ -635,9 +664,9 @@ pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom) -> R
         }
         found
     };
-    let compared = par_map(&new.entries, |entry| match added.contains(entry.key.as_str()) {
-        true => vec![],
-        false => changes((start, old, old.get(&entry.key).unwrap().referent), (current, &new, entry.referent)),
+    let compared = par_map(&new.entries, |entry| match old.get(&entry.key) {
+        Some(before) => changes((start, old, before.referent), (current, &new, entry.referent)),
+        None => vec![],
     });
     for (entry, mut list) in new.entries.iter().zip(compared) {
         if added.contains(entry.key.as_str()) {
@@ -646,7 +675,8 @@ pub(crate) fn compare_with(start: &WeakDom, old: &Index, current: &WeakDom) -> R
             }
             continue;
         }
-        let before = old.get(&entry.key).unwrap();
+        // A code Folder at the start that now holds things: what's new inside it shows on its own.
+        let Some(before) = old.get(&entry.key) else { continue };
         if before.parent != entry.parent {
             let path = |index: &Index, key: &Option<String>| key.as_ref().and_then(|k| index.get(k)).map(|e| e.path.clone()).unwrap_or_default();
             list.insert(0, Change::new("Parent", path(&old, &before.parent), path(&new, &entry.parent)));
@@ -856,6 +886,62 @@ mod tests {
         assert!(close(1.0, 1.000_01));
         assert!(!close(f32::INFINITY, 1.0e30));
         assert!(!close(1.0, 1.1));
+    }
+
+    /// ReplicatedStorage > Assets (a Folder of things with one stray script) and Code (scripts and Folders only).
+    fn assets_and_code(snow_size: f32, add_flake: bool, keep_snow: bool, code_gets_a_part: bool) -> WeakDom {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let storage = dom.insert(dom.root_ref(), InstanceBuilder::new("ReplicatedStorage").with_name("ReplicatedStorage"));
+        let assets = dom.insert(storage, tagged("Folder", "Assets", "assets"));
+        if keep_snow {
+            dom.insert(assets, tagged("Part", "Snow", "snow").with_property("Size", Variant::Vector3(Vector3::new(snow_size, 1.0, 1.0))));
+        }
+        dom.insert(assets, InstanceBuilder::new("Script").with_name("Animate"));
+        if add_flake {
+            dom.insert(assets, InstanceBuilder::new("Part").with_name("Flake"));
+        }
+        let code = dom.insert(storage, tagged("Folder", "Code", "code"));
+        dom.insert(code, InstanceBuilder::new("ModuleScript").with_name("Main"));
+        let shared = dom.insert(code, InstanceBuilder::new("Folder").with_name("Shared"));
+        dom.insert(shared, InstanceBuilder::new("ModuleScript").with_name("Util"));
+        if code_gets_a_part {
+            dom.insert(code, InstanceBuilder::new("RemoteEvent").with_name("Ping"));
+        }
+        dom
+    }
+
+    #[test]
+    fn a_folder_of_things_with_a_stray_script_is_tracked() {
+        let index = index(&assets_and_code(1.0, false, true, false));
+        let paths: Vec<&str> = index.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["ReplicatedStorage", "ReplicatedStorage/Assets", "ReplicatedStorage/Assets/Snow"]);
+        assert!(index.code.contains_key("code") && index.code.contains_key("path:ReplicatedStorage/Code/Shared#1"));
+        let review = compare(&assets_and_code(1.0, false, true, false), &assets_and_code(2.0, true, true, false));
+        assert_eq!(review.summary, Summary { added: 1, removed: 0, changed: 1 });
+    }
+
+    #[test]
+    fn a_folder_turning_into_code_or_back_is_neither_removed_nor_new() {
+        // The Snow part goes, so Assets holds only its script: Snow is removed, Assets isn't.
+        let review = compare(&assets_and_code(1.0, false, true, false), &assets_and_code(1.0, false, false, false));
+        assert_eq!(review.summary, Summary { added: 0, removed: 1, changed: 0 });
+        assert!(review.rows.iter().all(|r| r.name != "Assets" || r.status == Status::Context));
+        // Code gets a RemoteEvent: the event is new, Code isn't.
+        let review = compare(&assets_and_code(1.0, false, true, false), &assets_and_code(1.0, false, true, true));
+        assert_eq!(review.summary, Summary { added: 1, removed: 0, changed: 0 });
+        assert_eq!(review.rows.iter().find(|r| r.name == "Ping").unwrap().status, Status::Added);
+        assert_eq!(review.rows.iter().find(|r| r.name == "Code").unwrap().status, Status::Context);
+    }
+
+    #[test]
+    fn terrain_materials_are_not_changes() {
+        let terrain = |bytes: &[u8]| {
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace").with_name("Workspace"));
+            dom.insert(workspace, tagged("Terrain", "Terrain", "terrain").with_property("Materials", Variant::BinaryString(bytes.to_vec().into())));
+            dom
+        };
+        assert_eq!(compare(&terrain(b"a"), &terrain(b"b")).summary, Summary::default());
     }
 
     #[test]
