@@ -1,13 +1,15 @@
 # Builds rogit for macOS and Windows when a version tag (v1.2.3) is pushed, and attaches zips that Rokit can
-# install (`rokit add <owner>/rogit`) to the GitHub release.
+# install (`rokit add <owner>/rogit`) to the GitHub release. The release also gets SHA256SUMS and GitHub's signed
+# record of where each zip was built (`gh attestation verify rogit-windows-x86_64.zip --repo <owner>/rogit`).
 name: Release
 
 on:
   push:
     tags: ["v*"]
 
+# The builds only read the code. Only the last job, which runs none of it, can publish.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -24,10 +26,17 @@ jobs:
             target: x86_64-pc-windows-msvc
             name: windows-x86_64
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # SignPath reads the unsigned programs from this run's artifacts.
+      actions: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       - name: Check the tag matches Cargo.toml
         shell: bash
@@ -46,7 +55,7 @@ jobs:
       - name: Hand the Windows programs to SignPath
         id: unsigned
         if: runner.os == 'Windows' && vars.SIGNPATH_ORGANIZATION_ID != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unsigned-windows
           path: |
@@ -54,7 +63,7 @@ jobs:
             target/${{ matrix.target }}/release/rogit-background.exe
       - name: Sign the Windows programs
         if: runner.os == 'Windows' && vars.SIGNPATH_ORGANIZATION_ID != ''
-        uses: signpath/github-action-submit-signing-request@v3
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
@@ -78,6 +87,36 @@ jobs:
           else
             zip "$GITHUB_WORKSPACE/$zip" rogit
           fi
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          files: rogit-*.zip
+          name: rogit-${{ matrix.name }}
+          path: rogit-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # For the signed record of the build.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: rogit-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum rogit-*.zip > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/rogit-*.zip
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/rogit-*.zip
+            dist/SHA256SUMS

@@ -13,6 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Each 4 MiB base64 part from the plugin decodes to exactly this many bytes.
 pub const PART_BYTES: u64 = 3 * 1024 * 1024;
 
+/// The most parts one service's copy can have (12 GiB, far more than Roblox can save).
+pub const MAX_PARTS: u64 = 4096;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Branch {
     pub name: String,
@@ -114,6 +117,9 @@ impl Branches {
 
     /// Stores one base64 part of an uploaded service copy at its place in the file.
     pub fn store_part(&self, capture: &str, service: &str, part: u64, bytes: &[u8]) -> Result<(), String> {
+        if part >= MAX_PARTS || bytes.len() as u64 > PART_BYTES {
+            return Err("Invalid upload.".into());
+        }
         let dir = self.upload_dir(capture);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let file = fs::OpenOptions::new()
@@ -126,6 +132,9 @@ impl Branches {
     }
 
     pub fn get(&self, name: &str) -> Option<Branch> {
+        if !valid_name(name) {
+            return None;
+        }
         serde_json::from_slice(&fs::read(self.details(name)).ok()?).ok()
     }
 
@@ -472,7 +481,7 @@ impl Branches {
 
     pub fn open(&self, name: &str) -> Result<(), String> {
         let file = self.file(name);
-        if !file.exists() {
+        if !valid_name(name) || !file.exists() {
             return Err(format!("There's no branch file for {name}."));
         }
         open_in_studio(&file).map_err(|e| format!("Couldn't open Studio: {e}"))
@@ -505,12 +514,10 @@ fn close_in_studio(file: &Path) -> usize {
     let paths: Vec<String> =
         [Some(file.to_path_buf()), file.canonicalize().ok()].into_iter().flatten().map(|p| p.display().to_string()).collect();
     if cfg!(windows) {
-        let path = paths[0].replace('\'', "''");
-        let script = format!(
-            "$p = Get-CimInstance Win32_Process | Where-Object {{ $_.Name -like 'RobloxStudio*' -and $_.CommandLine -and $_.CommandLine.Contains('{path}') }}; \
-             $p | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}; @($p).Count"
-        );
-        let output = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output();
+        // The path goes in through the environment, so nothing in it can be read as part of the script.
+        let script = "$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'RobloxStudio*' -and $_.CommandLine -and $_.CommandLine.Contains($env:ROGIT_CLOSE_FILE) }; \
+             $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; @($p).Count";
+        let output = Command::new("powershell").args(["-NoProfile", "-Command", script]).env("ROGIT_CLOSE_FILE", &paths[0]).output();
         return output.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()).unwrap_or(0);
     }
     let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else { return 0 };
@@ -543,11 +550,15 @@ fn close_in_studio(file: &Path) -> usize {
     pids.len()
 }
 
+/// Opens the file the way double-clicking it would, without cmd.exe, which reads characters like & in a path as
+/// commands.
+#[cfg(windows)]
 fn open_in_studio(file: &Path) -> std::io::Result<()> {
-    if cfg!(windows) {
-        Command::new("cmd").args(["/C", "start", ""]).arg(file).spawn()?;
-        return Ok(());
-    }
+    crate::windows::open_file(file)
+}
+
+#[cfg(not(windows))]
+fn open_in_studio(file: &Path) -> std::io::Result<()> {
     // Opening Studio by name can pick another app copy with the same name, which starts Studio without the
     // file. The installed app's full path always opens the file.
     let home = std::env::var("HOME").unwrap_or_default();

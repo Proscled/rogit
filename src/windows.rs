@@ -1,5 +1,5 @@
 //! The current user's registry on Windows, for RoGit's PATH entry and its login entry: read and written directly, as
-//! installers do, rather than through PowerShell or reg.exe.
+//! installers do, rather than through PowerShell or reg.exe. Also opening files the way Explorer does.
 
 use std::ptr;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE_FLAG_INHERIT, SetHandleInformation};
@@ -8,7 +8,8 @@ use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW,
     RegDeleteValueW, RegQueryValueExW, RegSetValueExW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, SendMessageTimeoutW, WM_SETTINGCHANGE};
 
 const ENVIRONMENT: &str = "Environment";
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -20,6 +21,17 @@ pub fn keep_own_output() {
     for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         // Fails harmlessly when there's no such handle.
         unsafe { SetHandleInformation(GetStdHandle(which), HANDLE_FLAG_INHERIT, 0) };
+    }
+}
+
+/// Opens a file with the program Windows has for it, as double-clicking it does.
+pub fn open_file(file: &std::path::Path) -> std::io::Result<()> {
+    let path: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(file.as_os_str()).chain(Some(0)).collect();
+    let result = unsafe { ShellExecuteW(ptr::null_mut(), ptr::null(), path.as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL) };
+    // Anything above 32 means it opened; below is an error code.
+    match result as usize {
+        n if n > 32 => Ok(()),
+        n => Err(std::io::Error::other(format!("Windows couldn't open {} (error {n}).", file.display()))),
     }
 }
 

@@ -142,7 +142,13 @@ pub fn latest_release() -> Result<String, String> {
         .and_then(|mut res| res.body_mut().read_to_string())
         .map_err(|e| format!("Couldn't reach GitHub: {e}"))?;
     let release: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    release["tag_name"].as_str().map(|tag| tag.trim_start_matches('v').to_owned()).ok_or("GitHub has no release of RoGit.".into())
+    let tag = release["tag_name"].as_str().ok_or("GitHub has no release of RoGit.")?;
+    // It goes into a download address and a folder name: only a plain version will do.
+    let version = tag.trim_start_matches('v');
+    match version.split('.').count() == 3 && version.split('.').all(|n| !n.is_empty() && n.len() <= 5 && n.bytes().all(|b| b.is_ascii_digit())) {
+        true => Ok(version.to_owned()),
+        false => Err(format!("GitHub's newest release of RoGit has an unexpected name: {tag}")),
+    }
 }
 
 /// Downloads the newest release for this computer and installs it with its own `self-install`, which also updates
@@ -168,8 +174,10 @@ pub fn update() -> Result<(), String> {
         .call()
         .and_then(|mut res| res.body_mut().with_config().limit(200 * 1024 * 1024).read_to_vec())
         .map_err(|e| format!("Couldn't download {url}: {e}"))?;
-    let unpacked = env::temp_dir().join(format!("rogit-{latest}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&unpacked);
+    // A new folder of its own: if one of that name is already there, something else made it.
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let unpacked = env::temp_dir().join(format!("rogit-{latest}-{}-{stamp:x}", std::process::id()));
+    fs::create_dir(&unpacked).map_err(|e| format!("Couldn't make a folder to unpack the download in: {e}"))?;
     zip::ZipArchive::new(std::io::Cursor::new(zip))
         .and_then(|mut archive| archive.extract(&unpacked))
         .map_err(|e| format!("Couldn't unpack the download: {e}"))?;
@@ -316,6 +324,7 @@ mod tests {
 
     #[test]
     fn compares_versions() {
+        assert!(at_least("1.0.0", "0.99.99"));
         assert!(at_least("0.2.0", "0.2.0"));
         assert!(at_least("v0.10.0", "0.9.1"));
         assert!(!at_least("0.1.0", "0.2.0"));

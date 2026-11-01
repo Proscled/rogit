@@ -1,0 +1,18 @@
+# Keeps the Rust crates and the workflows' pinned actions current: one grouped pull request each, once a month.
+# Security fixes come sooner, once Dependabot security updates are on (Settings → Code security).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      crates:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

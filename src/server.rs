@@ -11,6 +11,7 @@ use crate::roblox::Roblox;
 use base64::Engine;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use rbx_dom_weak::WeakDom;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -112,11 +113,13 @@ struct Games {
     /// The folder with a folder per game.
     root: std::path::PathBuf,
     games: HashMap<u64, State>,
+    /// When a request from outside Studio was last refused and logged.
+    refused: Option<Instant>,
 }
 
 impl Games {
     fn new(root: std::path::PathBuf) -> Games {
-        Games { root, games: HashMap::new() }
+        Games { root, games: HashMap::new(), refused: None }
     }
 
     fn get(&mut self, id: u64) -> &mut State {
@@ -267,10 +270,57 @@ fn tidy(state: &mut State) {
     }
 }
 
+/// The largest request RoGit reads. Copies arrive in 4 MiB parts; the biggest other requests (a big game's list of
+/// object IDs) are a few MB.
+const MAX_BODY: u64 = 128 << 20;
+
+/// Why a request is refused, if it is: RoGit only answers Studio and rogit itself, never a web page. Any page you
+/// visit can send requests to 127.0.0.1, but browsers mark them as theirs (Origin, Referer, Sec-Fetch-*), and a page
+/// whose address was pointed at 127.0.0.1 (DNS rebinding) still names its own host. Studio's HttpService sends none
+/// of these, and names 127.0.0.1.
+fn refusal(headers: &[Header]) -> Option<String> {
+    let header = |name: &'static str| headers.iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str());
+    for mark in ["Origin", "Referer", "Sec-Fetch-Site", "Sec-Fetch-Mode"] {
+        if let Some(value) = header(mark) {
+            return Some(format!("{mark}: {value}"));
+        }
+    }
+    match header("Host") {
+        Some(host) if local_host(host) => None,
+        Some(host) => Some(format!("Host: {host}")),
+        None => Some("no Host".into()),
+    }
+}
+
+/// Whether a Host header names this computer: 127.0.0.1, localhost or [::1], with or without a port.
+fn local_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name == "127.0.0.1" || name == "::1" || name.eq_ignore_ascii_case("localhost")
+}
+
 fn handle(games: &mut Games, mut request: Request) {
     let started = Instant::now();
+    let json_header = || Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    if let Some(reason) = refusal(request.headers()) {
+        // A page that keeps trying would fill the log.
+        if games.refused.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+            println!("Refused a request that didn't come from Studio ({reason}). RoGit only answers Studio.");
+            games.refused = Some(Instant::now());
+        }
+        let reply = json!({ "error": "RoGit only answers Roblox Studio." }).to_string();
+        let _ = request.respond(Response::from_string(reply).with_status_code(403).with_header(json_header()));
+        return;
+    }
     let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
+    let _ = request.as_reader().take(MAX_BODY + 1).read_to_string(&mut body);
+    if body.len() as u64 > MAX_BODY {
+        let reply = json!({ "error": "That request is too big." }).to_string();
+        let _ = request.respond(Response::from_string(reply).with_status_code(413).with_header(json_header()));
+        return;
+    }
     let url = request.url().to_owned();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
     // Stopping, for an update or an uninstall: the autosaves are written first.
@@ -300,8 +350,7 @@ fn handle(games: &mut Games, mut request: Request) {
         let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         eprintln!("{}.{:03} {path} {} KB {} ms", since.as_secs() % 100, since.subsec_millis(), body.len() / 1024, started.elapsed().as_millis());
     }
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-    let _ = request.respond(Response::from_string(value.to_string()).with_status_code(code).with_header(header));
+    let _ = request.respond(Response::from_string(value.to_string()).with_status_code(code).with_header(json_header()));
 }
 
 /// Answers one request from the plugin.
@@ -395,6 +444,52 @@ mod tests {
         let status = status(games.get(20), "place=0&file=lobby.rbxl");
         assert_eq!((status["game"].clone(), status["branch"]["name"].clone()), (json!(20), json!("lobby")));
         assert_eq!(status["project"]["game"]["name"], json!("Obby"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn answers_studio_and_refuses_web_pages() {
+        let headers = |pairs: &[(&str, &str)]| -> Vec<Header> {
+            pairs.iter().map(|(k, v)| Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap()).collect()
+        };
+        // What Studio's HttpService sends (seen on Studio 0.744 for Mac), and what rogit itself sends.
+        let studio = [("Host", "127.0.0.1:34875"), ("User-Agent", "RobloxStudio/Darwin RobloxApp/0.744.0"), ("Roblox-Id", "0")];
+        assert_eq!(refusal(&headers(&studio)), None);
+        for host in ["localhost:34875", "LOCALHOST", "127.0.0.1", "[::1]:34876"] {
+            assert_eq!(refusal(&headers(&[("Host", host)])), None, "{host}");
+        }
+        // A page posting to 127.0.0.1, a form, a page whose address now points here, and no Host at all.
+        assert!(refusal(&headers(&[("Host", "127.0.0.1:34875"), ("Origin", "https://example.com")])).is_some());
+        assert!(refusal(&headers(&[("Host", "127.0.0.1:34875"), ("Origin", "null")])).is_some());
+        assert!(refusal(&headers(&[("Host", "127.0.0.1:34875"), ("Sec-Fetch-Site", "cross-site")])).is_some());
+        assert!(refusal(&headers(&[("Host", "127.0.0.1:34875"), ("referer", "https://example.com/")])).is_some());
+        for host in ["evil.example:34875", "127.0.0.1.evil.example", "localhost.evil.example:34875", "[::2]:34875"] {
+            assert!(refusal(&headers(&[("Host", host)])).is_some(), "{host}");
+        }
+        assert!(refusal(&[]).is_some());
+    }
+
+    #[test]
+    fn requests_only_reach_files_of_real_branches() {
+        let root = std::env::temp_dir().join(format!("rogit-names-{}", std::process::id()));
+        let project = Project::new(root.join("games").join("5"));
+        project.init(Game { name: "Test".into(), universe_id: 5, main_place_id: 6 }).unwrap();
+        // A branch.json outside the branches folder must never be taken for a branch.
+        std::fs::create_dir_all(root.join("games").join("outside")).unwrap();
+        std::fs::write(root.join("games").join("outside").join("branch.json"), r#"{"name":"outside","created":1,"has_starting_point":false}"#).unwrap();
+        let mut state = State::new(5, project);
+        for path in ["/api/branches/open", "/api/branches/merged", "/api/branches/updated", "/api/branches/archive", "/api/branches/pin"] {
+            let reply = route(&mut state, &Method::Post, path, "", &json!({ "name": "../../outside" }).to_string());
+            assert_eq!(reply.map_err(|(code, _)| code), Err(404), "{path}");
+        }
+        let start = json!({ "name": "../../outside", "capture": "capture01", "manifest": { "services": [] } });
+        assert!(route(&mut state, &Method::Post, "/api/branches/start", "", &start.to_string()).is_err());
+        assert!(state.branches.get("../../outside").is_none());
+        // Uploads land only where a part of a copy can be.
+        for query in ["capture=../x1234567&file=Workspace&part=0", "capture=capture01&file=..&part=0", "capture=capture01&file=Workspace&part=99999999999999"] {
+            let reply = route(&mut state, &Method::Post, "/api/upload", query, "AAAA");
+            assert_eq!(reply.map_err(|(code, _)| code), Err(400), "{query}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -648,7 +743,8 @@ fn init_done(body: &str) -> Value {
 fn upload(state: &mut State, query: &str, body: &str) -> Reply {
     let capture = param(query, "capture").filter(|id| branches::valid_capture(id));
     let service = param(query, "file").filter(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric()));
-    let (Some(capture), Some(service), Some(part)) = (capture, service, number(query, "part")) else {
+    let part = number(query, "part").filter(|part| *part < branches::MAX_PARTS);
+    let (Some(capture), Some(service), Some(part)) = (capture, service, part) else {
         return Err((400, "Invalid upload.".into()));
     };
     let bytes = base64::engine::general_purpose::STANDARD.decode(body.trim()).map_err(|_| (400, "Invalid upload data.".to_owned()))?;
@@ -682,6 +778,7 @@ fn create_branch(state: &mut State, body: &str) -> Reply {
 
 fn starting_point(state: &mut State, body: &str) -> Reply {
     let (name, capture, manifest) = capture_request(body)?;
+    existing(state, &name)?;
     state.branches.set_starting_point(&name, &capture, &manifest, state.id).map_err(|e| (409, e))?;
     state.committed.remove(&name);
     println!("Recorded the starting point of {name}");
@@ -823,6 +920,7 @@ fn print_report(heading: &str, report: &Value) {
 fn merged(state: &mut State, body: &str) -> Reply {
     let report = json_body(body)?;
     let name = report["name"].as_str().unwrap_or_default();
+    existing(state, name)?;
     state.branches.mark_merged(name).map_err(|e| (404, e))?;
     print_report(&format!("Merged {name} into main"), &report);
     // The plugin records the merge in main only when everything applied; then the next merge can start from here.
@@ -922,6 +1020,7 @@ fn update_status(state: &mut State, query: &str) -> Reply {
 fn updated(state: &mut State, body: &str) -> Reply {
     let report = json_body(body)?;
     let name = report["name"].as_str().unwrap_or_default();
+    existing(state, name)?;
     state.branches.mark_updated(name).map_err(|e| (404, e))?;
     print_report(&format!("Updated {name} from main"), &report);
     // Recorded in the branch only when everything applied; then the next review, merge or update starts from here.
@@ -955,6 +1054,7 @@ fn cancel(state: &mut State, body: &str) -> Reply {
 fn open_branch(state: &mut State, body: &str) -> Reply {
     let request = json_body(body)?;
     let name = request["name"].as_str().unwrap_or_default();
+    existing(state, name)?;
     state.branches.open(name).map_err(|e| (404, e))?;
     Ok(json!({ "ok": true }))
 }
