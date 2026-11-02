@@ -11,7 +11,7 @@ homepage = "https://proscled.github.io/rogit"
 [dependencies]
 base64 = "0.23.1"
 blake3 = "1.8.7"
-lz4_flex = "0.13.1"
+lz4_flex = "0.14.0"
 rbx_binary = "3.0.1"
 rbx_dom_weak = "4.2.0"
 rbx_reflection = "7.0.0"
