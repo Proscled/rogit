@@ -1,6 +1,6 @@
 [package]
 name = "rogit"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 description = "Branches for your Roblox places' assets, with a Studio plugin. Scripts stay out of branches."
 license = "MPL-2.0"
@@ -26,7 +26,21 @@ zstd = "0.14.3"
 zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = [
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Gives the Windows programs their name, version, icon and manifest (see build.rs).
+[build-dependencies]
+winresource = { version = "0.1.34", default-features = false }
 
 [profile.release]
 strip = true

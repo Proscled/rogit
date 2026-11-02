@@ -1,12 +1,22 @@
 //! The current user's registry on Windows, for RoGit's PATH entry and its login entry: read and written directly, as
-//! installers do, rather than through PowerShell or reg.exe. Also opening files the way Explorer does.
+//! installers do, rather than through PowerShell or reg.exe. Also opening files the way Explorer does, and finding and
+//! stopping programs without PowerShell or taskkill (Microsoft Defender counts a program that runs those against it).
 
 use std::ptr;
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE_FLAG_INHERIT, SetHandleInformation};
+use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    UNICODE_STRING, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW,
     RegDeleteValueW, RegQueryValueExW, RegSetValueExW,
+};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, SendMessageTimeoutW, WM_SETTINGCHANGE};
@@ -32,6 +42,68 @@ pub fn open_file(file: &std::path::Path) -> std::io::Result<()> {
     match result as usize {
         n if n > 32 => Ok(()),
         n => Err(std::io::Error::other(format!("Windows couldn't open {} (error {n}).", file.display()))),
+    }
+}
+
+/// Every running program: its process id and file name, like `RobloxStudioBeta.exe`.
+pub fn programs() -> Vec<(u32, String)> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+    let mut found = Vec::new();
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        let name = &entry.szExeFile[..entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len())];
+        found.push((entry.th32ProcessID, String::from_utf16_lossy(name)));
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    found
+}
+
+/// The command line a program was started with, if Windows lets this one read it (it does for the user's own).
+pub fn command_line(pid: u32) -> Option<String> {
+    let process = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let mut size = 0u32;
+    unsafe { NtQueryInformationProcess(process.0, ProcessCommandLineInformation, ptr::null_mut(), 0, &mut size) };
+    if size < size_of::<UNICODE_STRING>() as u32 {
+        return None;
+    }
+    // A UNICODE_STRING, followed by the text it points to. u64s keep it aligned.
+    let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+    let status = unsafe { NtQueryInformationProcess(process.0, ProcessCommandLineInformation, buffer.as_mut_ptr().cast(), size, &mut size) };
+    if status < 0 {
+        return None;
+    }
+    let text = unsafe { &*buffer.as_ptr().cast::<UNICODE_STRING>() };
+    if text.Buffer.is_null() {
+        return Some(String::new());
+    }
+    Some(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text.Buffer, text.Length as usize / 2) }))
+}
+
+/// Stops a program at once, as Task Manager's End task does, and waits up to two seconds for it to be gone. Returns
+/// whether it stopped.
+pub fn stop(pid: u32) -> bool {
+    let Some(process) = Process::open(pid, PROCESS_TERMINATE | PROCESS_SYNCHRONIZE) else { return false };
+    unsafe { TerminateProcess(process.0, 1) != 0 && WaitForSingleObject(process.0, 2000) == WAIT_OBJECT_0 }
+}
+
+/// A running program, closed when dropped.
+struct Process(HANDLE);
+
+impl Process {
+    fn open(pid: u32, access: PROCESS_ACCESS_RIGHTS) -> Option<Process> {
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        (!handle.is_null()).then_some(Process(handle))
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
     }
 }
 
@@ -136,5 +208,23 @@ pub fn set_login_entry(program: Option<&str>) -> Result<(), String> {
     match program {
         Some(program) => key.set("RoGit", &format!("\"{program}\""), REG_SZ),
         None => key.delete("RoGit"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn finds_and_stops_programs() {
+        // Busy for half a minute unless it's stopped.
+        let mut child = Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null()).spawn().unwrap();
+        let pid = child.id();
+        assert!(programs().iter().any(|(id, name)| *id == pid && name.eq_ignore_ascii_case("PING.EXE")));
+        assert!(command_line(pid).unwrap().ends_with("-n 30 127.0.0.1"));
+        assert!(command_line(std::process::id()).unwrap().contains("rogit"));
+        assert!(stop(pid));
+        assert!(!child.wait().unwrap().success());
     }
 }

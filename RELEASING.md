@@ -8,6 +8,12 @@
    names filled in, and again on every push to `main` that changes `site/`.
 3. In **Settings → Code security**, turn on **Private vulnerability reporting** (`SECURITY.md` sends reports there),
    **Dependabot alerts** and **Dependabot security updates**.
+4. Get the Windows programs signed. Microsoft Defender's machine learning quarantines unsigned programs it hasn't seen
+   before (RoGit has been called `Trojan:Win32/Bearfoos.B!ml`), and every release is a program it hasn't seen.
+   [SignPath Foundation](https://signpath.org) signs open-source projects for free: apply there, then add the
+   repository variables `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG` and `SIGNPATH_SIGNING_POLICY_SLUG` and the
+   secret `SIGNPATH_API_TOKEN` they give you. The **Release** workflow signs `rogit.exe` and `rogit-background.exe`
+   from then on.
 
 ## Each release
 
@@ -21,8 +27,13 @@
 
 3. The **Release** workflow checks the tag matches `Cargo.toml`, runs the tests, builds for Apple silicon, Intel Macs
    and Windows, and attaches `rogit-macos-aarch64.zip`, `rogit-macos-x86_64.zip` and `rogit-windows-x86_64.zip` to
-   the release, with `SHA256SUMS` and a signed build record for each zip (see `SECURITY.md`). The install scripts always fetch the latest release, so people update by running the install command
-   again.
+   the release, with `SHA256SUMS` and a signed build record for each zip (see `SECURITY.md`). The install scripts
+   always fetch the latest release, so people update by running the install command again.
+4. Until the Windows programs are signed, send Microsoft the new ones so Defender learns them before people install
+   them: unzip `rogit-windows-x86_64.zip`, and at [Submit a file for malware
+   analysis](https://www.microsoft.com/en-us/wdsi/filesubmission) choose **Software developer**, send `rogit.exe`
+   and `rogit-background.exe` (one zip is fine), and say they're incorrectly detected or may be. Microsoft usually
+   answers within a few days.
 
 The **CI** workflow runs both install scripts on every push, against that commit's build, so a broken installer
 shows up before a release.

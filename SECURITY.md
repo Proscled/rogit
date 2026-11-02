@@ -17,6 +17,11 @@ soon as it's ready. Only the latest release gets fixes, and `rogit update` insta
 - **Files.** Everything RoGit keeps is in `~/.rogit` (macOS) or `%LOCALAPPDATA%\rogit` (Windows), and the plugin in
   Studio's plugins folder. Branch names are limited to letters, numbers, `-` and `_`, so requests can't reach files
   outside a game's folder.
+- **Starting at login.** On Windows, the value `RoGit` under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
+  starts `rogit-background.exe` (RoGit without a console window); on macOS, the LaunchAgent `com.rogit.serve` starts
+  `rogit serve`. `rogit autostart off` removes them. On Windows, RoGit starts no PowerShell, scripts or other programs:
+  only its own (`rogit-background.exe`, and a new version when it updates) and Studio, to open a branch. It closes
+  Studio windows of a branch you archive.
 - **What it can't protect against.** Like Rojo, RoGit trusts programs running on the same computer: anything that
   runs as you (or another account on a shared computer) can talk to `127.0.0.1` too.
 
@@ -28,3 +33,10 @@ the [GitHub CLI](https://cli.github.com):
 ```sh
 gh attestation verify rogit-windows-x86_64.zip --repo Proscled/rogit
 ```
+
+## If your antivirus flags RoGit
+
+Microsoft Defender has wrongly quarantined RoGit's Windows programs (as `Trojan:Win32/Bearfoos.B!ml`, a machine
+learning guess about a program it hasn't seen before, and before 0.3.2 its start-up script as `Trojan:VBS/AgentTesla`).
+Check the download as above, then report it as a false positive (Microsoft's form is at
+<https://www.microsoft.com/en-us/wdsi/filesubmission>), and open an issue so it can be reported for everyone.

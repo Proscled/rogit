@@ -82,8 +82,9 @@ Everything saved in the place, except:
   out again; they don't change how your game runs.
 - **Settings plugins can't read.** Plugins can't read a few service settings (Lighting's Technology, for example), so
   they aren't copied into branches: a branch has Studio's defaults for them, and merges leave them alone in main.
-- **Warnings on Windows.** RoGit's Windows programs aren't signed yet, so Windows or your antivirus may warn about
-  them. The site's [help](https://proscled.github.io/rogit/#help) says what to do.
+- **Warnings on Windows.** RoGit's Windows programs aren't signed yet, so Windows may warn about them, and Microsoft
+  Defender or another antivirus may wrongly remove them as a Trojan. The site's
+  [help](https://proscled.github.io/rogit/#help) says what to do.
 
 ## From the terminal
 

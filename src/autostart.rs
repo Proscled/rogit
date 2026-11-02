@@ -52,9 +52,13 @@ pub fn stop_running() {
             thread::sleep(Duration::from_millis(100));
         }
     }
-    if cfg!(windows) && crate::server::running().is_some() {
-        let _ = Command::new("taskkill").args(["/F", "/IM", "rogit-background.exe"]).output();
-        let _ = Command::new("taskkill").args(["/F", "/IM", "rogit.exe", "/FI", &format!("PID ne {}", std::process::id())]).output();
+    #[cfg(windows)]
+    if crate::server::running().is_some() {
+        for (pid, name) in crate::windows::programs() {
+            if pid != std::process::id() && ["rogit-background.exe", "rogit.exe"].iter().any(|n| name.eq_ignore_ascii_case(n)) {
+                crate::windows::stop(pid);
+            }
+        }
     }
 }
 

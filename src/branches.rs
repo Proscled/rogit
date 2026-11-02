@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -513,13 +514,29 @@ fn write_at(file: &fs::File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
 fn close_in_studio(file: &Path) -> usize {
     let paths: Vec<String> =
         [Some(file.to_path_buf()), file.canonicalize().ok()].into_iter().flatten().map(|p| p.display().to_string()).collect();
-    if cfg!(windows) {
-        // The path goes in through the environment, so nothing in it can be read as part of the script.
-        let script = "$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'RobloxStudio*' -and $_.CommandLine -and $_.CommandLine.Contains($env:ROGIT_CLOSE_FILE) }; \
-             $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; @($p).Count";
-        let output = Command::new("powershell").args(["-NoProfile", "-Command", script]).env("ROGIT_CLOSE_FILE", &paths[0]).output();
-        return output.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()).unwrap_or(0);
+    close_studios(&paths)
+}
+
+/// Studio opens a file with its path on the command line (`-localPlaceFile "C:\…\dev.rbxl"`). Windows paths ignore case.
+#[cfg(windows)]
+fn close_studios(paths: &[String]) -> usize {
+    let paths: Vec<String> = paths.iter().map(|p| p.to_lowercase()).collect();
+    let studios: Vec<u32> = crate::windows::programs()
+        .into_iter()
+        .filter(|(pid, name)| {
+            name.to_ascii_lowercase().starts_with("robloxstudio")
+                && crate::windows::command_line(*pid).is_some_and(|line| paths.iter().any(|p| line.to_lowercase().contains(p)))
+        })
+        .map(|(pid, _)| pid)
+        .collect();
+    for pid in &studios {
+        crate::windows::stop(*pid);
     }
+    studios.len()
+}
+
+#[cfg(not(windows))]
+fn close_studios(paths: &[String]) -> usize {
     let Ok(output) = Command::new("ps").args(["-axo", "pid=,command="]).output() else { return 0 };
     let pids: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()

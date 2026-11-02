@@ -74,6 +74,20 @@ jobs:
           if grep -q rogit/env ~/.zshenv; then echo 'PATH line left in .zshenv'; exit 1; fi
           test ! -e ~/.rogit/bin && test ! -e ~/.rogit/env && test ! -e ~/Documents/Roblox/Plugins/RoGit.rbxm
           test -f ~/.rogit/games/1/game.toml
+      - name: Check the Windows programs' details
+        if: runner.os == 'Windows'
+        shell: powershell
+        # Their name, version and icon (build.rs). Microsoft Defender is quicker to call a program without them malware.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          trap { Write-Output "::error::$_"; exit 1 }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          foreach ($exe in 'rogit', 'rogit-background') {
+            $info = (Get-Item "target\release\$exe.exe").VersionInfo
+            if ($info.ProductName -ne 'RoGit' -or $info.ProductVersion -ne $version -or $info.OriginalFilename -ne "$exe.exe") {
+              throw "$exe.exe is missing its Windows details: $(($info | Format-List | Out-String) -replace '\s+', ' ')"
+            }
+          }
       - name: Install on Windows
         if: runner.os == 'Windows'
         # Windows PowerShell 5.1, which the one-line install command uses.
